@@ -60,7 +60,7 @@ pub async fn open_folder_window(
     Json(params): Json<AddFolderParams>,
 ) -> Result<Json<FolderHistoryEntry>, AppCommandError> {
     let db = &state.db;
-    let entry = folder_service::add_folder(&db.conn, &params.path)
+    let entry = folder_service::add_folder(&db.conn, &params.path, None)
         .await
         .map_err(AppCommandError::from)?;
     Ok(Json(entry))
@@ -256,7 +256,7 @@ pub async fn add_folder_to_history(
     Json(params): Json<AddFolderParams>,
 ) -> Result<Json<FolderHistoryEntry>, AppCommandError> {
     let db = &state.db;
-    let result = folder_service::add_folder(&db.conn, &params.path)
+    let result = folder_service::add_folder(&db.conn, &params.path, None)
         .await
         .map_err(AppCommandError::from)?;
     Ok(Json(result))

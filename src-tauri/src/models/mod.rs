@@ -2,6 +2,7 @@ pub mod agent;
 pub mod chat_channel;
 pub mod conversation;
 pub mod folder;
+pub mod folder_group;
 pub mod model_provider;
 pub mod message;
 pub mod system;
@@ -15,6 +16,7 @@ pub use conversation::{
     SidebarData,
 };
 pub use folder::{FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedConversation};
+pub use folder_group::{FolderGroup, FolderGroupDetail};
 pub use message::{
     AgentExecutionStats, AgentToolCall, ContentBlock, MessageRole, MessageTurn, TurnRole,
     TurnUsage, UnifiedMessage,

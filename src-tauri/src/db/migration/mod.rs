@@ -9,6 +9,7 @@ mod m20260330_000001_chat_channel;
 mod m20260401_000001_chat_channel_sender_context;
 mod m20260404_000001_model_provider;
 mod m20260406_000001_agent_setting_model_provider;
+mod m20260419_000001_folder_group;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -24,6 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260401_000001_chat_channel_sender_context::Migration),
             Box::new(m20260404_000001_model_provider::Migration),
             Box::new(m20260406_000001_agent_setting_model_provider::Migration),
+            Box::new(m20260419_000001_folder_group::Migration),
         ]
     }
 }

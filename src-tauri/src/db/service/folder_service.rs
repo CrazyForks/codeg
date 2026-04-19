@@ -7,6 +7,7 @@ use sea_orm::{
 
 use crate::db::entities::{folder, folder_opened_conversation};
 use crate::db::error::DbError;
+use crate::db::service::folder_group_service;
 use crate::models::agent::AgentType;
 use crate::models::{FolderDetail, FolderHistoryEntry, OpenedConversation};
 
@@ -16,6 +17,10 @@ fn to_entry(m: folder::Model) -> FolderHistoryEntry {
         path: m.path,
         name: m.name,
         last_opened_at: m.last_opened_at,
+        group_id: m.group_id,
+        sort_order_in_group: m.sort_order_in_group,
+        git_branch: m.git_branch,
+        is_open: m.is_open,
     }
 }
 
@@ -35,6 +40,8 @@ fn to_detail(m: folder::Model, opened: Vec<OpenedConversation>) -> FolderDetail 
         default_agent_type,
         last_opened_at: m.last_opened_at,
         opened_conversations: opened,
+        group_id: m.group_id,
+        sort_order_in_group: m.sort_order_in_group,
     }
 }
 
@@ -59,6 +66,7 @@ pub async fn get_folder_by_id(
 pub async fn add_folder(
     conn: &DatabaseConnection,
     path: &str,
+    group_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
     let now = Utc::now();
     let name = std::path::Path::new(path)
@@ -78,8 +86,21 @@ pub async fn add_folder(
         active.updated_at = Set(now);
         active.deleted_at = Set(None);
         active.is_open = Set(true);
+        if let Some(gid) = group_id {
+            active.group_id = Set(gid);
+        }
         active.update(conn).await?
     } else {
+        // Resolve group: either reuse the caller-supplied id, or auto-create a
+        // fresh group with the same display name (legacy 1-folder-per-group
+        // behaviour).
+        let resolved_group_id = match group_id {
+            Some(id) => id,
+            None => folder_group_service::create_group(conn, &name).await?.id,
+        };
+        let sort_order_in_group =
+            folder_group_service::next_folder_sort_order(conn, resolved_group_id).await?;
+
         let active = folder::ActiveModel {
             id: NotSet,
             name: Set(name),
@@ -92,6 +113,8 @@ pub async fn add_folder(
             updated_at: Set(now),
             deleted_at: Set(None),
             is_open: Set(true),
+            group_id: Set(resolved_group_id),
+            sort_order_in_group: Set(sort_order_in_group),
         };
         active.insert(conn).await?
     };
@@ -118,10 +141,13 @@ pub async fn remove_folder(conn: &DatabaseConnection, path: &str) -> Result<(), 
         .await?;
 
     if let Some(row) = row {
+        let group_id = row.group_id;
         let mut active = row.into_active_model();
         active.deleted_at = Set(Some(now));
         active.updated_at = Set(now);
         active.update(conn).await?;
+
+        folder_group_service::remove_group_if_empty(conn, group_id).await?;
     }
     Ok(())
 }

@@ -5,6 +5,7 @@ mod error;
 pub mod experts;
 pub mod files;
 pub mod folder_commands;
+pub mod folder_groups;
 pub mod folders;
 pub mod git;
 pub mod mcp;

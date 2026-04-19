@@ -9,6 +9,10 @@ pub struct FolderHistoryEntry {
     pub path: String,
     pub name: String,
     pub last_opened_at: DateTime<Utc>,
+    pub group_id: i32,
+    pub sort_order_in_group: i32,
+    pub git_branch: Option<String>,
+    pub is_open: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,6 +25,8 @@ pub struct FolderDetail {
     pub default_agent_type: Option<AgentType>,
     pub last_opened_at: DateTime<Utc>,
     pub opened_conversations: Vec<OpenedConversation>,
+    pub group_id: i32,
+    pub sort_order_in_group: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

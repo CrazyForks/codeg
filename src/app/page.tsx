@@ -8,16 +8,14 @@ export default function Page() {
   const router = useRouter()
   useEffect(() => {
     if (isDesktop()) {
-      router.replace("/welcome")
+      router.replace("/main")
       return
     }
-    // Web mode: validate token before entering app
     const token = localStorage.getItem("codeg_token")
     if (!token) {
       router.replace("/login")
       return
     }
-    // Verify token is still valid
     fetch("/api/health", {
       method: "POST",
       headers: {
@@ -28,14 +26,13 @@ export default function Page() {
     })
       .then((res) => {
         if (res.ok) {
-          router.replace("/welcome")
+          router.replace("/main")
         } else {
           localStorage.removeItem("codeg_token")
           router.replace("/login")
         }
       })
       .catch(() => {
-        // Server unreachable
         localStorage.removeItem("codeg_token")
         router.replace("/login")
       })

@@ -19,6 +19,8 @@ import type {
   ExpertInstallStatus,
   FolderHistoryEntry,
   FolderDetail,
+  FolderGroup,
+  FolderGroupDetail,
   DbConversationSummary,
   ImportResult,
   OpenedConversation,
@@ -1053,23 +1055,23 @@ export async function gitAddFiles(
 
 // Window management commands
 
+/**
+ * Adds a folder to history and requests activation inside the main window.
+ * No longer spawns a per-folder window. Returns the folder entry so callers
+ * (e.g. worktree creation flows) can route to it immediately.
+ */
 export async function openFolderWindow(
-  path: string,
-  options?: { newWindow?: boolean }
-): Promise<void> {
-  if (getTransport().isDesktop()) {
-    return getTransport().call("open_folder_window", { path })
-  }
-  const entry = await getTransport().call<{ id: number }>(
+  path: string
+): Promise<FolderHistoryEntry> {
+  const entry = await getTransport().call<FolderHistoryEntry>(
     "open_folder_window",
     { path }
   )
-  const url = `/folder?id=${entry.id}`
-  if (options?.newWindow) {
-    window.open(url, `folder-${entry.id}`)
-  } else {
-    window.location.href = url
+  if (!getTransport().isDesktop()) {
+    // Web mode: navigate the current tab to /main?folder=<id>
+    window.location.href = `/main?folder=${entry.id}`
   }
+  return entry
 }
 
 export async function openCommitWindow(folderId: number): Promise<void> {
@@ -1149,21 +1151,47 @@ export async function listOpenFolders(): Promise<FolderHistoryEntry[]> {
   return getTransport().call("list_open_folders")
 }
 
-export async function focusFolderWindow(folderId: number): Promise<void> {
-  if (getTransport().isDesktop()) {
-    return getTransport().call("focus_folder_window", { folderId })
-  }
-  // Web mode: open empty string to focus existing named window without reload.
-  // If the window doesn't exist (was closed), open the folder page.
-  const win = window.open("", `folder-${folderId}`)
-  if (
-    !win ||
-    win.closed ||
-    !win.location.href ||
-    win.location.href === "about:blank"
-  ) {
-    window.open(`/folder?id=${folderId}`, `folder-${folderId}`)
-  }
+// Folder Groups API
+
+export async function listFolderGroups(): Promise<FolderGroupDetail[]> {
+  return getTransport().call("list_folder_groups")
+}
+
+export async function createFolderGroup(name: string): Promise<FolderGroup> {
+  return getTransport().call("create_folder_group", { name })
+}
+
+export async function renameFolderGroup(
+  groupId: number,
+  name: string
+): Promise<FolderGroup | null> {
+  return getTransport().call("rename_folder_group", { groupId, name })
+}
+
+export async function removeFolderGroup(groupId: number): Promise<number> {
+  return getTransport().call("remove_folder_group", { groupId })
+}
+
+export async function reorderFolderGroups(orderedIds: number[]): Promise<void> {
+  return getTransport().call("reorder_folder_groups", { orderedIds })
+}
+
+export async function reorderFoldersInGroup(
+  groupId: number,
+  orderedFolderIds: number[]
+): Promise<void> {
+  return getTransport().call("reorder_folders_in_group", {
+    groupId,
+    orderedFolderIds,
+  })
+}
+
+/**
+ * Close/unload a folder (set is_open=false). Used by the nav tree's
+ * "unload" action to release a folder's resources without deleting history.
+ */
+export async function closeFolderWindow(folderId: number): Promise<void> {
+  return getTransport().call("close_folder_window", { folderId })
 }
 
 // Conversation CRUD commands

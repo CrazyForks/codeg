@@ -3,6 +3,7 @@ pub mod chat_channel;
 pub mod conversations;
 pub mod experts;
 pub mod folder_commands;
+pub mod folder_groups;
 pub mod folders;
 pub mod mcp;
 pub mod model_provider;

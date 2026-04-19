@@ -8,5 +8,6 @@ pub use super::chat_channel_sender_context::Entity as ChatChannelSenderContext;
 pub use super::conversation::Entity as Conversation;
 pub use super::folder::Entity as Folder;
 pub use super::folder_command::Entity as FolderCommand;
+pub use super::folder_group::Entity as FolderGroup;
 pub use super::folder_opened_conversation::Entity as FolderOpenedConversation;
 pub use super::model_provider::Entity as ModelProvider;

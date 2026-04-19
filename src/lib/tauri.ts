@@ -858,7 +858,9 @@ export async function gitAddFiles(
 
 // Window management commands
 
-export async function openFolderWindow(path: string): Promise<void> {
+export async function openFolderWindow(
+  path: string
+): Promise<FolderHistoryEntry> {
   return invoke("open_folder_window", { path })
 }
 
@@ -890,10 +892,6 @@ export async function openSettingsWindow(
 
 export async function listOpenFolders(): Promise<FolderHistoryEntry[]> {
   return invoke("list_open_folders")
-}
-
-export async function focusFolderWindow(folderId: number): Promise<void> {
-  return invoke("focus_folder_window", { folderId })
 }
 
 // Conversation CRUD commands

@@ -344,7 +344,7 @@ export function BranchDropdown({
     setWorktreeOpen(false)
     await runGitTask(t("tasks.newWorktree", { name }), async () => {
       await gitWorktreeAdd(folderPath, name, wtPath)
-      await openFolderWindow(wtPath, { newWindow: true })
+      await openFolderWindow(wtPath)
       await setFolderParentBranch(wtPath, branch)
     })
   }

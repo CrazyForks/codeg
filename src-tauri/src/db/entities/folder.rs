@@ -16,6 +16,8 @@ pub struct Model {
     pub deleted_at: Option<DateTimeUtc>,
     pub is_open: bool,
     pub parent_branch: Option<String>,
+    pub group_id: i32,
+    pub sort_order_in_group: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -28,6 +30,13 @@ pub enum Relation {
 
     #[sea_orm(has_many = "super::folder_command::Entity")]
     FolderCommands,
+
+    #[sea_orm(
+        belongs_to = "super::folder_group::Entity",
+        from = "Column::GroupId",
+        to = "super::folder_group::Column::Id"
+    )]
+    Group,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -45,6 +54,12 @@ impl Related<super::folder_opened_conversation::Entity> for Entity {
 impl Related<super::folder_command::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::FolderCommands.def()
+    }
+}
+
+impl Related<super::folder_group::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Group.def()
     }
 }
 

@@ -153,6 +153,10 @@ export interface FolderHistoryEntry {
   path: string
   name: string
   last_opened_at: string
+  group_id: number
+  sort_order_in_group: number
+  git_branch: string | null
+  is_open: boolean
 }
 
 export interface FolderDetail {
@@ -164,6 +168,25 @@ export interface FolderDetail {
   default_agent_type: AgentType | null
   last_opened_at: string
   opened_conversations: OpenedConversation[]
+  group_id: number
+  sort_order_in_group: number
+}
+
+export interface FolderGroup {
+  id: number
+  name: string
+  sort_order: number
+  created_at: string
+  updated_at: string
+}
+
+export interface FolderGroupDetail {
+  id: number
+  name: string
+  sort_order: number
+  created_at: string
+  updated_at: string
+  folders: FolderHistoryEntry[]
 }
 
 export interface OpenedConversation {

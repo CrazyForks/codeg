@@ -1,15 +1,8 @@
 "use client"
 
-import {
-  Suspense,
-  useMemo,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react"
-import { useSearchParams } from "next/navigation"
+import { useMemo, useCallback, useEffect, useRef, useState } from "react"
 import type { ImperativePanelGroupHandle } from "react-resizable-panels"
+import { ConversationDetailPanel } from "@/components/conversations/conversation-detail-panel"
 import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { Sidebar } from "@/components/layout/sidebar"
 import { StatusBar } from "@/components/layout/status-bar"
@@ -50,19 +43,8 @@ import {
 } from "@/components/ui/resizable"
 import type { AgentType } from "@/lib/types"
 import { cn } from "@/lib/utils"
-import { useFolderContext } from "@/contexts/folder-context"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
-
-function FolderDocumentTitle() {
-  const { folder } = useFolderContext()
-
-  useEffect(() => {
-    document.title = folder ? `${folder.name} - codeg` : "codeg"
-  }, [folder])
-
-  return null
-}
 
 const TOAST_DURATION_MS = 15000
 const WORKSPACE_PANEL_GROUP_ID = "workspace-panel-group"
@@ -776,39 +758,44 @@ function FolderLayoutShell({ children }: { children: React.ReactNode }) {
   )
 }
 
-function FolderLayoutInner({ children }: { children: React.ReactNode }) {
-  const searchParams = useSearchParams()
-  const folderId = Number(searchParams.get("id") ?? "0")
-  const normalizedFolderId = Number.isFinite(folderId) ? folderId : 0
-  const conversationId = searchParams.get("conversationId")
-  const agentType = searchParams.get("agent") as AgentType | null
+export interface FolderWorkspaceProps {
+  folderId: number
+  initialConversationId?: number | null
+  initialAgentType?: AgentType | null
+}
 
+export function FolderWorkspace({
+  folderId,
+  initialConversationId = null,
+  initialAgentType = null,
+}: FolderWorkspaceProps) {
   return (
     <FolderProvider
-      folderId={normalizedFolderId}
-      initialConversationId={conversationId ? Number(conversationId) : null}
-      initialAgentType={agentType}
+      folderId={folderId}
+      initialConversationId={initialConversationId}
+      initialAgentType={initialAgentType}
     >
-      <FolderDocumentTitle />
       <AlertProvider>
         <GitCredentialProvider>
           <TaskProvider>
             <AcpConnectionsProvider>
               <ConversationRuntimeProvider>
-                <WorkspaceProvider key={`workspace-${normalizedFolderId}`}>
+                <WorkspaceProvider key={`workspace-${folderId}`}>
                   <TabProvider>
                     <TabKeysSync />
                     <SessionStatsProvider>
                       <SidebarProvider
-                        key={`left-sidebar-${normalizedFolderId}`}
-                        folderId={normalizedFolderId}
+                        key={`left-sidebar-${folderId}`}
+                        folderId={folderId}
                       >
                         <AuxPanelProvider
-                          key={`right-sidebar-${normalizedFolderId}`}
-                          folderId={normalizedFolderId}
+                          key={`right-sidebar-${folderId}`}
+                          folderId={folderId}
                         >
                           <TerminalProvider>
-                            <FolderLayoutShell>{children}</FolderLayoutShell>
+                            <FolderLayoutShell>
+                              <ConversationDetailPanel />
+                            </FolderLayoutShell>
                           </TerminalProvider>
                         </AuxPanelProvider>
                       </SidebarProvider>
@@ -821,17 +808,5 @@ function FolderLayoutInner({ children }: { children: React.ReactNode }) {
         </GitCredentialProvider>
       </AlertProvider>
     </FolderProvider>
-  )
-}
-
-export default function FolderLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
-  return (
-    <Suspense>
-      <FolderLayoutInner>{children}</FolderLayoutInner>
-    </Suspense>
   )
 }

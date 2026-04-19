@@ -109,6 +109,31 @@ pub fn build_router(state: Arc<AppState>, token: String, static_dir: std::path::
             "/save_folder_opened_conversations",
             post(handlers::folders::save_folder_opened_conversations),
         )
+        // ─── Folder Groups ───
+        .route(
+            "/list_folder_groups",
+            post(handlers::folder_groups::list_folder_groups),
+        )
+        .route(
+            "/create_folder_group",
+            post(handlers::folder_groups::create_folder_group),
+        )
+        .route(
+            "/rename_folder_group",
+            post(handlers::folder_groups::rename_folder_group),
+        )
+        .route(
+            "/remove_folder_group",
+            post(handlers::folder_groups::remove_folder_group),
+        )
+        .route(
+            "/reorder_folder_groups",
+            post(handlers::folder_groups::reorder_folder_groups),
+        )
+        .route(
+            "/reorder_folders_in_group",
+            post(handlers::folder_groups::reorder_folders_in_group),
+        )
         .route("/get_git_branch", post(handlers::folders::get_git_branch))
         .route(
             "/get_home_directory",

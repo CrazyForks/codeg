@@ -16,7 +16,7 @@ export default function LoginPage() {
 
   // Desktop users skip login entirely
   if (isDesktop()) {
-    router.replace("/welcome")
+    router.replace("/main")
     return null
   }
 
@@ -38,7 +38,7 @@ export default function LoginPage() {
 
       if (res.ok) {
         localStorage.setItem("codeg_token", token)
-        router.replace("/welcome")
+        router.replace("/main")
       } else if (res.status === 401) {
         setError("Token 无效，请检查后重试")
       } else {

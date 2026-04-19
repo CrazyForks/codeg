@@ -121,7 +121,7 @@ async fn select_folder_by_path(
     sender_id: &str,
     lang: Lang,
 ) -> RichMessage {
-    let entry = match folder_service::add_folder(db, path).await {
+    let entry = match folder_service::add_folder(db, path, None).await {
         Ok(e) => e,
         Err(e) => {
             return RichMessage::error(format!("{}{e}", i18n::failed_to_add_folder_label(lang)));

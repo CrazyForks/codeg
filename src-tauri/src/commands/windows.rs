@@ -85,9 +85,8 @@ pub struct CommitWindowState {
     owner_by_commit_label: Mutex<HashMap<String, String>>,
 }
 
-pub fn folder_window_label(folder_id: i32) -> String {
-    format!("folder-{folder_id}")
-}
+/// Fixed label for the single main window that replaces per-folder windows.
+pub const MAIN_WINDOW_LABEL: &str = "main";
 
 /// Detect macOS system dark mode via `defaults read`.
 /// Result is cached for the process lifetime via `OnceLock`.
@@ -288,13 +287,6 @@ impl CommitWindowState {
     }
 }
 
-fn get_folder_id_from_window(window: &tauri::WebviewWindow) -> Option<i32> {
-    let url = window.url().ok()?;
-    url.query_pairs()
-        .find(|(key, _)| key == "id")
-        .and_then(|(_, value)| value.parse::<i32>().ok())
-}
-
 fn resolve_settings_route(section: Option<&str>) -> &'static str {
     match section {
         Some("appearance") => "settings/appearance",
@@ -331,55 +323,16 @@ fn resolve_settings_target(section: Option<&str>, agent_type: Option<&str>) -> S
     route.to_string()
 }
 
+pub const ACTIVATE_FOLDER_EVENT: &str = "activate-folder";
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn list_open_folders(
-    app: AppHandle,
     db: tauri::State<'_, AppDatabase>,
 ) -> Result<Vec<FolderHistoryEntry>, AppCommandError> {
-    let windows = app.webview_windows();
-    let mut folder_ids: Vec<i32> = Vec::new();
-
-    for (label, window) in &windows {
-        if label.starts_with("folder-") {
-            if let Some(id) = get_folder_id_from_window(window) {
-                folder_ids.push(id);
-            }
-        }
-    }
-
-    let all_folders = crate::db::service::folder_service::list_folders(&db.conn)
+    crate::db::service::folder_service::list_open_folders(&db.conn)
         .await
-        .map_err(AppCommandError::from)?;
-
-    let open_folders: Vec<FolderHistoryEntry> = all_folders
-        .into_iter()
-        .filter(|f| folder_ids.contains(&f.id))
-        .collect();
-
-    Ok(open_folders)
-}
-
-#[cfg(feature = "tauri-runtime")]
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn focus_folder_window(app: AppHandle, folder_id: i32) -> Result<(), AppCommandError> {
-    let windows = app.webview_windows();
-    for (label, window) in &windows {
-        if label.starts_with("folder-") {
-            if let Some(id) = get_folder_id_from_window(window) {
-                if id == folder_id {
-                    window.set_focus().map_err(|e| {
-                        AppCommandError::window("Failed to focus folder window", e.to_string())
-                    })?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    Err(
-        AppCommandError::not_found(format!("No open window for folder {folder_id}"))
-            .with_detail(format!("folder_id={folder_id}")),
-    )
+        .map_err(AppCommandError::from)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -388,46 +341,23 @@ pub async fn open_folder_window(
     app: AppHandle,
     db: tauri::State<'_, AppDatabase>,
     path: String,
-) -> Result<(), AppCommandError> {
-    // Add to history via DB
-    let entry = crate::db::service::folder_service::add_folder(&db.conn, &path)
+) -> Result<FolderHistoryEntry, AppCommandError> {
+    let entry = crate::db::service::folder_service::add_folder(&db.conn, &path, None)
         .await
         .map_err(AppCommandError::from)?;
 
-    let label = folder_window_label(entry.id);
-    if let Some(existing) = app.get_webview_window(&label) {
-        post_window_setup(&existing);
-        let _ = existing.unminimize();
-        existing
-            .set_focus()
-            .map_err(|e| AppCommandError::window("Failed to focus folder window", e.to_string()))?;
-        if let Some(w) = app.get_webview_window("welcome") {
-            let _ = w.close();
-        }
-        if let Some(w) = app.get_webview_window("project-boot") {
-            let _ = w.close();
-        }
-        return Ok(());
-    }
-
-    let url = WebviewUrl::App(format!("folder?id={}", entry.id).into());
-    let builder = WebviewWindowBuilder::new(&app, &label, url)
-        .title(&entry.name)
-        .inner_size(1260.0, 860.0)
-        .min_inner_size(900.0, 600.0);
-    let folder_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| AppCommandError::window("Failed to open folder window", e.to_string()))?;
-    post_window_setup(&folder_window);
-
-    // Close welcome and project-boot windows
-    if let Some(w) = app.get_webview_window("welcome") {
-        let _ = w.close();
+    if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = main_window.unminimize();
+        let _ = main_window.set_focus();
     }
     if let Some(w) = app.get_webview_window("project-boot") {
         let _ = w.close();
     }
-    Ok(())
+
+    let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.clone());
+    crate::web::event_bridge::emit_event(&emitter, ACTIVATE_FOLDER_EVENT, &entry);
+
+    Ok(entry)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -714,21 +644,25 @@ pub async fn cleanup_dangling_merge(app: &AppHandle, merge_window_label: &str) {
     }
 }
 
-pub fn open_welcome_window(app: &AppHandle) -> Result<(), AppCommandError> {
-    if let Some(existing) = app.get_webview_window("welcome") {
+/// Open or focus the single main window that hosts the folder navigation tree
+/// and active folder workspace. Called at startup and when external entries
+/// (CLI, deep-link) wake the app up.
+pub fn open_main_window(app: &AppHandle) -> Result<(), AppCommandError> {
+    if let Some(existing) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
         post_window_setup(&existing);
         return Ok(());
     }
-    let url = WebviewUrl::App("welcome".into());
-    let builder = WebviewWindowBuilder::new(app, "welcome", url)
+    let url = WebviewUrl::App("main".into());
+    let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, url)
         .title("Codeg")
-        .inner_size(800.0, 520.0)
-        .min_inner_size(600.0, 400.0)
-        .center();
-    let welcome_window = apply_platform_window_style(builder)
+        .inner_size(1260.0, 860.0)
+        .min_inner_size(900.0, 600.0);
+    let main_window = apply_platform_window_style(builder)
         .build()
-        .map_err(|e| AppCommandError::window("Failed to open welcome window", e.to_string()))?;
-    post_window_setup(&welcome_window);
+        .map_err(|e| AppCommandError::window("Failed to open main window", e.to_string()))?;
+    post_window_setup(&main_window);
     Ok(())
 }
 

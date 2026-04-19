@@ -476,7 +476,7 @@ pub async fn add_folder_to_history(
     db: tauri::State<'_, AppDatabase>,
     path: String,
 ) -> Result<FolderHistoryEntry, DbError> {
-    folder_service::add_folder(&db.conn, &path).await
+    folder_service::add_folder(&db.conn, &path, None).await
 }
 
 pub(crate) async fn set_folder_parent_branch_core(
@@ -532,6 +532,20 @@ pub async fn save_folder_opened_conversations(
     items: Vec<OpenedConversation>,
 ) -> Result<(), DbError> {
     folder_service::save_opened_conversations(&db.conn, folder_id, items).await
+}
+
+/// Mark a folder as unloaded (is_open=false) from the main window. Used by
+/// the navigation tree's "unload" action to release a folder's resources
+/// without removing it from history.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn close_folder_window(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+) -> Result<(), AppCommandError> {
+    folder_service::set_folder_open(&db.conn, folder_id, false)
+        .await
+        .map_err(AppCommandError::from)
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
