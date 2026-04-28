@@ -1130,34 +1130,38 @@ export function SidebarConversationList({
   // If the active folder lives on that SSH host, force-fire an import so
   // the new row appears in the sidebar immediately instead of waiting for
   // the 30s throttle to elapse.
+  //
+  // CG-002.12: same force-import on `connection://remote_resync` — the WS
+  // bridge fires it after every reconnect, so any `conversation_linked`
+  // events emitted during the WS gap (which are fire-and-forget on the
+  // broadcast channel) are reconciled here. snapshot rehydrate handles
+  // in-flight ACP state; this handles the conversation row that the
+  // sidebar would otherwise miss.
   useEffect(() => {
     let cancelled = false
-    let unlisten: (() => void) | null = null
-    subscribe<{ ssh_connection_id: string }>(
+    const unlistenFns: Array<() => void> = []
+    const handler = (payload: { ssh_connection_id: string }) => {
+      if (cancelled) return
+      const sshId = payload?.ssh_connection_id
+      if (!sshId) return
+      if (!activeFolder?.connection_id || activeFolder.connection_id !== sshId)
+        return
+      triggerRemoteAutoImport(activeFolder.id, { force: true })
+    }
+    for (const channel of [
       "connection://remote_conversation_linked",
-      (payload) => {
-        if (cancelled) return
-        const sshId = payload?.ssh_connection_id
-        if (!sshId) return
-        if (
-          !activeFolder?.connection_id ||
-          activeFolder.connection_id !== sshId
-        )
-          return
-        triggerRemoteAutoImport(activeFolder.id, { force: true })
-      }
-    )
-      .then((fn) => {
-        if (cancelled) {
-          fn()
-        } else {
-          unlisten = fn
-        }
-      })
-      .catch(() => {})
+      "connection://remote_resync",
+    ]) {
+      subscribe<{ ssh_connection_id: string }>(channel, handler)
+        .then((fn) => {
+          if (cancelled) fn()
+          else unlistenFns.push(fn)
+        })
+        .catch(() => {})
+    }
     return () => {
       cancelled = true
-      unlisten?.()
+      for (const fn of unlistenFns) fn()
     }
   }, [activeFolder?.id, activeFolder?.connection_id, triggerRemoteAutoImport])
 
