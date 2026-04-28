@@ -17,14 +17,20 @@ import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import {
   ChevronDown,
   ChevronRight,
+  Copy,
   Download,
   FolderOpen,
   GitBranch,
   ListChecks,
   Loader2,
   Palette,
+  Plug,
+  Plug2,
   Plus,
+  RefreshCw,
   Rocket,
+  Server,
+  Settings2,
   XCircle,
 } from "lucide-react"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -33,15 +39,27 @@ import { useTabContext } from "@/contexts/tab-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useZoomLevel } from "@/hooks/use-appearance"
 import {
+  closeConnection,
+  getConnectionRuntime,
+  hardResetConnection,
   importLocalConversations,
+  listConnections,
+  openConnection,
   openProjectBootWindow,
+  openSettingsWindow,
   updateConversationTitle,
   updateConversationStatus,
   updateFolderColor,
   deleteConversation,
 } from "@/lib/api"
 import { isDesktop, openFileDialog } from "@/lib/platform"
-import type { ConversationStatus, DbConversationSummary } from "@/lib/types"
+import type {
+  ConnectionConfig,
+  ConnectionRuntime,
+  ConnectionStatusKind,
+  ConversationStatus,
+  DbConversationSummary,
+} from "@/lib/types"
 import {
   loadFolderExpanded,
   saveFolderExpanded,
@@ -160,6 +178,8 @@ const FolderHeader = memo(function FolderHeader({
   expanded,
   importing,
   color,
+  connectionId,
+  remotePath,
   onToggle,
   onRemoveFromWorkspace,
   onNewConversation,
@@ -176,6 +196,8 @@ const FolderHeader = memo(function FolderHeader({
   expanded: boolean
   importing: boolean
   color: string
+  connectionId: string | null
+  remotePath: string | null
   onToggle: (folderId: number) => void
   onRemoveFromWorkspace: (folderId: number) => void
   onNewConversation: (folderId: number) => void
@@ -186,8 +208,103 @@ const FolderHeader = memo(function FolderHeader({
   dragControls: DragControls
   t: ReturnType<typeof useTranslations>
 }) {
+  const isRemote = connectionId !== null
+  const [runtime, setRuntime] = useState<ConnectionRuntime | null>(null)
+  const [connection, setConnection] = useState<ConnectionConfig | null>(null)
+  const [hydrated, setHydrated] = useState(false)
+  const fetchInflightRef = useRef(false)
+
+  const fetchRemoteState = useCallback(async () => {
+    if (!connectionId) return
+    if (fetchInflightRef.current) return
+    fetchInflightRef.current = true
+    try {
+      const [rt, conns] = await Promise.all([
+        getConnectionRuntime(connectionId).catch(() => null),
+        connection
+          ? Promise.resolve(null)
+          : listConnections().catch(() => null),
+      ])
+      setRuntime(rt)
+      if (conns) {
+        const found = conns.find((c) => c.id === connectionId) ?? null
+        setConnection(found)
+      }
+      setHydrated(true)
+    } finally {
+      fetchInflightRef.current = false
+    }
+  }, [connectionId, connection])
+
+  const status: ConnectionStatusKind = runtime?.status?.kind ?? "not_attempted"
+  const isLive = status === "live"
+
+  const handleConnect = useCallback(async () => {
+    if (!connectionId) return
+    try {
+      await openConnection(connectionId)
+      await fetchRemoteState()
+    } catch (e) {
+      toast.error(String(e))
+    }
+  }, [connectionId, fetchRemoteState])
+
+  const handleDisconnect = useCallback(async () => {
+    if (!connectionId) return
+    try {
+      await closeConnection(connectionId)
+      await fetchRemoteState()
+    } catch (e) {
+      toast.error(String(e))
+    }
+  }, [connectionId, fetchRemoteState])
+
+  const handleHardReset = useCallback(async () => {
+    if (!connectionId) return
+    try {
+      await hardResetConnection(connectionId)
+      await fetchRemoteState()
+    } catch (e) {
+      toast.error(String(e))
+    }
+  }, [connectionId, fetchRemoteState])
+
+  const sshTargetText = useMemo(() => {
+    if (!remotePath) return null
+    const c = connection
+    if (!c) return remotePath
+    if (c.ssh_alias) return `${c.ssh_alias}:${remotePath}`
+    if (c.ssh_user && c.ssh_host) {
+      return `${c.ssh_user}@${c.ssh_host}:${remotePath}`
+    }
+    if (c.ssh_host) return `${c.ssh_host}:${remotePath}`
+    return remotePath
+  }, [connection, remotePath])
+
+  const handleCopy = useCallback(
+    async (text: string) => {
+      try {
+        await navigator.clipboard.writeText(text)
+        toast.success(t("folderHeaderMenu.remote.copied"))
+      } catch (e) {
+        toast.error(String(e))
+      }
+    },
+    [t]
+  )
+
+  const handleOpenSettings = useCallback(() => {
+    openSettingsWindow("ssh-connections").catch((err) =>
+      console.error("[FolderHeader] failed to open settings:", err)
+    )
+  }, [])
+
   return (
-    <ContextMenu>
+    <ContextMenu
+      onOpenChange={(open) => {
+        if (open && isRemote && !hydrated) void fetchRemoteState()
+      }}
+    >
       <ContextMenuTrigger asChild>
         <div className={cn("relative h-[2rem]", isDragging && "opacity-60")}>
           <div
@@ -279,16 +396,68 @@ const FolderHeader = memo(function FolderHeader({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onSelect={() => onNewConversation(folderId)}>
-          <Plus className="h-4 w-4" />
-          {t("newConversation")}
-        </ContextMenuItem>
+        {isRemote && (
+          <>
+            <ContextMenuItem disabled className="opacity-100">
+              <Server className="h-4 w-4" />
+              <span className="text-xs text-muted-foreground">
+                {t("folderHeaderMenu.remote.status")}:&nbsp;
+                {hydrated
+                  ? t(`folderHeaderMenu.remote.statusKind.${status}` as never)
+                  : t("folderHeaderMenu.remote.statusUnknown")}
+              </span>
+            </ContextMenuItem>
+            <ContextMenuItem disabled={isLive} onSelect={handleConnect}>
+              <Plug className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.connect")}
+            </ContextMenuItem>
+            <ContextMenuItem disabled={!isLive} onSelect={handleDisconnect}>
+              <Plug2 className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.disconnect")}
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={handleHardReset}>
+              <RefreshCw className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.hardReset")}
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              disabled={!remotePath}
+              onSelect={() => remotePath && void handleCopy(remotePath)}
+            >
+              <Copy className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.copyRemotePath")}
+            </ContextMenuItem>
+            <ContextMenuItem
+              disabled={!sshTargetText}
+              onSelect={() => sshTargetText && void handleCopy(sshTargetText)}
+            >
+              <Copy className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.copySshTarget")}
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem onSelect={handleOpenSettings}>
+              <Settings2 className="h-4 w-4" />
+              {t("folderHeaderMenu.remote.openConnectionSettings")}
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+          </>
+        )}
+        {!isRemote && (
+          <ContextMenuItem onSelect={() => onNewConversation(folderId)}>
+            <Plus className="h-4 w-4" />
+            {t("newConversation")}
+          </ContextMenuItem>
+        )}
         <ContextMenuItem
           disabled={importing}
           onSelect={() => onImport(folderId)}
         >
           <Download className="h-4 w-4" />
-          {importing ? t("importing") : t("importLocalSessions")}
+          {importing
+            ? t("importing")
+            : isRemote
+              ? t("folderHeaderMenu.remote.importRemoteSessions")
+              : t("importLocalSessions")}
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => onManageConversations(folderId)}>
@@ -350,6 +519,8 @@ interface FolderGroupItemProps {
   selectedConversation: { id: number; agentType: string } | null
   openTabConversationKeys: Set<string>
   color: string
+  connectionId: string | null
+  remotePath: string | null
   onToggle: (folderId: number) => void
   onRemoveFromWorkspace: (folderId: number) => void
   onNewConversationForFolder: (folderId: number) => void
@@ -383,6 +554,8 @@ function FolderGroupItem({
   selectedConversation,
   openTabConversationKeys,
   color,
+  connectionId,
+  remotePath,
   onToggle,
   onRemoveFromWorkspace,
   onNewConversationForFolder,
@@ -456,6 +629,8 @@ function FolderGroupItem({
             expanded={expanded}
             importing={importing}
             color={color}
+            connectionId={connectionId}
+            remotePath={remotePath}
             onToggle={handleToggle}
             onRemoveFromWorkspace={onRemoveFromWorkspace}
             onNewConversation={onNewConversationForFolder}
@@ -557,9 +732,24 @@ export function SidebarConversationList({
   const { addTask, updateTask } = useTaskContext()
 
   const folderIndex = useMemo(() => {
-    const map = new Map<number, { name: string; path: string; color: string }>()
+    const map = new Map<
+      number,
+      {
+        name: string
+        path: string
+        color: string
+        connection_id: string | null
+        remote_path: string | null
+      }
+    >()
     for (const f of allFolders)
-      map.set(f.id, { name: f.name, path: f.path, color: f.color })
+      map.set(f.id, {
+        name: f.name,
+        path: f.path,
+        color: f.color,
+        connection_id: f.connection_id,
+        remote_path: f.remote_path,
+      })
     return map
   }, [allFolders])
 
@@ -1063,6 +1253,7 @@ export function SidebarConversationList({
                     // `will-change: transform`, which would otherwise trap
                     // each sticky inside its own Reorder.Item.
                     const stackIndex = orderedFolderIds.length - index
+                    const folderMeta = folderIndex.get(folderId)
                     return (
                       <FolderGroupItem
                         key={folderId}
@@ -1079,7 +1270,9 @@ export function SidebarConversationList({
                         sortMode={sortMode}
                         selectedConversation={selectedConversation}
                         openTabConversationKeys={openTabConversationKeys}
-                        color={folderIndex.get(folderId)?.color ?? "#22c55e"}
+                        color={folderMeta?.color ?? "#22c55e"}
+                        connectionId={folderMeta?.connection_id ?? null}
+                        remotePath={folderMeta?.remote_path ?? null}
                         onToggle={toggleFolder}
                         onRemoveFromWorkspace={handleRemoveFolder}
                         onNewConversationForFolder={

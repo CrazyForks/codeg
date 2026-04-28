@@ -816,7 +816,32 @@
       "folderHeaderMenu": {
         "manageConversations": "Gérer les conversations…",
         "changeColor": "Changer la couleur",
-        "removeFromWorkspace": "Retirer de l'espace de travail"
+        "removeFromWorkspace": "Retirer de l'espace de travail",
+        "remote": {
+          "status": "Status",
+          "statusUnknown": "unknown",
+          "statusKind": {
+            "not_attempted": "not connected",
+            "probing": "probing",
+            "deploying": "deploying",
+            "awaiting_manual": "awaiting manual install",
+            "launching": "launching",
+            "handshaking": "handshaking",
+            "live": "live",
+            "reconnecting": "reconnecting",
+            "cached": "cached",
+            "error": "error",
+            "disconnected": "disconnected"
+          },
+          "connect": "Connect",
+          "disconnect": "Disconnect",
+          "hardReset": "Hard reset",
+          "copyRemotePath": "Copy remote path",
+          "copySshTarget": "Copy SSH target",
+          "openConnectionSettings": "Open connection settings…",
+          "importRemoteSessions": "Import remote sessions",
+          "copied": "Copied to clipboard"
+        }
       },
       "manageConversations": {
         "title": "Gérer les conversations — {name}",

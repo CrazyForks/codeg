@@ -816,7 +816,32 @@
       "folderHeaderMenu": {
         "manageConversations": "会话管理…",
         "changeColor": "修改颜色",
-        "removeFromWorkspace": "从工作区移除"
+        "removeFromWorkspace": "从工作区移除",
+        "remote": {
+          "status": "状态",
+          "statusUnknown": "未知",
+          "statusKind": {
+            "not_attempted": "未连接",
+            "probing": "探测中",
+            "deploying": "部署中",
+            "awaiting_manual": "待手动安装",
+            "launching": "启动中",
+            "handshaking": "握手中",
+            "live": "已连接",
+            "reconnecting": "重连中",
+            "cached": "已缓存",
+            "error": "错误",
+            "disconnected": "已断开"
+          },
+          "connect": "连接",
+          "disconnect": "断开",
+          "hardReset": "强制重连",
+          "copyRemotePath": "复制远端路径",
+          "copySshTarget": "复制 SSH 目标",
+          "openConnectionSettings": "打开连接设置…",
+          "importRemoteSessions": "导入远端会话",
+          "copied": "已复制到剪贴板"
+        }
       },
       "manageConversations": {
         "title": "会话管理 — {name}",
