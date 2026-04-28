@@ -10,10 +10,12 @@
 // channel name. Routing back to specific frontend connections happens via
 // the standard envelope `connection_id` field already embedded in payloads.
 //
-// A1 limitation: if the WS connection itself drops (e.g. mid-air mux
-// reset) but the daemon is still healthy, the bridge exits and events are
-// silently lost until the next reconnect supervisor cycle re-spawns it.
-// A future iteration adds in-bridge retry.
+// Self-retry (Phase C): connect failures and mid-stream errors trigger an
+// exponential backoff retry (1/2/4/8/16s, capped) until the killer fires.
+// The supervisor (CG-002.7) is the authority on whether the SSH-level
+// connection is dead — the bridge just keeps trying until told to stop.
+
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::sync::oneshot;
@@ -27,13 +29,12 @@ struct DaemonEventFrame {
     payload: serde_json::Value,
 }
 
+const MAX_BACKOFF_SECS: u64 = 16;
+
 /// Run a bridge against `ws://127.0.0.1:<local_port>/ws/events?token=...`.
 ///
 /// The bridge auths via the `?token=` query string (matches
-/// `web::auth::require_token`). It returns when:
-///   - the killer fires (graceful shutdown),
-///   - the daemon closes the socket,
-///   - the WS handshake or any subsequent read fails.
+/// `web::auth::require_token`). Returns only when the killer fires.
 pub async fn bridge_loop(
     local_port: u16,
     token: String,
@@ -45,40 +46,77 @@ pub async fn bridge_loop(
         local_port,
         urlencoding::encode(&token)
     );
-    let (ws_stream, _) = match tokio_tungstenite::connect_async(&url).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("[Remote ws-bridge] connect failed: {e}");
-            return;
-        }
-    };
-
-    use futures_util::StreamExt;
-    let (_write, mut read) = ws_stream.split();
+    let mut backoff_secs: u64 = 1;
 
     loop {
-        tokio::select! {
+        // 1. Connect (killer-aware).
+        let connect_fut = Box::pin(tokio_tungstenite::connect_async(&url));
+        let ws_stream = tokio::select! {
             biased;
             _ = &mut killer => return,
-            msg = read.next() => {
-                let Some(msg) = msg else { return; };
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[Remote ws-bridge] read error: {e}");
-                        return;
+            res = connect_fut => match res {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    eprintln!(
+                        "[Remote ws-bridge] connect failed (retry in {}s): {e}",
+                        backoff_secs
+                    );
+                    let sleep = tokio::time::sleep(Duration::from_secs(backoff_secs));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        biased;
+                        _ = &mut killer => return,
+                        _ = &mut sleep => {}
                     }
-                };
-                match msg {
-                    Message::Text(text) => relay_frame(&emitter, &text),
-                    Message::Binary(_)
-                    | Message::Ping(_)
-                    | Message::Pong(_)
-                    | Message::Frame(_) => {}
-                    Message::Close(_) => return,
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+            }
+        };
+
+        eprintln!("[Remote ws-bridge] connected port={}", local_port);
+        backoff_secs = 1;
+
+        use futures_util::StreamExt;
+        let (_write, mut read) = ws_stream.split();
+
+        // 2. Read until close / error / killer.
+        let mut killer_fired = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut killer => { killer_fired = true; break; }
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        eprintln!("[Remote ws-bridge] stream ended (will reconnect)");
+                        break;
+                    };
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[Remote ws-bridge] read error (will reconnect): {e}");
+                            break;
+                        }
+                    };
+                    match msg {
+                        Message::Text(text) => relay_frame(&emitter, &text),
+                        Message::Binary(_)
+                        | Message::Ping(_)
+                        | Message::Pong(_)
+                        | Message::Frame(_) => {}
+                        Message::Close(_) => {
+                            eprintln!("[Remote ws-bridge] daemon closed (will reconnect)");
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        if killer_fired {
+            return;
+        }
+        // Outer loop reconnects with the (still-1s) backoff.
     }
 }
 
@@ -106,5 +144,32 @@ mod tests {
             frame.payload.get("connection_id").and_then(|v| v.as_str()),
             Some("abc")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn killer_during_initial_connect_returns_quickly() {
+        // Use port 1 (privileged) which fails to connect on macOS without
+        // sudo; the bridge should burn through retries while the killer
+        // races the backoff sleep. We fire the killer immediately so the
+        // very first sleep wakes up right away.
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            bridge_loop(1, "tok".into(), EventEmitter::Noop, kill_rx).await;
+        });
+
+        // Yield once so the bridge can attempt its first connect_async, then
+        // signal kill. Under `start_paused = true`, time advances on demand
+        // — `tokio::time::advance` would fast-forward the backoff sleep, but
+        // the killer should preempt it regardless.
+        tokio::task::yield_now().await;
+        let _ = kill_tx.send(());
+
+        // Bound: bridge must return within a small wall-clock budget even
+        // though `connect_async` typically fails after a TCP timeout. The
+        // killer races inside both the connect and sleep selects; if the
+        // wiring is right we exit immediately.
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(res.is_ok(), "bridge_loop did not exit on killer in time");
     }
 }
