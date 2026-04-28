@@ -180,21 +180,21 @@ pub struct GitStartPullMergeParams {
 pub async fn git_start_pull_merge(
     Json(params): Json<GitStartPullMergeParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_start_pull_merge(params.path, params.upstream_commit).await?;
+    folder_commands::git_start_pull_merge_local(params.path, params.upstream_commit).await?;
     Ok(Json(()))
 }
 
 pub async fn git_has_merge_head(
     Json(params): Json<PathParams>,
 ) -> Result<Json<bool>, AppCommandError> {
-    let result = folder_commands::git_has_merge_head(params.path).await?;
+    let result = folder_commands::git_has_merge_head_local(params.path).await?;
     Ok(Json(result))
 }
 
 pub async fn git_push_info(
     Json(params): Json<PathParams>,
 ) -> Result<Json<folder_commands::GitPushInfo>, AppCommandError> {
-    let result = folder_commands::git_push_info(params.path).await?;
+    let result = folder_commands::git_push_info_local(params.path).await?;
     Ok(Json(result))
 }
 
@@ -385,21 +385,21 @@ pub async fn git_add_files(
 pub async fn git_add_remote(
     Json(params): Json<PathNameUrlParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_add_remote(params.path, params.name, params.url).await?;
+    folder_commands::git_add_remote_local(params.path, params.name, params.url).await?;
     Ok(Json(()))
 }
 
 pub async fn git_remove_remote(
     Json(params): Json<PathNameParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_remove_remote(params.path, params.name).await?;
+    folder_commands::git_remove_remote_local(params.path, params.name).await?;
     Ok(Json(()))
 }
 
 pub async fn git_set_remote_url(
     Json(params): Json<PathNameUrlParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_set_remote_url(params.path, params.name, params.url).await?;
+    folder_commands::git_set_remote_url_local(params.path, params.name, params.url).await?;
     Ok(Json(()))
 }
 

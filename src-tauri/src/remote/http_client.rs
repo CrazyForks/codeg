@@ -11,9 +11,9 @@ use crate::acp::types::{ForkResultInfo, PromptInputBlock};
 use crate::acp::LiveSessionSnapshot;
 use crate::commands::folders::{
     FileEditContent, FilePreviewContent, FileSaveResult, GitBranchList, GitCommitResult,
-    GitLogResult, GitRemote, GitStatusEntry,
+    GitLogResult, GitPullResult, GitPushInfo, GitPushResult, GitRemote, GitStatusEntry,
 };
-use crate::models::{AgentType, ConversationDetail, ConversationSummary};
+use crate::models::{AgentType, ConversationDetail, ConversationSummary, GitCredentials};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -539,6 +539,127 @@ impl DaemonClient {
         self.post_json(&url, &body).await
     }
 
+    pub async fn git_pull(
+        &self,
+        path: String,
+        credentials: Option<GitCredentials>,
+    ) -> Result<GitPullResult, ClientError> {
+        let url = format!("{}/api/git_pull", self.base_url);
+        let body = GitPullBody { path, credentials };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_fetch(
+        &self,
+        path: String,
+        credentials: Option<GitCredentials>,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/git_fetch", self.base_url);
+        let body = GitFetchBody { path, credentials };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_fetch_remote(
+        &self,
+        path: String,
+        name: String,
+        credentials: Option<GitCredentials>,
+    ) -> Result<String, ClientError> {
+        let url = format!("{}/api/git_fetch_remote", self.base_url);
+        let body = GitFetchRemoteBody {
+            path,
+            name,
+            credentials,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_push(
+        &self,
+        path: String,
+        remote: Option<String>,
+        credentials: Option<GitCredentials>,
+        folder_id: Option<i32>,
+    ) -> Result<GitPushResult, ClientError> {
+        let url = format!("{}/api/git_push", self.base_url);
+        let body = GitPushBody {
+            folder_id,
+            path,
+            remote,
+            credentials,
+        };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_push_info(&self, path: String) -> Result<GitPushInfo, ClientError> {
+        let url = format!("{}/api/git_push_info", self.base_url);
+        let body = GitPathBody { path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_start_pull_merge(
+        &self,
+        path: String,
+        upstream_commit: Option<String>,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_start_pull_merge", self.base_url);
+        let body = GitStartPullMergeBody {
+            path,
+            upstream_commit,
+        };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_has_merge_head(&self, path: String) -> Result<bool, ClientError> {
+        let url = format!("{}/api/git_has_merge_head", self.base_url);
+        let body = GitPathBody { path };
+        self.post_json(&url, &body).await
+    }
+
+    pub async fn git_add_remote(
+        &self,
+        path: String,
+        name: String,
+        url_value: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_add_remote", self.base_url);
+        let body = GitPathNameUrlBody {
+            path,
+            name,
+            url: url_value,
+        };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_remove_remote(
+        &self,
+        path: String,
+        name: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_remove_remote", self.base_url);
+        let body = GitPathNameBody { path, name };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
+    pub async fn git_set_remote_url(
+        &self,
+        path: String,
+        name: String,
+        url_value: String,
+    ) -> Result<(), ClientError> {
+        let url = format!("{}/api/git_set_remote_url", self.base_url);
+        let body = GitPathNameUrlBody {
+            path,
+            name,
+            url: url_value,
+        };
+        let _: serde_json::Value = self.post_json(&url, &body).await?;
+        Ok(())
+    }
+
     async fn post_json<B: serde::Serialize, R: for<'de> serde::Deserialize<'de>>(
         &self,
         url: &str,
@@ -758,6 +879,59 @@ struct GitCommitBody {
     path: String,
     message: String,
     files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPullBody {
+    path: String,
+    credentials: Option<GitCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitFetchBody {
+    path: String,
+    credentials: Option<GitCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitFetchRemoteBody {
+    path: String,
+    name: String,
+    credentials: Option<GitCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPushBody {
+    folder_id: Option<i32>,
+    path: String,
+    remote: Option<String>,
+    credentials: Option<GitCredentials>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStartPullMergeBody {
+    path: String,
+    upstream_commit: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPathNameBody {
+    path: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitPathNameUrlBody {
+    path: String,
+    name: String,
+    url: String,
 }
 
 #[derive(Debug, thiserror::Error)]

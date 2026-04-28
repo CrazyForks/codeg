@@ -214,7 +214,7 @@ pub struct GitBranchList {
     pub worktree_branches: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GitConflictInfo {
     pub has_conflicts: bool,
     pub conflicted_files: Vec<String>,
@@ -222,19 +222,19 @@ pub struct GitConflictInfo {
     pub upstream_commit: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GitPullResult {
     pub updated_files: usize,
     pub conflict: Option<GitConflictInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GitPushResult {
     pub pushed_commits: usize,
     pub upstream_set: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GitPushInfo {
     pub branch: String,
     pub remotes: Vec<GitRemote>,
@@ -1007,8 +1007,16 @@ pub async fn git_pull(
     path: String,
     credentials: Option<GitCredentials>,
     db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
     app_handle: tauri::AppHandle,
 ) -> Result<GitPullResult, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_pull(real_path.to_string(), credentials)
+            .await
+            .map_err(client_error_to_app_error);
+    }
     let data_dir = app_handle.path().app_data_dir().map_err(|e| {
         AppCommandError::external_command("Failed to resolve app data dir", e.to_string())
     })?;
@@ -1018,8 +1026,7 @@ pub async fn git_pull(
 /// Start a merge with the upstream branch (used by merge workspace after pull conflict detection).
 /// This recreates the conflict state so that :1:, :2:, :3: stage entries are available.
 /// If `upstream_commit` is provided, merge against that specific commit instead of `@{u}`.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_start_pull_merge(
+pub async fn git_start_pull_merge_local(
     path: String,
     upstream_commit: Option<String>,
 ) -> Result<(), AppCommandError> {
@@ -1044,8 +1051,25 @@ pub async fn git_start_pull_merge(
     Ok(())
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_has_merge_head(path: String) -> Result<bool, AppCommandError> {
+pub async fn git_start_pull_merge(
+    path: String,
+    upstream_commit: Option<String>,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<(), AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_start_pull_merge(real_path.to_string(), upstream_commit)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_start_pull_merge_local(path, upstream_commit).await
+}
+
+pub async fn git_has_merge_head_local(path: String) -> Result<bool, AppCommandError> {
     let output = crate::process::tokio_command("git")
         .args(["rev-parse", "--verify", "MERGE_HEAD"])
         .current_dir(&path)
@@ -1053,6 +1077,23 @@ pub async fn git_has_merge_head(path: String) -> Result<bool, AppCommandError> {
         .await
         .map_err(AppCommandError::io)?;
     Ok(output.status.success())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_has_merge_head(
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<bool, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_has_merge_head(real_path.to_string())
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_has_merge_head_local(path).await
 }
 
 pub(crate) async fn git_fetch_core(
@@ -1079,16 +1120,23 @@ pub async fn git_fetch(
     path: String,
     credentials: Option<GitCredentials>,
     db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_fetch(real_path.to_string(), credentials)
+            .await
+            .map_err(client_error_to_app_error);
+    }
     let data_dir = app_handle.path().app_data_dir().map_err(|e| {
         AppCommandError::external_command("Failed to resolve app data dir", e.to_string())
     })?;
     git_fetch_core(&path, credentials.as_ref(), &db, &data_dir).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError> {
+pub async fn git_push_info_local(path: String) -> Result<GitPushInfo, AppCommandError> {
     ensure_git_repo(&path)?;
 
     // Get current branch name
@@ -1123,6 +1171,23 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
         remotes,
         tracking_remote,
     })
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_push_info(
+    path: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<GitPushInfo, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_push_info(real_path.to_string())
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_push_info_local(path).await
 }
 
 pub(crate) async fn git_push_core(
@@ -1225,6 +1290,7 @@ pub(crate) async fn git_push_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn git_push(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
@@ -1233,6 +1299,7 @@ pub async fn git_push(
     credentials: Option<GitCredentials>,
     folder_id: Option<i32>,
     db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
 ) -> Result<GitPushResult, AppCommandError> {
     let folder_id = folder_id.or_else(|| {
         window
@@ -1240,10 +1307,35 @@ pub async fn git_push(
             .strip_prefix("push-")
             .and_then(|value| value.parse::<i32>().ok())
     });
+    let emitter = EventEmitter::Tauri(app.clone());
+
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        // Force folder_id=None on the remote so the daemon does NOT emit
+        // `folder://git-push-succeeded`; the daemon's folder id is meaningless
+        // to the desktop frontend. We emit locally with the desktop-side
+        // folder_id below.
+        let result = client
+            .git_push(real_path.to_string(), remote.clone(), credentials, None)
+            .await
+            .map_err(client_error_to_app_error)?;
+        if let Some(fid) = folder_id {
+            crate::web::event_bridge::emit_event(
+                &emitter,
+                "folder://git-push-succeeded",
+                GitPushSucceededEvent {
+                    folder_id: fid,
+                    pushed_commits: result.pushed_commits,
+                    upstream_set: result.upstream_set,
+                },
+            );
+        }
+        return Ok(result);
+    }
+
     let data_dir = app.path().app_data_dir().map_err(|e| {
         AppCommandError::external_command("Failed to resolve app data dir", e.to_string())
     })?;
-    let emitter = EventEmitter::Tauri(app.clone());
     git_push_core(
         &data_dir,
         &emitter,
@@ -2386,16 +2478,23 @@ pub async fn git_fetch_remote(
     name: String,
     credentials: Option<GitCredentials>,
     db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_fetch_remote(real_path.to_string(), name, credentials)
+            .await
+            .map_err(client_error_to_app_error);
+    }
     let data_dir = app_handle.path().app_data_dir().map_err(|e| {
         AppCommandError::external_command("Failed to resolve app data dir", e.to_string())
     })?;
     git_fetch_remote_core(&path, &name, credentials.as_ref(), &db, &data_dir).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_add_remote(
+pub async fn git_add_remote_local(
     path: String,
     name: String,
     url: String,
@@ -2413,8 +2512,26 @@ pub async fn git_add_remote(
     Ok(())
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_remove_remote(path: String, name: String) -> Result<(), AppCommandError> {
+pub async fn git_add_remote(
+    path: String,
+    name: String,
+    url: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<(), AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_add_remote(real_path.to_string(), name, url)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_add_remote_local(path, name, url).await
+}
+
+pub async fn git_remove_remote_local(path: String, name: String) -> Result<(), AppCommandError> {
     let output = crate::process::tokio_command("git")
         .args(["remote", "remove", &name])
         .current_dir(&path)
@@ -2428,8 +2545,25 @@ pub async fn git_remove_remote(path: String, name: String) -> Result<(), AppComm
     Ok(())
 }
 
+#[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_set_remote_url(
+pub async fn git_remove_remote(
+    path: String,
+    name: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<(), AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_remove_remote(real_path.to_string(), name)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_remove_remote_local(path, name).await
+}
+
+pub async fn git_set_remote_url_local(
     path: String,
     name: String,
     url: String,
@@ -2445,6 +2579,25 @@ pub async fn git_set_remote_url(
         return Err(git_command_error("remote set-url", &output.stderr));
     }
     Ok(())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_set_remote_url(
+    path: String,
+    name: String,
+    url: String,
+    db: tauri::State<'_, AppDatabase>,
+    rcm: tauri::State<'_, RemoteConnectionManager>,
+) -> Result<(), AppCommandError> {
+    if let Some((ssh_id, real_path)) = parse_remote_path(&path) {
+        let client = resolve_remote_file_client(&rcm, &db, ssh_id).await?;
+        return client
+            .git_set_remote_url(real_path.to_string(), name, url)
+            .await
+            .map_err(client_error_to_app_error);
+    }
+    git_set_remote_url_local(path, name, url).await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
