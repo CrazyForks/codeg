@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use crate::models::*;
@@ -35,7 +37,14 @@ impl GeminiParser {
     }
 
     fn is_chat_file(path: &Path) -> bool {
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let Some(extension) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+        else {
+            return false;
+        };
+        if !matches!(extension.as_str(), "json" | "jsonl") {
             return false;
         }
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -46,6 +55,97 @@ impl GeminiParser {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             == Some("chats")
+    }
+
+    fn parse_chat_value(path: &Path, raw: &str) -> Option<Value> {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if extension.as_deref() == Some("jsonl") {
+            Self::parse_jsonl_chat_value(raw)
+        } else {
+            serde_json::from_str(raw).ok()
+        }
+    }
+
+    fn set_jsonl_root_field(
+        root: &mut Map<String, Value>,
+        key: &str,
+        value: Option<&Value>,
+        overwrite: bool,
+    ) {
+        let Some(value) = value else {
+            return;
+        };
+        if overwrite || !root.contains_key(key) {
+            root.insert(key.to_string(), value.clone());
+        }
+    }
+
+    fn merge_message_value(existing: &mut Value, update: Value) {
+        match (existing.as_object_mut(), update) {
+            (Some(existing_map), Value::Object(update_map)) => {
+                for (key, value) in update_map {
+                    existing_map.insert(key, value);
+                }
+            }
+            (_, update) => {
+                *existing = update;
+            }
+        }
+    }
+
+    fn parse_jsonl_chat_value(raw: &str) -> Option<Value> {
+        let mut root = Map::new();
+        let mut messages = Vec::new();
+        let mut message_index_by_id: HashMap<String, usize> = HashMap::new();
+        let mut saw_json_line = false;
+
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let value: Value = serde_json::from_str(trimmed).ok()?;
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            saw_json_line = true;
+
+            Self::set_jsonl_root_field(&mut root, "kind", object.get("kind"), false);
+            Self::set_jsonl_root_field(&mut root, "sessionId", object.get("sessionId"), false);
+            Self::set_jsonl_root_field(&mut root, "projectHash", object.get("projectHash"), false);
+            Self::set_jsonl_root_field(&mut root, "startTime", object.get("startTime"), false);
+            Self::set_jsonl_root_field(&mut root, "lastUpdated", object.get("lastUpdated"), true);
+
+            if let Some(set) = object.get("$set").and_then(|v| v.as_object()) {
+                Self::set_jsonl_root_field(&mut root, "lastUpdated", set.get("lastUpdated"), true);
+            }
+
+            if object.get("type").and_then(|v| v.as_str()).is_none() {
+                continue;
+            }
+
+            if let Some(id) = object.get("id").and_then(|v| v.as_str()) {
+                if let Some(index) = message_index_by_id.get(id).copied() {
+                    Self::merge_message_value(&mut messages[index], value);
+                    continue;
+                }
+
+                message_index_by_id.insert(id.to_string(), messages.len());
+            }
+
+            messages.push(value);
+        }
+
+        if !saw_json_line {
+            return None;
+        }
+
+        root.insert("messages".to_string(), Value::Array(messages));
+        Some(Value::Object(root))
     }
 
     fn list_chat_files(&self) -> Vec<PathBuf> {
@@ -114,9 +214,9 @@ impl GeminiParser {
         value.and_then(|v| v.as_str()?.parse::<DateTime<Utc>>().ok())
     }
 
-    fn extract_text(value: &serde_json::Value) -> Option<String> {
+    fn extract_text(value: &Value) -> Option<String> {
         match value {
-            serde_json::Value::String(text) => {
+            Value::String(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
                     None
@@ -124,7 +224,7 @@ impl GeminiParser {
                     Some(trimmed.to_string())
                 }
             }
-            serde_json::Value::Array(items) => {
+            Value::Array(items) => {
                 let mut parts = Vec::new();
                 for item in items {
                     if let Some(text) = item.get("text").and_then(Self::extract_text) {
@@ -139,7 +239,7 @@ impl GeminiParser {
                     Some(parts.join("\n"))
                 }
             }
-            serde_json::Value::Object(map) => {
+            Value::Object(map) => {
                 if let Some(text) = map.get("text").and_then(Self::extract_text) {
                     return Some(text);
                 }
@@ -152,7 +252,7 @@ impl GeminiParser {
         }
     }
 
-    fn extract_message_text(message: &serde_json::Value) -> Option<String> {
+    fn extract_message_text(message: &Value) -> Option<String> {
         message
             .get("content")
             .and_then(Self::extract_text)
@@ -175,7 +275,7 @@ impl GeminiParser {
         Some((mime_type.to_string(), data.to_string()))
     }
 
-    fn parse_user_image_part(part: &serde_json::Value) -> Option<ContentBlock> {
+    fn parse_user_image_part(part: &Value) -> Option<ContentBlock> {
         let inline = part
             .get("inlineData")
             .or_else(|| part.get("inline_data"))
@@ -213,7 +313,7 @@ impl GeminiParser {
         })
     }
 
-    fn parse_user_blocks(message: &serde_json::Value) -> Vec<ContentBlock> {
+    fn parse_user_blocks(message: &Value) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
         let content = match message.get("content") {
             Some(c) => c,
@@ -262,11 +362,7 @@ impl GeminiParser {
         blocks
     }
 
-    fn parse_summary_from_value(
-        &self,
-        path: &Path,
-        value: &serde_json::Value,
-    ) -> Option<ConversationSummary> {
+    fn parse_summary_from_value(&self, path: &Path, value: &Value) -> Option<ConversationSummary> {
         let id = value.get("sessionId").and_then(|v| v.as_str())?.to_string();
         let messages = value
             .get("messages")
@@ -322,7 +418,7 @@ impl GeminiParser {
         })
     }
 
-    fn result_preview(result: Option<&serde_json::Value>) -> Option<String> {
+    fn result_preview(result: Option<&Value>) -> Option<String> {
         let v = result?;
         if let Some(s) = v.as_str() {
             let trimmed = s.trim();
@@ -334,7 +430,21 @@ impl GeminiParser {
         serde_json::to_string(v).ok()
     }
 
-    fn tool_call_is_error(call: &serde_json::Value, output_preview: Option<&str>) -> bool {
+    fn result_display_preview(result_display: Option<&Value>) -> Option<String> {
+        let value = result_display?;
+        if let Some(summary) = value
+            .get("summary")
+            .and_then(Self::extract_text)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(summary);
+        }
+
+        Self::result_preview(Some(value))
+    }
+
+    fn tool_call_is_error(call: &Value, output_preview: Option<&str>) -> bool {
         if call
             .get("status")
             .and_then(|v| v.as_str())
@@ -370,7 +480,7 @@ impl GeminiParser {
             .unwrap_or(false)
     }
 
-    fn parse_assistant_blocks(message: &serde_json::Value) -> Vec<ContentBlock> {
+    fn parse_assistant_blocks(message: &Value) -> Vec<ContentBlock> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
 
         if let Some(thoughts) = message.get("thoughts").and_then(|v| v.as_array()) {
@@ -421,12 +531,7 @@ impl GeminiParser {
                     input_preview,
                 });
 
-                let output_preview = call
-                    .get("resultDisplay")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
+                let output_preview = Self::result_display_preview(call.get("resultDisplay"))
                     .or_else(|| Self::result_preview(call.get("result")));
                 let is_error = Self::tool_call_is_error(call, output_preview.as_deref());
 
@@ -446,7 +551,7 @@ impl GeminiParser {
         blocks
     }
 
-    fn parse_usage(message: &serde_json::Value) -> Option<TurnUsage> {
+    fn parse_usage(message: &Value) -> Option<TurnUsage> {
         let tokens = message.get("tokens")?;
         let input_tokens = tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
         let output_tokens = tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -462,7 +567,7 @@ impl GeminiParser {
     fn parse_conversation_detail(
         &self,
         path: &Path,
-        value: &serde_json::Value,
+        value: &Value,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
         let mut summary = self
@@ -605,9 +710,8 @@ impl AgentParser for GeminiParser {
                 Ok(raw) => raw,
                 Err(_) => continue,
             };
-            let value: serde_json::Value = match serde_json::from_str(&raw) {
-                Ok(value) => value,
-                Err(_) => continue,
+            let Some(value) = Self::parse_chat_value(&chat_file, &raw) else {
+                continue;
             };
             if let Some(summary) = self.parse_summary_from_value(&chat_file, &value) {
                 conversations.push(summary);
@@ -628,9 +732,8 @@ impl AgentParser for GeminiParser {
                 continue;
             }
 
-            let value: serde_json::Value = match serde_json::from_str(&raw) {
-                Ok(value) => value,
-                Err(_) => continue,
+            let Some(value) = Self::parse_chat_value(&chat_file, &raw) else {
+                continue;
             };
             let session_id = value.get("sessionId").and_then(|v| v.as_str());
             if session_id != Some(conversation_id) {
@@ -817,6 +920,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_gemini_session_detail_from_jsonl_chat_log() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let base: PathBuf = env::temp_dir().join(format!("codeg-gemini-jsonl-test-{nanos}"));
+        let chats_dir = base.join("tmp").join("codeg-jsonl").join("chats");
+        fs::create_dir_all(&chats_dir).expect("create chat dir");
+        fs::write(
+            base.join("tmp").join("codeg-jsonl").join(".project_root"),
+            "/Users/test/workspace/jsonl-demo",
+        )
+        .expect("write project root");
+
+        let file_path = chats_dir.join("session-2026-05-11T13-22-jsonl.jsonl");
+        let content = r#"{"kind":"main","sessionId":"jsonl-session-1","projectHash":"abc","startTime":"2026-05-11T13:22:43.000Z","lastUpdated":"2026-05-11T13:22:43.000Z"}
+{"kind":"main","sessionId":"jsonl-session-1","projectHash":"abc","startTime":"2026-05-11T13:22:43.000Z","lastUpdated":"2026-05-11T13:22:44.000Z"}
+{"id":"u1","timestamp":"2026-05-11T13:23:16.870Z","type":"user","content":[{"text":"hello from jsonl"}]}
+{"$set":{"lastUpdated":"2026-05-11T13:23:16.870Z"}}
+{"id":"a1","timestamp":"2026-05-11T13:23:23.568Z","type":"gemini","content":"partial answer","model":"gemini-2.5-pro"}
+{"id":"a1","timestamp":"2026-05-11T13:23:23.568Z","type":"gemini","content":"final answer","toolCalls":[{"id":"read-1","name":"read_file","args":{"path":"README.md"},"resultDisplay":{"summary":"Read README.md"},"status":"success"}],"tokens":{"input":10,"output":20,"cached":3},"model":"gemini-2.5-pro"}
+"#;
+        fs::write(&file_path, content).expect("write jsonl chat file");
+
+        let parser = GeminiParser::with_base_dir(base.clone());
+        let summaries = parser.list_conversations().expect("list conversations");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "jsonl-session-1");
+        assert_eq!(summaries[0].message_count, 2);
+        assert_eq!(summaries[0].title.as_deref(), Some("hello from jsonl"));
+        assert_eq!(
+            summaries[0].folder_path.as_deref(),
+            Some("/Users/test/workspace/jsonl-demo")
+        );
+
+        let detail = parser
+            .get_conversation("jsonl-session-1")
+            .expect("get conversation");
+        assert_eq!(detail.turns.len(), 2);
+        assert!(matches!(detail.turns[0].role, TurnRole::User));
+        assert!(matches!(detail.turns[1].role, TurnRole::Assistant));
+
+        let assistant = &detail.turns[1];
+        assert_eq!(assistant.model.as_deref(), Some("gemini-2.5-pro"));
+        let text_blocks: Vec<&str> = assistant
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_blocks, vec!["final answer"]);
+        assert!(assistant.blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolResult {
+                output_preview: Some(output),
+                is_error: false,
+                ..
+            } if output == "Read README.md"
+        )));
+        let stats = detail.session_stats.expect("session stats");
+        assert_eq!(stats.total_tokens, Some(33));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn parse_detail_completion_time_uses_assistant_timestamp_not_next_message_gap() {
         // Regression: Gemini's `duration_ms` heuristic is `next_msg.ts -
         // assistant.ts`, which means a quick user follow-up makes the gap
@@ -855,15 +1026,11 @@ mod tests {
             .find(|t| matches!(t.role, TurnRole::Assistant))
             .expect("assistant turn");
         let completed_at = assistant.completed_at.expect("completed_at populated");
-        let expected = "2026-03-02T04:30:02.000Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap();
+        let expected = "2026-03-02T04:30:02.000Z".parse::<DateTime<Utc>>().unwrap();
         assert_eq!(completed_at, expected);
         // The naive `timestamp + (next_user.ts - assistant.ts)` would land
         // on the second user message timestamp.
-        let wrong = "2026-03-02T04:30:50.000Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap();
+        let wrong = "2026-03-02T04:30:50.000Z".parse::<DateTime<Utc>>().unwrap();
         assert_ne!(completed_at, wrong);
 
         let _ = fs::remove_dir_all(base);
