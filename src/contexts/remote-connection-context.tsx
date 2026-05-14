@@ -28,12 +28,20 @@ interface RemoteConnectionContextValue {
 interface RemoteConnectionState {
   connection: RemoteWorkspaceConnection | null
   loadedId: number | null
+  loadedWindowId: string | null
   error: string | null
   expired: boolean
 }
 
 const RemoteConnectionContext =
   createContext<RemoteConnectionContextValue | null>(null)
+
+function createFallbackRemoteWindowId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return `rw-${globalThis.crypto.randomUUID()}`
+  }
+  return `rw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
 
 export function useRemoteConnection() {
   return useContext(RemoteConnectionContext)
@@ -44,9 +52,16 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
   const searchParams = useSearchParams()
   const rawId = searchParams.get("remoteConnectionId")
   const remoteConnectionId = rawId ? Number(rawId) : null
+  const fallbackRemoteWindowId = useMemo(
+    () => createFallbackRemoteWindowId(),
+    []
+  )
+  const remoteWindowId =
+    searchParams.get("remoteWindowId") || fallbackRemoteWindowId
   const [state, setState] = useState<RemoteConnectionState>({
     connection: null,
     loadedId: null,
+    loadedWindowId: null,
     error: null,
     expired: false,
   })
@@ -68,12 +83,14 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
           name: next.name,
           baseUrl: next.base_url,
           token: next.token,
+          windowInstanceId: remoteWindowId,
           onUnauthorized: () =>
             setState((prev) => ({ ...prev, expired: true })),
         })
         setState({
           connection: next,
           loadedId: remoteConnectionId,
+          loadedWindowId: remoteWindowId,
           error: null,
           expired: false,
         })
@@ -84,6 +101,7 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
         setState({
           connection: null,
           loadedId: remoteConnectionId,
+          loadedWindowId: remoteWindowId,
           error: toErrorMessage(err),
           expired: false,
         })
@@ -92,7 +110,7 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true
     }
-  }, [remoteConnectionId])
+  }, [remoteConnectionId, remoteWindowId])
 
   const value = useMemo(
     () => ({
@@ -105,19 +123,16 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
 
   const hasRemoteConnection =
     remoteConnectionId !== null && Number.isFinite(remoteConnectionId)
-  const loading = hasRemoteConnection && state.loadedId !== remoteConnectionId
+  const loadedCurrentRemoteWindow =
+    state.loadedId === remoteConnectionId &&
+    state.loadedWindowId === remoteWindowId
+  const loading = hasRemoteConnection && !loadedCurrentRemoteWindow
   const error =
-    hasRemoteConnection && state.loadedId === remoteConnectionId
-      ? state.error
-      : null
+    hasRemoteConnection && loadedCurrentRemoteWindow ? state.error : null
   const expired =
-    hasRemoteConnection && state.loadedId === remoteConnectionId
-      ? state.expired
-      : false
+    hasRemoteConnection && loadedCurrentRemoteWindow ? state.expired : false
   const connection =
-    hasRemoteConnection && state.loadedId === remoteConnectionId
-      ? state.connection
-      : null
+    hasRemoteConnection && loadedCurrentRemoteWindow ? state.connection : null
 
   if (loading) {
     return (

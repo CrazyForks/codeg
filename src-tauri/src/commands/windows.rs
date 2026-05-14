@@ -335,11 +335,63 @@ fn resolve_settings_target(section: Option<&str>, agent_type: Option<&str>) -> S
     route.to_string()
 }
 
-fn append_remote_connection_id(route: String, remote_connection_id: Option<i32>) -> String {
-    match remote_connection_id {
-        Some(id) if route.contains('?') => format!("{route}&remoteConnectionId={id}"),
-        Some(id) => format!("{route}?remoteConnectionId={id}"),
+fn append_query_param(route: String, key: &str, value: &str) -> String {
+    if route.contains('?') {
+        format!("{route}&{key}={value}")
+    } else {
+        format!("{route}?{key}={value}")
+    }
+}
+
+fn append_remote_context(
+    route: String,
+    remote_connection_id: Option<i32>,
+    remote_window_id: Option<&str>,
+) -> String {
+    let Some(id) = remote_connection_id else {
+        return route;
+    };
+    let route = append_query_param(route, "remoteConnectionId", &id.to_string());
+    match remote_window_id {
+        Some(window_id) => append_query_param(route, "remoteWindowId", window_id),
         None => route,
+    }
+}
+
+fn route_with_new_remote_window(
+    route: String,
+    remote_connection_id: Option<i32>,
+) -> (String, Option<String>) {
+    let remote_window_id = remote_connection_id
+        .map(|_| crate::commands::remote_workspace::new_remote_window_instance_id());
+    let route = append_remote_context(route, remote_connection_id, remote_window_id.as_deref());
+    (route, remote_window_id)
+}
+
+fn remote_window_id_from_window(window: &tauri::WebviewWindow) -> Option<String> {
+    window.url().ok()?.query_pairs().find_map(|(key, value)| {
+        if key == "remoteWindowId" && !value.is_empty() {
+            Some(value.into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn register_remote_window_cleanup(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    remote_window_id: Option<&str>,
+) {
+    let Some(remote_window_id) = remote_window_id else {
+        return;
+    };
+    if let Some(proxy) =
+        app.try_state::<std::sync::Arc<crate::commands::remote_proxy::RemoteProxyState>>()
+    {
+        proxy
+            .inner()
+            .register_window_instance_cleanup(window, remote_window_id.to_string());
     }
 }
 
@@ -536,10 +588,9 @@ pub async fn open_commit_window(
             })?;
         format!("{} - {}", titles.commit, folder.name)
     };
-    let url = WebviewUrl::App(
-        append_remote_connection_id(format!("commit?folderId={folder_id}"), remote_connection_id)
-            .into(),
-    );
+    let (url_str, remote_window_id) =
+        route_with_new_remote_window(format!("commit?folderId={folder_id}"), remote_connection_id);
+    let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)
         .inner_size(1220.0, 820.0)
@@ -551,6 +602,7 @@ pub async fn open_commit_window(
     let commit_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open commit window", e.to_string()))?;
+    register_remote_window_cleanup(&app, &commit_window, remote_window_id.as_deref());
     post_window_setup(&commit_window);
     state.set_owner(label, owner_label);
     commit_window
@@ -573,10 +625,6 @@ pub async fn open_settings_window(
     remote_connection_id: Option<i32>,
     state: tauri::State<'_, SettingsWindowState>,
 ) -> Result<(), AppCommandError> {
-    let target_route = append_remote_connection_id(
-        resolve_settings_target(section.as_deref(), agent_type.as_deref()),
-        remote_connection_id,
-    );
     let settings_label = match remote_connection_id {
         Some(remote_id) => format!("remote-settings-{remote_id}"),
         None => "settings".to_string(),
@@ -585,6 +633,21 @@ pub async fn open_settings_window(
     if let Some(existing) = app.get_webview_window(&settings_label) {
         post_window_setup(&existing);
         if section.is_some() || agent_type.is_some() || remote_connection_id.is_some() {
+            let existing_remote_window_id = remote_window_id_from_window(&existing);
+            let generated_remote_window_id = remote_connection_id
+                .filter(|_| existing_remote_window_id.is_none())
+                .map(|_| crate::commands::remote_workspace::new_remote_window_instance_id());
+            let remote_window_id = existing_remote_window_id
+                .as_deref()
+                .or(generated_remote_window_id.as_deref());
+            if generated_remote_window_id.is_some() {
+                register_remote_window_cleanup(&app, &existing, remote_window_id);
+            }
+            let target_route = append_remote_context(
+                resolve_settings_target(section.as_deref(), agent_type.as_deref()),
+                remote_connection_id,
+                remote_window_id,
+            );
             let target_path = format!("/{target_route}");
             let target_json = serde_json::to_string(&target_path).map_err(|e| {
                 AppCommandError::window("Failed to build settings navigation target", e.to_string())
@@ -604,6 +667,10 @@ pub async fn open_settings_window(
     }
 
     let titles = resolve_window_titles(&db.conn, locale).await;
+    let (target_route, remote_window_id) = route_with_new_remote_window(
+        resolve_settings_target(section.as_deref(), agent_type.as_deref()),
+        remote_connection_id,
+    );
     let url = WebviewUrl::App(target_route.into());
     let builder = WebviewWindowBuilder::new(&app, &settings_label, url)
         .title(titles.settings)
@@ -616,6 +683,7 @@ pub async fn open_settings_window(
     let settings_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open settings window", e.to_string()))?;
+    register_remote_window_cleanup(&app, &settings_window, remote_window_id.as_deref());
     post_window_setup(&settings_window);
     state.set_owner(settings_label, owner_label);
     settings_window
@@ -725,7 +793,7 @@ pub async fn open_merge_window(
     if let Some(ref commit) = upstream_commit {
         url_str.push_str(&format!("&upstreamCommit={commit}"));
     }
-    url_str = append_remote_connection_id(url_str, remote_connection_id);
+    let (url_str, remote_window_id) = route_with_new_remote_window(url_str, remote_connection_id);
     let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)
@@ -738,6 +806,7 @@ pub async fn open_merge_window(
     let merge_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open merge window", e.to_string()))?;
+    register_remote_window_cleanup(&app, &merge_window, remote_window_id.as_deref());
     post_window_setup(&merge_window);
     state.set_owner(label, owner_label);
     merge_window
@@ -842,10 +911,9 @@ pub async fn open_stash_window(
             })?;
         format!("{} - {}", titles.stash, folder.name)
     };
-    let url = WebviewUrl::App(
-        append_remote_connection_id(format!("stash?folderId={folder_id}"), remote_connection_id)
-            .into(),
-    );
+    let (url_str, remote_window_id) =
+        route_with_new_remote_window(format!("stash?folderId={folder_id}"), remote_connection_id);
+    let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)
         .inner_size(1100.0, 700.0)
@@ -854,6 +922,7 @@ pub async fn open_stash_window(
     let stash_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open stash window", e.to_string()))?;
+    register_remote_window_cleanup(&app, &stash_window, remote_window_id.as_deref());
     post_window_setup(&stash_window);
 
     Ok(())
@@ -896,10 +965,9 @@ pub async fn open_push_window(
             })?;
         format!("{} - {}", titles.push, folder.name)
     };
-    let url = WebviewUrl::App(
-        append_remote_connection_id(format!("push?folderId={folder_id}"), remote_connection_id)
-            .into(),
-    );
+    let (url_str, remote_window_id) =
+        route_with_new_remote_window(format!("push?folderId={folder_id}"), remote_connection_id);
+    let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)
         .inner_size(1100.0, 700.0)
@@ -911,6 +979,7 @@ pub async fn open_push_window(
     let push_window = apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open push window", e.to_string()))?;
+    register_remote_window_cleanup(&app, &push_window, remote_window_id.as_deref());
     post_window_setup(&push_window);
 
     Ok(())
@@ -940,7 +1009,8 @@ pub async fn open_project_boot_window(
     }
 
     let titles = resolve_window_titles(&db.conn, locale).await;
-    let url_str = append_remote_connection_id("project-boot".to_string(), remote_connection_id);
+    let (url_str, remote_window_id) =
+        route_with_new_remote_window("project-boot".to_string(), remote_connection_id);
     let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(titles.project_boot)
@@ -950,6 +1020,7 @@ pub async fn open_project_boot_window(
     let window = apply_platform_window_style(builder).build().map_err(|e| {
         AppCommandError::window("Failed to open project boot window", e.to_string())
     })?;
+    register_remote_window_cleanup(&app, &window, remote_window_id.as_deref());
     post_window_setup(&window);
 
     Ok(())

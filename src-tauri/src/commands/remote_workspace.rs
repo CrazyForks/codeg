@@ -20,6 +20,11 @@ use crate::models::RemoteWorkspaceConnectionInfo;
 const REMOTE_HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[cfg(feature = "tauri-runtime")]
+pub(crate) fn new_remote_window_instance_id() -> String {
+    format!("rw-{}", uuid::Uuid::new_v4().simple())
+}
+
+#[cfg(feature = "tauri-runtime")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteWorkspaceConnectionInput {
@@ -174,7 +179,10 @@ pub async fn open_remote_workspace(
 
     validate_remote_health(&connection.base_url, &connection.token).await?;
 
-    let url = WebviewUrl::App(format!("workspace?remoteConnectionId={id}").into());
+    let window_instance_id = new_remote_window_instance_id();
+    let url = WebviewUrl::App(
+        format!("workspace?remoteConnectionId={id}&remoteWindowId={window_instance_id}").into(),
+    );
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(format!("Codeg - {}", connection.name))
         .inner_size(1400.0, 900.0)
@@ -183,6 +191,13 @@ pub async fn open_remote_workspace(
     let window = crate::commands::windows::apply_platform_window_style(builder)
         .build()
         .map_err(|e| AppCommandError::window("Failed to open remote workspace", e.to_string()))?;
+    if let Some(proxy) =
+        app.try_state::<std::sync::Arc<crate::commands::remote_proxy::RemoteProxyState>>()
+    {
+        proxy
+            .inner()
+            .register_window_instance_cleanup(&window, window_instance_id);
+    }
     crate::commands::windows::post_window_setup(&window);
     Ok(())
 }

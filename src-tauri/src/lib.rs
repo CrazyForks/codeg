@@ -385,27 +385,6 @@ mod tauri_app {
             .on_window_event(|window, event| {
                 let label = window.label().to_string();
 
-                // Remote-workspace IPC proxy cleanup: when ANY webview is
-                // destroyed, remove its label from every active WS
-                // subscription. This is the fail-safe for forced quits /
-                // crashes where the frontend never got a chance to call
-                // `remote_ws_unsubscribe`; the happy path is covered by
-                // RemoteDesktopTransport.destroy() in JS. Subscriber sets
-                // shrink to zero → the WS task self-shuts-down, so we
-                // don't leak per-connection background work.
-                if matches!(event, tauri::WindowEvent::Destroyed) {
-                    let app = window.app_handle();
-                    if let Some(proxy) =
-                        app.try_state::<std::sync::Arc<crate::commands::remote_proxy::RemoteProxyState>>()
-                    {
-                        let proxy_arc = proxy.inner().clone();
-                        let label_clone = label.clone();
-                        tauri::async_runtime::spawn(async move {
-                            proxy_arc.remove_subscriber_globally(&label_clone).await;
-                        });
-                    }
-                }
-
                 if (label == "settings" || label.starts_with("remote-settings-"))
                     && matches!(
                         event,

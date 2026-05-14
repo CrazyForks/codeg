@@ -64,9 +64,13 @@ export class RemoteDesktopTransport implements Transport {
   private reconnectCallbacks = new Set<() => void>()
   /// Listener handle for `remote-ws-event-{id}`. Null when not subscribed.
   private unlistenWsEvent: UnlistenFn | null = null
-  /// Tracks whether we have requested the Rust task to start. Used to
-  /// keep `subscribe()` idempotent on multiple event registrations.
-  private wsRequested = false
+  /// Opaque ID generated at construction time, passed to `remote_ws_subscribe`
+  /// and `remote_ws_unsubscribe`. Because it is known before the invoke
+  /// returns, destroy() can always issue a clean unsubscribe regardless of
+  /// whether the subscribe invoke is still in-flight.
+  private readonly subscriptionId = crypto.randomUUID()
+  /// Null = not yet requested; true = subscribe invoke in-flight or done.
+  private wsStarted = false
   /// Latched in `destroy()` so any in-flight `subscribe()` awaiters
   /// settle promptly instead of hanging on `readyPromise`.
   private destroyed = false
@@ -137,7 +141,7 @@ export class RemoteDesktopTransport implements Transport {
     const wrappedHandler = handler as (payload: unknown) => void
     this.handlers.get(event)!.add(wrappedHandler)
 
-    if (!this.wsRequested && !this.destroyed) {
+    if (!this.wsStarted && !this.destroyed) {
       await this.startWs()
     }
 
@@ -164,12 +168,7 @@ export class RemoteDesktopTransport implements Transport {
   }
 
   private async startWs() {
-    // Register the listener BEFORE asking the Rust task to start, so the
-    // first `__ready__` emit is never missed. Tauri's `listen()` is async,
-    // and `remote_ws_subscribe` can emit synchronously the moment a
-    // pre-existing socket already exists (e.g. another window opened
-    // first), so this ordering matters.
-    this.wsRequested = true
+    this.wsStarted = true
 
     try {
       this.unlistenWsEvent = await listen<WsEnvelope>(
@@ -177,20 +176,29 @@ export class RemoteDesktopTransport implements Transport {
         (event) => this.handleWsEvent(event.payload)
       )
     } catch (err) {
-      this.wsRequested = false
+      this.wsStarted = false
       throw err
     }
 
     try {
       await invoke("remote_ws_subscribe", {
         connectionId: this.config.id,
+        subscriptionId: this.subscriptionId,
+        windowInstanceId: this.config.windowInstanceId,
       })
+      if (this.destroyed) {
+        // destroy() ran while the invoke was in-flight; clean up immediately.
+        invoke("remote_ws_unsubscribe", {
+          connectionId: this.config.id,
+          subscriptionId: this.subscriptionId,
+        }).catch(() => {})
+        this.unlistenWsEvent?.()
+        this.unlistenWsEvent = null
+      }
     } catch (err) {
-      // If the Rust side refused the subscription (e.g. connection row
-      // missing), tear down the listener so we don't leak it.
       this.unlistenWsEvent?.()
       this.unlistenWsEvent = null
-      this.wsRequested = false
+      this.wsStarted = false
       throw err
     }
   }
@@ -247,20 +255,17 @@ export class RemoteDesktopTransport implements Transport {
       this.unlistenWsEvent()
       this.unlistenWsEvent = null
     }
-    if (this.wsRequested) {
-      // Fire and forget — destroy() runs during React unmount and we
-      // must not block. Rust's WindowEvent::Destroyed hook provides a
-      // belt-and-suspenders backup for forced-kill paths where this
-      // invoke never lands.
+    if (this.wsStarted) {
       invoke("remote_ws_unsubscribe", {
         connectionId: this.config.id,
+        subscriptionId: this.subscriptionId,
       }).catch((err) => {
         console.warn(
           "[RemoteDesktopTransport] remote_ws_unsubscribe failed:",
           err
         )
       })
-      this.wsRequested = false
+      this.wsStarted = false
     }
     this.handlers.clear()
     this.reconnectCallbacks.clear()

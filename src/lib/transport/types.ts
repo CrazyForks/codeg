@@ -5,6 +5,7 @@ export interface RemoteTransportConfig {
   name: string
   baseUrl: string
   token: string
+  windowInstanceId: string
   onUnauthorized?: () => void
 }
 
