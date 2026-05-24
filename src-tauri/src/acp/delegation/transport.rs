@@ -152,6 +152,52 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_round_trip() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        // PID + nanosecond suffix keeps the pipe name unique across parallel
+        // tests and avoids collisions with a live listener on the same box.
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-mcp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+
+        let server_pipe = pipe_name.clone();
+        let server_task = tokio::spawn(async move {
+            let mut conn = server;
+            conn.connect().await.unwrap();
+            let req: BrokerRequest = read_frame(&mut conn).await.unwrap();
+            assert_eq!(req.token, "tok");
+            let resp = BrokerResponse {
+                outcome: json!({"kind": "ok", "text": "hello"}),
+            };
+            write_frame(&mut conn, &resp).await.unwrap();
+            // Silence "unused" — server name is captured for clarity.
+            let _ = server_pipe;
+        });
+
+        let req = BrokerRequest {
+            token: "tok".into(),
+            parent_connection_id: "p1".into(),
+            parent_tool_use_id: "pt1".into(),
+            input: json!({"agent_type": "codex", "task": "do x"}),
+        };
+        let resp = client_round_trip(&pipe_name, &req).await.unwrap();
+        assert_eq!(resp.outcome["kind"], "ok");
+        assert_eq!(resp.outcome["text"], "hello");
+        server_task.await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn uds_round_trip() {

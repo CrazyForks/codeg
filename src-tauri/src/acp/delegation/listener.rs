@@ -114,22 +114,35 @@ impl DelegationListener {
         }
     }
 
-    /// Windows variant: accept once, re-create the named pipe instance, repeat.
-    /// Tokio's named-pipe API exposes one server instance at a time and
-    /// requires re-binding after each connection.
+    /// Windows variant: bind a named pipe and follow Tokio's recommended
+    /// accept pattern — wait for a connect, immediately create the *next*
+    /// server instance, then hand the connected instance off to a worker.
+    /// This keeps a pipe instance available at all times, so clients calling
+    /// `ClientOptions::open()` between connections don't see `NotFound`.
     #[cfg(windows)]
     pub async fn run(self: Arc<Self>, socket_path: PathBuf) -> std::io::Result<()> {
         use tokio::net::windows::named_pipe::ServerOptions;
         let path_str = socket_path.to_string_lossy().to_string();
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path_str)?;
+        eprintln!("[delegation] listening on named pipe {path_str}");
         loop {
-            let mut server = ServerOptions::new().create(&path_str)?;
             if let Err(e) = server.connect().await {
                 eprintln!("[delegation] connect failed: {e}");
+                // Re-create the instance so the next iteration has a fresh
+                // listener; a failed connect leaves the current one unusable.
+                server = ServerOptions::new().create(&path_str)?;
                 continue;
             }
+            let connected = server;
+            // Re-bind BEFORE serving the current client, so a client that
+            // opens during this turn finds a server instance to connect to.
+            server = ServerOptions::new().create(&path_str)?;
             let me = Arc::clone(&self);
             tokio::spawn(async move {
-                if let Err(e) = me.serve_one(&mut server).await {
+                let mut conn = connected;
+                if let Err(e) = me.serve_one(&mut conn).await {
                     eprintln!("[delegation] connection failed: {e}");
                 }
             });
@@ -242,8 +255,22 @@ fn parse_agent_type(raw: &str) -> Option<AgentType> {
 
 /// Default socket path for the running process, scoped to PID so multiple
 /// codeg instances on the same machine don't collide.
+///
+/// Unix: a `.sock` file inside `temp_dir`.
+/// Windows: a named pipe address `\\.\pipe\codeg-delegation-<pid>`. Windows
+/// named pipes live in their own kernel namespace and ignore `temp_dir`; the
+/// argument is kept for signature parity across platforms.
+#[cfg(unix)]
 pub fn default_socket_path(temp_dir: &Path) -> PathBuf {
     temp_dir.join(format!("codeg-delegation-{}.sock", std::process::id()))
+}
+
+#[cfg(windows)]
+pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        r"\\.\pipe\codeg-delegation-{}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
