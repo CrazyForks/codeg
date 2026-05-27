@@ -184,6 +184,21 @@ pub enum AcpEvent {
         /// When present, the frontend renders a localized message keyed on
         /// this code; otherwise it falls back to `message`.
         code: Option<String>,
+        /// Whether this Error signals connection-level death — i.e. the
+        /// `run_connection` task is about to emit `Disconnected` and tear
+        /// the session down. Non-terminal Errors (turn failure, `SetMode`
+        /// failure, `session/load` fallback, empty-prompt rejection)
+        /// leave the connection alive and the next prompt will still work.
+        ///
+        /// Skipped from serialization — the wire-format payload sent to
+        /// the frontend (Tauri / WebSocket) is unchanged. This is purely
+        /// an in-process signal between `connection.rs` and the lifecycle
+        /// worker so the worker can avoid wrongly cancelling the
+        /// conversation row or polluting the broker's cancel reason with
+        /// a stale, non-terminal error detail. (Stays `false` after any
+        /// JSON round-trip; only the original emitter sees `true`.)
+        #[serde(skip, default)]
+        terminal: bool,
     },
     /// `session/load` failed in a non-recoverable way (e.g. the agent has no
     /// record of this `session_id`). Emitted instead of silently falling back

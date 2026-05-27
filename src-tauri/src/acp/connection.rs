@@ -494,6 +494,12 @@ pub async fn spawn_agent_connection(
                     message: e.to_string(),
                     agent_type: agent_type.to_string(),
                     code,
+                    // The only genuinely terminal emit site: `run_connection`
+                    // is unwinding and the next event is `Disconnected`.
+                    // The lifecycle worker uses this flag to decide whether
+                    // to flip the conversation row to Cancelled and to
+                    // buffer the detail for the broker's cancel reason.
+                    terminal: true,
                 },
             )
             .await;
@@ -1546,6 +1552,9 @@ async fn run_connection(
                                     message: format!("Failed to load session, starting new: {e}"),
                                     agent_type: agent_type.to_string(),
                                     code: None,
+                                    // Recoverable: we fall through to `session/new`
+                                    // below. Connection stays alive.
+                                    terminal: false,
                                 },
                             )
                             .await;
@@ -2704,6 +2713,13 @@ fn turn_failure_error_event(reason_str: &str, agent_type: AgentType) -> Option<A
         message,
         agent_type: agent_type.to_string(),
         code: Some(code.to_string()),
+        // Non-terminal: this Error is paired with a `TurnComplete`
+        // carrying the same stop reason. The connection stays alive and
+        // the broker's pending entry is drained by `complete_call` with
+        // the correct child-side mapping (`ChildRefusal` /
+        // `ChildMaxTokens` / …). See F1 in the v0.14.3 sub-agent
+        // delegation post-mortem.
+        terminal: false,
     })
 }
 
@@ -2776,6 +2792,9 @@ async fn run_conversation_loop<'a>(
                             message: "Prompt must contain at least one content block".into(),
                             agent_type: agent_type.to_string(),
                             code: None,
+                            // Recoverable: idle loop continues, awaiting the
+                            // next user command. Connection stays alive.
+                            terminal: false,
                         },
                     )
                     .await;
@@ -3041,6 +3060,8 @@ async fn run_conversation_loop<'a>(
                                                     message: format!("Failed to set mode: {e}"),
                                                     agent_type: agent_type.to_string(),
                                                     code: None,
+                                                    // Recoverable: just a failed mode toggle.
+                                                    terminal: false,
                                                 },
                                             )
                                             .await;
@@ -3069,6 +3090,8 @@ async fn run_conversation_loop<'a>(
                                                 message: format!("Failed to set config option: {e}"),
                                                 agent_type: agent_type.to_string(),
                                                 code: None,
+                                                // Recoverable: just a failed config-option toggle.
+                                                terminal: false,
                                             },
                                         )
                                         .await;
@@ -3206,6 +3229,10 @@ async fn run_conversation_loop<'a>(
                             message: format!("Failed to set mode: {e}"),
                             agent_type: agent_type.to_string(),
                             code: None,
+                            // Recoverable: idle SetMode failure leaves the
+                            // connection alive — same rationale as the
+                            // mid-prompt SetMode site above.
+                            terminal: false,
                         },
                     )
                     .await;
@@ -3229,6 +3256,9 @@ async fn run_conversation_loop<'a>(
                             message: format!("Failed to set config option: {e}"),
                             agent_type: agent_type.to_string(),
                             code: None,
+                            // Recoverable: idle SetConfigOption failure leaves
+                            // the connection alive.
+                            terminal: false,
                         },
                     )
                     .await;

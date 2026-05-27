@@ -490,6 +490,7 @@ mod tests {
                 message: "boom".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                terminal: true,
             },
         ));
         assert_eq!(compute_pet_state(&s), PetState::Failed);
@@ -779,6 +780,7 @@ mod tests {
                 message: "x".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                terminal: true,
             },
             AcpEvent::PermissionRequest {
                 request_id: "r1".into(),
@@ -1032,6 +1034,7 @@ mod tests {
                 message: "boom".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                terminal: true,
             },
         );
         let failed = read_state_event(&mut rx).await;
@@ -1085,6 +1088,7 @@ mod tests {
                     message: "boom".into(),
                     agent_type: "claude_code".into(),
                     code: None,
+                    terminal: true,
                 },
             );
         };
@@ -1171,6 +1175,7 @@ mod tests {
                 message: "boom".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                terminal: true,
             },
         );
         let failed = read_state_event(&mut rx).await;
