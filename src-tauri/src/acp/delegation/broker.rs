@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{oneshot, Mutex};
@@ -134,11 +134,24 @@ const PRE_CANCELED_CAP: usize = 256;
 ///
 /// ACP `sessionUpdate(tool_call)` almost always lands ahead of the
 /// agent's own MCP `tools/call`, so this LRU resolves the race in
-/// practice. Stale entries (if any) get evicted on parent disconnect.
+/// practice. Each entry carries an enqueue timestamp so `take_*` can
+/// skip stale ids whose matching MCP round-trip never arrived (e.g.
+/// the host emitted a `tool_call` but ultimately did not invoke the
+/// MCP tool, or the MCP transport dropped) — these would otherwise
+/// linger until parent disconnect and silently mis-bind a later
+/// delegation. Per-parent draining also runs on parent disconnect via
+/// `drop_pending_tool_calls_for_parent`.
 #[derive(Default)]
 struct PendingToolCalls {
-    inner: Mutex<HashMap<String, VecDeque<String>>>,
+    inner: Mutex<HashMap<String, VecDeque<(String, Instant)>>>,
 }
+
+/// Maximum age of a `pending_tool_calls` entry before `take_*` discards
+/// it as stale. 60 s is far longer than any observed ACP→MCP gap (<5 ms
+/// typical, <100 ms in the worst case the polling budget targets) but
+/// short enough that a forgotten id from an earlier delegation cannot
+/// outlast a subsequent one in the same parent session.
+const PENDING_TOOL_CALL_TTL: Duration = Duration::from_secs(60);
 
 /// The broker is intentionally `Clone` (cheap — only `Arc`s inside) so
 /// listener/handler code can hand copies to spawned tasks without lifetime
@@ -222,6 +235,14 @@ impl DelegationBroker {
     /// invoking `delegate_to_agent`. The next broker round-trip from the
     /// same `parent_connection_id` will claim this id as its
     /// `parent_tool_use_id`. Bounded FIFO per connection.
+    ///
+    /// De-duplicates against any pending entry with the same id. Some hosts
+    /// re-emit `sessionUpdate(tool_call)` (not `tool_call_update`) for the
+    /// same call as `raw_input` arrives in chunks or as the status flips
+    /// to `completed`. Without this guard the second emit would push a
+    /// duplicate onto the queue; the first push gets claimed by the
+    /// matching MCP round-trip, and the duplicate then mis-binds the
+    /// **next** delegation in the same parent session.
     pub async fn register_pending_tool_call(
         &self,
         parent_connection_id: &str,
@@ -231,23 +252,57 @@ impl DelegationBroker {
         let queue = map
             .entry(parent_connection_id.to_string())
             .or_insert_with(VecDeque::new);
+        if queue.iter().any(|(id, _)| id == &tool_call_id) {
+            eprintln!(
+                "[delegation] dropping duplicate ACP tool_call_id={tool_call_id} on conn={parent_connection_id}"
+            );
+            return;
+        }
         // Defensive cap so an agent that fires many delegations without ever
         // round-tripping can't grow this map without bound.
         if queue.len() >= 32 {
             queue.pop_front();
         }
-        queue.push_back(tool_call_id);
+        queue.push_back((tool_call_id, Instant::now()));
     }
 
     /// Pop the oldest pending `tool_call_id` for the given parent, if any.
+    /// Skips entries older than [`PENDING_TOOL_CALL_TTL`] so an ACP id whose
+    /// matching MCP round-trip never arrived cannot mis-bind a later
+    /// delegation. Mutates the queue in-place; the bucket is removed once
+    /// drained.
     pub async fn take_pending_tool_call(&self, parent_connection_id: &str) -> Option<String> {
+        self.take_pending_tool_call_at(parent_connection_id, Instant::now())
+            .await
+    }
+
+    /// `take_pending_tool_call` with an injected "as of" instant. The
+    /// public entry point pins it to `Instant::now()`; tests can supply
+    /// a future instant to exercise TTL eviction without sleeping past
+    /// [`PENDING_TOOL_CALL_TTL`].
+    async fn take_pending_tool_call_at(
+        &self,
+        parent_connection_id: &str,
+        now: Instant,
+    ) -> Option<String> {
         let mut map = self.pending_tool_calls.inner.lock().await;
         let queue = map.get_mut(parent_connection_id)?;
-        let id = queue.pop_front();
+        let mut claimed: Option<String> = None;
+        while let Some((id, ts)) = queue.pop_front() {
+            if now.duration_since(ts) > PENDING_TOOL_CALL_TTL {
+                let age_secs = now.duration_since(ts).as_secs();
+                eprintln!(
+                    "[delegation] evicting stale ACP tool_call_id={id} (age={age_secs}s) on conn={parent_connection_id}"
+                );
+                continue;
+            }
+            claimed = Some(id);
+            break;
+        }
         if queue.is_empty() {
             map.remove(parent_connection_id);
         }
-        id
+        claimed
     }
 
     /// `take_pending_tool_call` with a brief poll loop. Used by
@@ -266,10 +321,13 @@ impl DelegationBroker {
     /// breaks the parent's UI binding because the frontend keys its
     /// `parent_tool_use_id` map by the agent's real `tool_call_id`.
     ///
-    /// 100 ms total polling budget (10 attempts × 10 ms) is generous: the
-    /// observed gap on local dev is well under 5 ms, but headroom protects
-    /// against busier hosts or slower MCP transports without delaying the
-    /// no-ACP-id fallback path materially.
+    /// 150 ms total polling budget (15 attempts × 10 ms): the observed
+    /// gap on local dev is well under 5 ms, but headroom protects against
+    /// busier hosts (Docker, slow disk, high LLM stream pressure) and
+    /// slower MCP transports. Bumped from the original 100 ms after
+    /// intermittent reports of missing "view sub-agent conversation"
+    /// buttons; the no-ACP-id fallback path is delayed at most by 50 ms
+    /// extra, which is imperceptible next to the delegation spawn cost.
     async fn claim_pending_tool_call_with_brief_wait(
         &self,
         parent_connection_id: &str,
@@ -277,7 +335,7 @@ impl DelegationBroker {
         if let Some(id) = self.take_pending_tool_call(parent_connection_id).await {
             return Some(id);
         }
-        for _ in 0..10 {
+        for _ in 0..15 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             if let Some(id) = self.take_pending_tool_call(parent_connection_id).await {
                 return Some(id);
@@ -373,7 +431,13 @@ impl DelegationBroker {
             req.parent_tool_use_id = self
                 .claim_pending_tool_call_with_brief_wait(&req.parent_connection_id)
                 .await
-                .unwrap_or_else(|| format!("delegation-{}", uuid::Uuid::new_v4()));
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[delegation] synthetic fallback for parent_tool_use_id on conn={} (no ACP tool_call_id arrived within 150ms budget)",
+                        req.parent_connection_id
+                    );
+                    format!("delegation-{}", uuid::Uuid::new_v4())
+                });
         }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
@@ -1351,6 +1415,69 @@ mod tests {
         assert_eq!(
             broker.take_pending_tool_call("p1").await.as_deref(),
             Some("tc-b")
+        );
+        assert!(broker.take_pending_tool_call("p1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_dedupes_repeated_tool_call_id() {
+        // Regression: some hosts re-emit `sessionUpdate(tool_call)` (not
+        // `tool_call_update`) for the same call as raw_input chunks arrive
+        // or as the status flips. Without dedupe the second push leaves a
+        // stale id in the queue that mis-binds the next delegation.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker.register_pending_tool_call("p1", "tc-a".into()).await;
+        broker.register_pending_tool_call("p1", "tc-a".into()).await;
+        broker.register_pending_tool_call("p1", "tc-a".into()).await;
+        assert_eq!(
+            broker.take_pending_tool_call("p1").await.as_deref(),
+            Some("tc-a")
+        );
+        assert!(
+            broker.take_pending_tool_call("p1").await.is_none(),
+            "duplicate register must not leave a stale id in the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_skips_entries_older_than_ttl() {
+        // Regression: an ACP `tool_call` whose matching MCP round-trip
+        // never arrives (host changed its mind, transport dropped, etc.)
+        // must not sit in the queue forever and mis-bind a subsequent
+        // delegation. TTL eviction is exercised by advancing the
+        // injected `as of` instant past PENDING_TOOL_CALL_TTL.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let t0 = Instant::now();
+        broker.register_pending_tool_call("p1", "stale".into()).await;
+        // Fresh id registered "just before" the future `now`.
+        broker.register_pending_tool_call("p1", "fresh".into()).await;
+        let future_now = t0 + PENDING_TOOL_CALL_TTL + Duration::from_millis(50);
+        // Forge "fresh" so it survives the TTL: rewrite its timestamp to
+        // ~now-relative-to-future-now. Direct field access is OK — we're
+        // a sibling test in the same module.
+        {
+            let mut map = broker.pending_tool_calls.inner.lock().await;
+            let queue = map.get_mut("p1").expect("queue present");
+            // Re-stamp the second entry ("fresh") to `future_now`.
+            if let Some(entry) = queue.iter_mut().find(|(id, _)| id == "fresh") {
+                entry.1 = future_now;
+            }
+        }
+        // First entry ("stale", stamped at ~t0) is past TTL relative to
+        // future_now; the second ("fresh") was just re-stamped to
+        // future_now and must survive.
+        assert_eq!(
+            broker
+                .take_pending_tool_call_at("p1", future_now)
+                .await
+                .as_deref(),
+            Some("fresh")
         );
         assert!(broker.take_pending_tool_call("p1").await.is_none());
     }
