@@ -1420,6 +1420,59 @@ impl DelegationBroker {
         }
     }
 
+    /// Tombstone a parent `tool_call_id` whose `delegate_to_agent` reached a
+    /// TERMINAL ACP status (`completed`/`failed`) so a stale keyed pending entry
+    /// can't mis-bind a later delegation. The lifecycle dispatcher calls this
+    /// from its terminal-`ToolCallUpdate` branch, keyed on `tool_call_id`
+    /// (a bare terminal update carries no parseable key).
+    ///
+    /// The hazard: keyed pending entries are retained regardless of age (see the
+    /// retain block in `take_matching_tool_call_at`), so if a `delegate_to_agent`
+    /// tool call goes terminal without its MCP round-trip ever reaching the
+    /// broker (the call failed, the turn was interrupted, the companion never
+    /// dispatched), its entry would linger forever and a LATER delegation sharing
+    /// the same `(agent_type, task, working_dir)` key would claim this dead id,
+    /// retargeting its writes/events at the wrong card. Same hazard
+    /// `consume_explicit_tool_call` guards on the explicit-id path; this is its
+    /// terminal-status sibling.
+    ///
+    /// Safe synchronously, no grace window: a terminal `completed` can only
+    /// arrive AFTER the round-trip's claim already removed the entry (the ack
+    /// that claim produces is what lets the parent's tool call return), and a
+    /// serialized sibling still awaiting its (observed 77s-late) round-trip is
+    /// NON-terminal while it waits — so this never evicts a live entry.
+    ///
+    /// Records `consumed` ONLY when an entry was actually removed: this runs for
+    /// EVERY terminal tool-call update (the vast majority are non-delegations),
+    /// and `consumed` has no TTL/cap, so recording unconditionally would grow it
+    /// with every completed tool call. Recording on a real removal still drops an
+    /// out-of-order re-registration of the same id via the Tier-1 consumed check
+    /// in `register_pending_tool_call_with_key_at`. Returns whether an entry was
+    /// removed (for the dispatcher's gated log).
+    pub async fn tombstone_pending_tool_call(
+        &self,
+        parent_connection_id: &str,
+        tool_call_id: &str,
+    ) -> bool {
+        let mut map = self.tool_calls.inner.lock().await;
+        // No bucket → nothing registered for this parent; nothing to tombstone
+        // and nothing to record (unlike `consume_explicit_tool_call`, no
+        // MCP-before-ACP race can land a terminal status before registration on
+        // the single ordered ACP stream, so we never pre-create a bucket here).
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return false;
+        };
+        let before = bucket.pending.len();
+        bucket.pending.retain(|p| p.tool_call_id != tool_call_id);
+        let removed = bucket.pending.len() != before;
+        if removed && !bucket.consumed.iter().any(|(id, _)| id == tool_call_id) {
+            bucket
+                .consumed
+                .push_back((tool_call_id.to_string(), Instant::now()));
+        }
+        removed
+    }
+
     /// Correlate an MCP `delegate_to_agent` round-trip to the parent's
     /// real ACP `tool_call_id`, polling briefly to absorb the race between
     /// two independent arrival paths for the same invocation:
@@ -4102,6 +4155,168 @@ mod tests {
             .take_matching_tool_call("p1", &task_key("task B"))
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstone_removes_stale_keyed_entry() {
+        // A `delegate_to_agent` tool call registered a keyed entry but its MCP
+        // round-trip never reached the broker (the call failed / the turn was
+        // interrupted). A terminal `ToolCallUpdate` tombstones the entry so it
+        // can't linger indefinitely (keyed entries are never aged out).
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-stale".into(), Some(task_key("task A")))
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-stale").await);
+        assert!(broker
+            .take_matching_tool_call("p1", &task_key("task A"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstone_prevents_same_key_misbind() {
+        // The High regression: without the tombstone, a stale keyed entry is
+        // retained forever and a LATER identical-key delegation claims its dead
+        // id (the exact-key scan returns the oldest match). After tombstoning the
+        // stale entry, a fresh registration for the same key binds to the FRESH
+        // id instead.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-stale".into(), Some(task_key("task A")))
+            .await;
+        broker.tombstone_pending_tool_call("p1", "tc-stale").await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-fresh".into(), Some(task_key("task A")))
+            .await;
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task A"))
+                .await
+                .as_deref(),
+            Some("tc-fresh"),
+            "a later same-key delegation must claim the fresh id, not the tombstoned one"
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_leaves_other_entries_intact() {
+        // A terminal update for an unrelated (non-delegation) id no-ops and must
+        // leave a registered delegation untouched.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-keep".into(), Some(task_key("task A")))
+            .await;
+        assert!(
+            !broker
+                .tombstone_pending_tool_call("p1", "tc-bash-123")
+                .await
+        );
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task A"))
+                .await
+                .as_deref(),
+            Some("tc-keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_then_reregister_same_id_stays_dropped() {
+        // After tombstoning a real entry, an out-of-order re-registration of the
+        // same id is dropped by the Tier-1 consumed check — mirrors
+        // `explicit_tool_use_id_consumes_pending_entry_acp_first`.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-stale".into(), Some(task_key("task A")))
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-stale").await);
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-stale".into(), Some(task_key("task A")))
+            .await;
+        assert!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task A"))
+                .await
+                .is_none(),
+            "a re-registration after tombstone must stay dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_noop_does_not_record_consumed() {
+        // The tombstone runs for EVERY terminal tool-call update, most of them
+        // non-delegations. A no-op tombstone (id not pending) must NOT record
+        // `consumed` — otherwise `consumed` (no TTL/cap) would grow with every
+        // completed tool call, and a later legitimate registration of that id
+        // would be wrongly dropped.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        assert!(!broker.tombstone_pending_tool_call("p1", "tc-x").await);
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-x".into(), Some(task_key("task A")))
+            .await;
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task A"))
+                .await
+                .as_deref(),
+            Some("tc-x"),
+            "a no-op tombstone must not record consumed and drop a later registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_removes_only_the_matching_entry_from_a_multi_entry_bucket() {
+        // Tombstoning a MIDDLE entry removes only that id (retain is by exact
+        // tool_call_id, position-independent) and leaves the siblings claimable
+        // by their own keys.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-a".into(), Some(task_key("task A")))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-b".into(), Some(task_key("task B")))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c".into(), Some(task_key("task C")))
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-b").await);
+        assert!(broker
+            .take_matching_tool_call("p1", &task_key("task B"))
+            .await
+            .is_none());
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task A"))
+                .await
+                .as_deref(),
+            Some("tc-a")
+        );
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &task_key("task C"))
+                .await
+                .as_deref(),
+            Some("tc-c")
+        );
     }
 
     #[tokio::test]
