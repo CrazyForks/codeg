@@ -242,8 +242,6 @@ function GoalCard({
         className={cn(
           "group inline-flex max-w-full items-center gap-1.5 rounded-full px-3.5 py-2 text-xs font-medium transition-colors",
           "bg-primary/10 text-foreground hover:bg-primary/15",
-          tone === "complete" &&
-            "bg-emerald-500/10 text-foreground hover:bg-emerald-500/15",
           tone === "error" &&
             "bg-destructive/10 text-destructive hover:bg-destructive/15",
           tone === "muted" && "bg-muted/70 text-foreground hover:bg-muted"
