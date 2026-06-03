@@ -36,6 +36,10 @@ export interface ServerUpdateActionResult {
   version?: string
   needRestart: boolean
   restartDelayMs: number
+  // Supervisor probation window (seconds): a freshly-upgraded worker that
+  // crashes within it is auto-rolled-back. 0 in re-exec mode (no supervisor),
+  // so the frontend need not wait it out before declaring success.
+  trialSeconds: number
   capability: ServerUpdateCapability
 }
 

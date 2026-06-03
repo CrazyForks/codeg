@@ -437,10 +437,38 @@ export function SystemNetworkSettings() {
       if (rolledBack) {
         setUpdateError(t("upgradeRolledBack"))
         toast.error(t("upgradeRolledBack"))
-      } else {
-        toast.success(t("upgradeSuccess"))
-        window.location.reload()
+        return
       }
+
+      // Phase 3 (supervised only): the new version is answering, but the
+      // supervisor auto-rolls-back a worker that crashes within the trial
+      // window. Keep watching across that window and only claim success if the
+      // target version is still the one serving when it elapses; if it reverts,
+      // the supervisor rolled back a version that booted but couldn't stay up.
+      const trialSeconds =
+        result.capability === "supervised" ? result.trialSeconds : 0
+      if (trialSeconds > 0 && result.version) {
+        const trialDeadline = Date.now() + trialSeconds * 1000 + 3000
+        let reverted = false
+        while (Date.now() < trialDeadline) {
+          setRestartCountdown(Math.ceil((trialDeadline - Date.now()) / 1000))
+          await new Promise<void>((r) => setTimeout(r, 2000))
+          const v = await getRunningServerVersion()
+          if (v && v !== result.version) {
+            reverted = true
+            break
+          }
+        }
+        setRestartCountdown(null)
+        if (reverted) {
+          setUpdateError(t("upgradeRolledBack"))
+          toast.error(t("upgradeRolledBack"))
+          return
+        }
+      }
+
+      toast.success(t("upgradeSuccess"))
+      window.location.reload()
     } catch (err) {
       const message = formatUpdateError(err, "install")
       setUpdateError(message)
