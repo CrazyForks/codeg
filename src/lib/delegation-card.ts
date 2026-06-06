@@ -155,16 +155,38 @@ function findDelegationArgs(
   return null
 }
 
+/**
+ * A content-free structural descriptor of a value: object keys (recursively,
+ * depth- and width-capped), array lengths, and primitive *types* — never the
+ * values themselves. This is exactly what diagnoses an unrecognized wire shape
+ * (which keys did the host nest the args under?) without exposing any content.
+ */
+function describeShape(value: unknown, depth = 0): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return `array(${value.length})`
+  if (typeof value !== "object") return typeof value
+  if (depth >= 3) return "object{…}"
+  const obj = value as Record<string, unknown>
+  const keys = Object.keys(obj)
+  if (keys.length === 0) return "object{}"
+  const shown = keys
+    .slice(0, 20)
+    .map((k) => `${k}: ${describeShape(obj[k], depth + 1)}`)
+    .join(", ")
+  return `object{ ${shown}${keys.length > 20 ? ", …" : ""} }`
+}
+
 // One-line debug breadcrumb. The walker covers the wrappers we know about
 // (`arguments`, `input`, `params`, `payload`, `_meta`); if a non-empty raw
 // input still doesn't yield delegation args, the host is using a shape we
-// haven't accounted for. Logging a truncated sample makes the next "task
-// didn't show up" report self-debugging — the actual wire shape lands in
-// the user's devtools instead of needing a repro.
-function warnDelegationInputUnparseable(raw: string, reason: string): void {
-  const sample = raw.length > 240 ? `${raw.slice(0, 240)}…` : raw
+// haven't accounted for. We log the unrecognized *shape* (keys + types, never
+// values) so the next "task didn't show up" report is self-debugging — the
+// wire shape lands in the user's devtools — without dumping the raw `task`
+// text, `working_dir` path, or anything a user pasted into a prompt into the
+// console.
+function warnDelegationInputUnparseable(shape: string, reason: string): void {
   console.warn(
-    `[delegation-card] could not extract delegation args (${reason}). raw=${sample}`
+    `[delegation-card] could not extract delegation args (${reason}). shape=${shape}`
   )
 }
 
@@ -174,12 +196,18 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   try {
     parsed = JSON.parse(raw)
   } catch {
-    warnDelegationInputUnparseable(raw, "JSON.parse threw")
+    warnDelegationInputUnparseable(
+      `non-JSON(len=${raw.length})`,
+      "JSON.parse threw"
+    )
     return EMPTY_PARSED_INPUT
   }
   const obj = findDelegationArgs(parsed)
   if (!obj) {
-    warnDelegationInputUnparseable(raw, "no known wrapper matched")
+    warnDelegationInputUnparseable(
+      describeShape(parsed),
+      "no known wrapper matched"
+    )
     return EMPTY_PARSED_INPUT
   }
   const at = typeof obj.agent_type === "string" ? obj.agent_type : null
