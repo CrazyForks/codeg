@@ -1,5 +1,11 @@
-import { type ReactNode, useEffect, useState } from "react"
-import { act, render } from "@testing-library/react"
+import {
+  type ReactNode,
+  type Ref,
+  useEffect,
+  useImperativeHandle,
+  useState,
+} from "react"
+import { act, fireEvent, render } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -69,17 +75,53 @@ vi.mock("@/components/agent-icon", () => ({
   },
 }))
 
+// Controllable virtua geometry for the sticky-overlay tests. All rows are 32px
+// (h-[2rem]), so offsets are index*32 and findItemIndex is floor(offset/32).
+const virtuaCtl = vi.hoisted(() => ({
+  scrollOffset: 0,
+  onScroll: null as ((offset: number) => void) | null,
+  scrollToIndex: vi.fn(),
+}))
+
 // Render EVERY row (data.map) rather than only a window, so the render-count
 // probes stay meaningful in jsdom (which has no real layout/scroll). This is
-// exactly why virtua's windowing itself needs manual QA on a large dataset.
+// exactly why virtua's windowing itself needs manual QA on a large dataset. The
+// mock also forwards a settable VirtualizerHandle (ref-as-prop, React 19) so the
+// list's scroll-driven sticky logic can be exercised; with scrollOffset left at
+// 0 the overlay stays hidden, so the memo-scope tests below are unaffected.
 vi.mock("virtua", () => ({
   Virtualizer: ({
     data,
     children,
+    onScroll,
+    ref,
   }: {
     data: unknown[]
     children: (row: unknown, index: number) => ReactNode
-  }) => <>{data.map((row, i) => children(row, i))}</>,
+    onScroll?: (offset: number) => void
+    ref?: Ref<unknown>
+  }) => {
+    virtuaCtl.onScroll = onScroll ?? null
+    useImperativeHandle(ref, () => ({
+      get scrollOffset() {
+        return virtuaCtl.scrollOffset
+      },
+      get scrollSize() {
+        return data.length * 32
+      },
+      get viewportSize() {
+        return 600
+      },
+      findItemIndex: (offset: number) =>
+        Math.max(0, Math.min(data.length - 1, Math.floor(offset / 32))),
+      getItemOffset: (index: number) => index * 32,
+      getItemSize: () => 32,
+      scrollToIndex: virtuaCtl.scrollToIndex,
+      scrollTo: () => {},
+      scrollBy: () => {},
+    }))
+    return <>{data.map((row, i) => children(row, i))}</>
+  },
 }))
 
 // FolderHeader renders exactly one of Folder/FolderOpen in its body → folder
@@ -232,6 +274,15 @@ function tree() {
   )
 }
 
+// Reset the virtua geometry before every test (runs before each describe's own
+// beforeEach) so a scrolled overlay test never bleeds into the memo-scope or
+// drag suites, which all assume scrollOffset 0 → overlay hidden.
+beforeEach(() => {
+  virtuaCtl.scrollOffset = 0
+  virtuaCtl.onScroll = null
+  virtuaCtl.scrollToIndex.mockClear()
+})
+
 describe("SidebarConversationList — single status event re-render scope", () => {
   beforeEach(() => {
     vi.useFakeTimers({ now: FIXED })
@@ -265,7 +316,7 @@ describe("SidebarConversationList — single status event re-render scope", () =
     vi.useRealTimers()
   })
 
-  it("re-renders exactly one card and one folder when a single summary changes", () => {
+  it("re-renders exactly one card and no folder headers when a single summary changes", () => {
     render(tree())
 
     // Sanity: initial mount rendered all 5 cards and both folders.
@@ -360,6 +411,11 @@ describe("SidebarConversationList — folder drag gesture", () => {
   })
 
   afterEach(() => {
+    // A committed drag leaves a one-shot capture-phase "click" suppressor on
+    // window whose rAF-based removal does not fire under fake timers. Drain it
+    // with a throwaway window click (target=window never reaches the React root)
+    // so it cannot swallow a later test's click.
+    window.dispatchEvent(new MouseEvent("click", { bubbles: true }))
     rectSpy.mockRestore()
     vi.useRealTimers()
   })
@@ -434,5 +490,125 @@ describe("SidebarConversationList — folder drag gesture", () => {
       firePointer(window, "pointerup", { clientY: 103 })
     })
     expect(stableWorkspaceFns.reorderFolders).not.toHaveBeenCalled()
+  })
+})
+
+// Drives the sticky overlay via the controllable virtua handle. The overlay is
+// resolved from the layout effect at mount (no scroll event needed): set
+// virtuaCtl.scrollOffset before render and assert the duplicated header. Real
+// virtua scrolling / handoff smoothness still needs manual QA.
+describe("SidebarConversationList — sticky folder header overlay", () => {
+  beforeEach(() => {
+    localStorage.clear() // folderExpanded persists across tests otherwise
+    store.folders = [folder(1, "Folder 1"), folder(2, "Folder 2")]
+    store.allFolders = store.folders
+    // rows: F1(0) c11(1) c12(2) F2(3) c21(4) c22(5) c23(6)
+    store.conversations = [
+      conv(11, 1),
+      conv(12, 1),
+      conv(21, 2),
+      conv(22, 2),
+      conv(23, 2),
+    ]
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  function headerCount(folderId: number): number {
+    return document.querySelectorAll(`[data-folder-id="${folderId}"]`).length
+  }
+
+  it("hides the overlay at the top of the list", () => {
+    virtuaCtl.scrollOffset = 0
+    render(tree())
+    // Only the real in-list header exists for each folder.
+    expect(headerCount(1)).toBe(1)
+    expect(headerCount(2)).toBe(1)
+  })
+
+  it("shows a sticky overlay for the folder scrolled through", () => {
+    virtuaCtl.scrollOffset = 40 // past F1's header (offset 0), inside conv 11
+    render(tree())
+    // Folder 1 header is duplicated in the DOM (in-list + overlay); folder 2 is
+    // not.
+    expect(headerCount(1)).toBe(2)
+    expect(headerCount(2)).toBe(1)
+    // Only one of the two is accessible: the in-list copy is suppressed
+    // (inert + aria-hidden) so the overlay is the sole tab stop / announcement.
+    const f1 = document.querySelectorAll('[data-folder-id="1"]')
+    expect(
+      (f1[0] as HTMLElement).closest('[aria-hidden="true"]')
+    ).not.toBeNull()
+    expect((f1[1] as HTMLElement).closest('[aria-hidden="true"]')).toBeNull()
+    // The accessible (overlay) toggle exposes its expanded state to AT.
+    expect((f1[1] as HTMLElement).getAttribute("aria-expanded")).toBe("true")
+  })
+
+  it("tracks the active folder as the scroll moves into the next folder", () => {
+    virtuaCtl.scrollOffset = 130 // inside folder 2 (F2 header at offset 96)
+    render(tree())
+    expect(headerCount(1)).toBe(1)
+    expect(headerCount(2)).toBe(2)
+  })
+
+  it("collapses from the overlay and scrolls the folder header to the top", () => {
+    // rAF runs synchronously so the deferred scrollToIndex is observable.
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0)
+      return 0
+    })
+    try {
+      virtuaCtl.scrollOffset = 130 // overlay shows folder 2
+      render(tree())
+      const headers = document.querySelectorAll('[data-folder-id="2"]')
+      expect(headers.length).toBe(2)
+      // headers[1] is the overlay copy (rendered after ScrollArea in DOM order).
+      act(() => {
+        fireEvent.click(headers[1] as HTMLElement)
+      })
+      // The folder collapsed (its conversation rows are gone).
+      expect(document.body.textContent).not.toContain("conv-21")
+      // Folder 2's header is flat index 3 → scrolled to the top, instant.
+      expect(virtuaCtl.scrollToIndex).toHaveBeenCalledWith(
+        3,
+        expect.objectContaining({ align: "start" })
+      )
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("hides the overlay while a folder drag is in progress", () => {
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        top: 0,
+        bottom: 600,
+        left: 0,
+        right: 200,
+        width: 200,
+        height: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect)
+    try {
+      virtuaCtl.scrollOffset = 40 // overlay shows folder 1
+      render(tree())
+      expect(headerCount(1)).toBe(2) // suppressed in-list + overlay
+      // Drag a NON-sticky folder (folder 2) from its in-list header — folder 1's
+      // in-list header is inert while its overlay is showing, and the overlay
+      // itself has no drag grip.
+      const grip = (
+        document.querySelector('[data-folder-id="2"]') as HTMLElement
+      ).parentElement as HTMLElement
+      act(() => firePointer(grip, "pointerdown", { clientY: 100 }))
+      act(() => firePointer(window, "pointermove", { clientY: 120 })) // cross 6px
+      // Virtualizer unmounted → drag surface shows each folder once, overlay gone.
+      expect(headerCount(1)).toBe(1)
+      act(() => firePointer(window, "pointercancel", { clientY: 120 }))
+    } finally {
+      rectSpy.mockRestore()
+    }
   })
 })

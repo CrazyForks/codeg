@@ -295,3 +295,100 @@ export function applyReorder<T>(
   next.splice(clampedTo, 0, moved)
   return next
 }
+
+// ── Sticky folder header (floating overlay) ─────────────────────────────────
+// virtua renders every row as `position:absolute; top:<offset>` inside a
+// `contain:strict` container and unmounts off-screen rows, so CSS
+// `position:sticky` cannot pin a folder header. Instead a single floating
+// overlay stands in for the folder currently scrolled through. These pure
+// helpers resolve "which folder" and the iOS-style handoff offset from the
+// virtua handle's measured pixel offsets — see the wiring in
+// `SidebarConversationList`.
+
+/**
+ * For every flat row, the index of the folder header that owns it: a folder
+ * header owns itself; a conversation/empty row owns the nearest folder header
+ * above it (or -1 if none precedes it, which `buildRows` never produces). Lets
+ * the scroll handler resolve the active folder in O(1) from the topmost visible
+ * row index, instead of an O(folder span) backward scan that would jank in very
+ * large folders.
+ */
+export function buildOwnerHeaderIndex(rows: readonly SidebarRow[]): Int32Array {
+  const out = new Int32Array(rows.length)
+  let current = -1
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].kind === "folder") current = i
+    out[i] = current
+  }
+  return out
+}
+
+/** Flat indices of every folder header row, in ascending order. */
+export function folderHeaderFlatIndices(rows: readonly SidebarRow[]): number[] {
+  const indices: number[] = []
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].kind === "folder") indices.push(i)
+  }
+  return indices
+}
+
+/**
+ * The next folder header flat index strictly after `activeHeaderIndex`, or
+ * `null` when `activeHeaderIndex` is the last folder. `headerIndices` must be
+ * ascending (as produced by {@link folderHeaderFlatIndices}).
+ */
+export function nextHeaderAfter(
+  headerIndices: readonly number[],
+  activeHeaderIndex: number
+): number | null {
+  for (let i = 0; i < headerIndices.length; i++) {
+    if (headerIndices[i] > activeHeaderIndex) return headerIndices[i]
+  }
+  return null
+}
+
+/**
+ * Flat index of the folder header row for `folderId`, or -1 if absent. Used
+ * after a collapse-from-overlay toggle to scroll that header to the top.
+ */
+export function headerIndexForFolder(
+  rows: readonly SidebarRow[],
+  folderId: number
+): number {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    if (row.kind === "folder" && row.folderId === folderId) return i
+  }
+  return -1
+}
+
+/**
+ * Pure geometry for the floating sticky folder header. All inputs are measured
+ * pixel offsets from the virtua handle; no DOM access.
+ *
+ * - `visible`: the active folder's own header has scrolled above the viewport
+ *   top, so the overlay should stand in for it. (At the very top, where
+ *   `scrollOffset === activeHeaderOffset`, the real header is shown instead.)
+ * - `translateY`: iOS-style handoff — once the next folder's header is within
+ *   one header height of the top it pushes the overlay up so the incoming header
+ *   displaces it. Rounded to whole pixels to avoid sub-pixel shimmer against the
+ *   real (still-mounted within the buffer) header underneath.
+ */
+export function computeStickyState(args: {
+  scrollOffset: number
+  activeHeaderOffset: number
+  nextHeaderOffset: number | null
+  headerHeight: number
+}): { visible: boolean; translateY: number } {
+  const { scrollOffset, activeHeaderOffset, nextHeaderOffset, headerHeight } =
+    args
+  const visible = scrollOffset > activeHeaderOffset
+  let translateY = 0
+  if (visible && nextHeaderOffset != null) {
+    const d = nextHeaderOffset - scrollOffset
+    if (d >= 0 && d < headerHeight) {
+      translateY = Math.round(d - headerHeight)
+    }
+  }
+  return { visible, translateY }
+}

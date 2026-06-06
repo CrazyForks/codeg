@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -68,10 +69,15 @@ import {
 import { SidebarConversationCard } from "./sidebar-conversation-card"
 import {
   applyReorder,
+  buildOwnerHeaderIndex,
   buildRows,
+  computeStickyState,
   flatIndexOfConversation,
+  folderHeaderFlatIndices,
   formatRelative,
   groupByFolderWithReuse,
+  headerIndexForFolder,
+  nextHeaderAfter,
   pointerYToTargetIndex,
   reuseSelected,
   reuseSet,
@@ -105,6 +111,11 @@ import {
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
 import { toErrorMessage } from "@/lib/app-error"
+
+// Layout effect on the client (so the sticky overlay is positioned before
+// paint) but a no-op-safe passive effect during the static-export prerender.
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect
 
 const THEME_COLOR_SET = new Set<string>(THEME_COLORS)
 
@@ -156,6 +167,7 @@ const FolderHeader = memo(function FolderHeader({
   onOpenInTerminal,
   isDragging,
   onGripPointerDown,
+  suppressed = false,
 }: {
   folderId: number
   folderName: string
@@ -191,6 +203,14 @@ const FolderHeader = memo(function FolderHeader({
    * surface (already dragging) so headers there are pure drop-target visuals.
    */
   onGripPointerDown?: (folderId: number, event: React.PointerEvent) => void
+  /**
+   * True for the in-list copy of the folder whose floating sticky overlay is
+   * currently showing: the overlay is the accessible control for that folder,
+   * so the (scrolled-past, occluded) in-list copy is made `inert` + aria-hidden
+   * to avoid a duplicate tab stop / double announcement during the window where
+   * virtua still keeps it mounted in the buffer.
+   */
+  suppressed?: boolean
 }) {
   // Own the translations here rather than receiving `t` as a prop: next-intl
   // returns a fresh `t` on every parent render, so passing it down would defeat
@@ -220,7 +240,11 @@ const FolderHeader = memo(function FolderHeader({
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div className={cn("relative h-[2rem]", isDragging && "opacity-60")}>
+        <div
+          inert={suppressed || undefined}
+          aria-hidden={suppressed || undefined}
+          className={cn("relative h-[2rem]", isDragging && "opacity-60")}
+        >
           <div
             onPointerDown={(e) => onGripPointerDown?.(folderId, e)}
             className={cn(
@@ -236,8 +260,10 @@ const FolderHeader = memo(function FolderHeader({
               data-folder-id={folderId}
               onClick={() => onToggle(folderId)}
               title={folderPath}
+              aria-expanded={expanded}
               className={cn(
                 "relative flex h-full min-w-0 flex-1 items-center pr-[0.5rem] outline-none",
+                "rounded-full focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
                 "text-sidebar-foreground",
                 isDragging ? "cursor-grabbing" : "cursor-grab"
               )}
@@ -579,6 +605,18 @@ export function SidebarConversationList({
   const [dragOrder, setDragOrder] = useState<number[] | null>(null)
   const pendingOrderRef = useRef<number[] | null>(null)
 
+  // Floating sticky folder header. `stickyFolderId` is the ONLY new render
+  // state and changes solely when the scroll crosses into a different folder —
+  // never on a status event or the per-minute `now` tick — so the card/header
+  // memo budget is untouched. The per-frame handoff translateY is written
+  // straight to the overlay node (no re-render); see `recomputeSticky`.
+  const [stickyFolderId, setStickyFolderId] = useState<number | null>(null)
+  const overlayRef = useRef<HTMLDivElement>(null)
+  const stickyRafRef = useRef<number | null>(null)
+  // Read by the imperative scroll path without re-subscribing virtua's listener.
+  const draggingRef = useRef<number | null>(dragging)
+  draggingRef.current = dragging
+
   // Custom pointer-based folder reorder (replaces motion `Reorder`, which can't
   // coexist with virtualization — see the perf plan). Refs are read by the
   // window pointer listeners so the public callbacks stay referentially stable
@@ -760,6 +798,17 @@ export function SidebarConversationList({
   orderedFolderIdsRef.current = orderedFolderIds
   reorderingRef.current = reordering
 
+  // Sticky-overlay lookup tables, rebuilt only when the flat rows change
+  // (folder add/remove/expand, not status events). Consumed exclusively by the
+  // imperative scroll handler via refs — never passed to a memoized child — so
+  // they have zero effect on the card/header memo path.
+  const ownerHeaderIndex = useMemo(() => buildOwnerHeaderIndex(rows), [rows])
+  const headerFlatIndices = useMemo(() => folderHeaderFlatIndices(rows), [rows])
+  const ownerHeaderIndexRef = useRef(ownerHeaderIndex)
+  ownerHeaderIndexRef.current = ownerHeaderIndex
+  const headerFlatIndicesRef = useRef(headerFlatIndices)
+  headerFlatIndicesRef.current = headerFlatIndices
+
   useImperativeHandle(ref, () => ({
     scrollToActive() {
       scrollToActiveRef.current()
@@ -830,6 +879,106 @@ export function SidebarConversationList({
       return next
     })
   }, [])
+
+  // ── Sticky folder header overlay ──────────────────────────────────────────
+  // Resolve the folder currently scrolled through and the iOS handoff offset
+  // from the live virtua geometry. Imperative + ref-only so its identity stays
+  // stable (passing it to `<Virtualizer onScroll>` must not re-subscribe the
+  // listener) and so it never participates in the memoized render path.
+  const recomputeSticky = useCallback(() => {
+    const handle = virtualizerRef.current
+    const currentRows = rowsRef.current
+    const headers = headerFlatIndicesRef.current
+    if (
+      !handle ||
+      draggingRef.current !== null ||
+      currentRows.length === 0 ||
+      headers.length === 0
+    ) {
+      setStickyFolderId((prev) => (prev === null ? prev : null))
+      return
+    }
+    const scrollOffset = handle.scrollOffset
+    const topIndex = Math.max(
+      0,
+      Math.min(currentRows.length - 1, handle.findItemIndex(scrollOffset))
+    )
+    const activeHeaderIndex = ownerHeaderIndexRef.current[topIndex]
+    if (activeHeaderIndex < 0) {
+      setStickyFolderId((prev) => (prev === null ? prev : null))
+      return
+    }
+    const nextHeaderIndex = nextHeaderAfter(headers, activeHeaderIndex)
+    const { visible, translateY } = computeStickyState({
+      scrollOffset,
+      activeHeaderOffset: handle.getItemOffset(activeHeaderIndex),
+      nextHeaderOffset:
+        nextHeaderIndex == null ? null : handle.getItemOffset(nextHeaderIndex),
+      headerHeight: handle.getItemSize(activeHeaderIndex) || 32,
+    })
+    if (overlayRef.current) {
+      overlayRef.current.style.transform = `translateY(${translateY}px)`
+    }
+    const activeRow = currentRows[activeHeaderIndex]
+    const nextFolderId =
+      visible && activeRow.kind === "folder" ? activeRow.folderId : null
+    setStickyFolderId((prev) => (prev === nextFolderId ? prev : nextFolderId))
+  }, [])
+
+  // virtua fires onScroll synchronously per scroll event; coalesce to one
+  // recompute per frame and keep the DOM write frame-aligned.
+  const handleVirtuaScroll = useCallback(() => {
+    if (stickyRafRef.current != null) return
+    stickyRafRef.current = requestAnimationFrame(() => {
+      stickyRafRef.current = null
+      recomputeSticky()
+    })
+  }, [recomputeSticky])
+
+  // Collapse from the overlay, then bring the now-collapsed header to the top so
+  // the eye lands on the folder just folded (the in-list toggle leaves you mid
+  // next folder otherwise). Deferred so virtua re-measures the shorter list
+  // before scrolling. Header index is unchanged by its own collapse, but we
+  // re-resolve it to stay correct regardless.
+  const handleOverlayToggle = useCallback(
+    (folderId: number) => {
+      toggleFolder(folderId)
+      requestAnimationFrame(() => {
+        const idx = headerIndexForFolder(rowsRef.current, folderId)
+        if (idx >= 0) {
+          virtualizerRef.current?.scrollToIndex(idx, {
+            align: "start",
+            smooth: false,
+          })
+        }
+      })
+    },
+    [toggleFolder]
+  )
+
+  // Recompute on anything that shifts geometry without firing a scroll event:
+  // expand/collapse, reorder, data refresh, drag start/end, viewport ready, and
+  // the overlay flip itself (so the freshly-mounted overlay node gets its
+  // initial transform). `useLayoutEffect` avoids a one-frame stale overlay.
+  useIsomorphicLayoutEffect(() => {
+    recomputeSticky()
+  }, [
+    rows,
+    folderExpanded,
+    viewportEl,
+    dragging,
+    stickyFolderId,
+    recomputeSticky,
+  ])
+
+  useEffect(
+    () => () => {
+      if (stickyRafRef.current != null) {
+        cancelAnimationFrame(stickyRafRef.current)
+      }
+    },
+    []
+  )
 
   const handleRemoveFolder = useCallback(
     (folderId: number) => {
@@ -1261,7 +1410,13 @@ export function SidebarConversationList({
 
   const folderHeaderElement = (
     folderId: number,
-    opts: { dragging: boolean; collapsed?: boolean; grip: boolean }
+    opts: {
+      dragging: boolean
+      collapsed?: boolean
+      grip: boolean
+      onToggle?: (folderId: number) => void
+      suppressed?: boolean
+    }
   ) => {
     const folderEntry = folderIndex.get(folderId)
     return (
@@ -1277,7 +1432,7 @@ export function SidebarConversationList({
         currentDefaultAgent={folderEntry?.defaultAgentType ?? null}
         availableAgents={availableAgents}
         availableAgentsFresh={availableAgentsFresh}
-        onToggle={toggleFolder}
+        onToggle={opts.onToggle ?? toggleFolder}
         onRemoveFromWorkspace={handleRemoveFolder}
         onNewConversation={handleNewConversationForFolder}
         onImport={handleImportForFolder}
@@ -1288,6 +1443,7 @@ export function SidebarConversationList({
         onOpenInTerminal={handleOpenFolderInTerminal}
         isDragging={opts.dragging}
         onGripPointerDown={opts.grip ? beginFolderDrag : undefined}
+        suppressed={opts.suppressed ?? false}
       />
     )
   }
@@ -1299,6 +1455,10 @@ export function SidebarConversationList({
         folderHeaderElement(row.folderId, {
           dragging: dragging === row.folderId,
           grip: true,
+          // While this folder's sticky overlay is showing, the overlay is the
+          // accessible control; make the (occluded) in-list copy inert so it is
+          // not a duplicate tab stop / announcement.
+          suppressed: stickyFolderId === row.folderId,
         })
       )
     }
@@ -1348,7 +1508,9 @@ export function SidebarConversationList({
   return (
     <div className="relative flex flex-col flex-1 min-h-0">
       {(loading || refreshing) && (
-        <div className="absolute top-0 left-0 right-0 flex items-center justify-center py-1 z-10 pointer-events-none">
+        // z-20 keeps the refresh spinner above the sticky header overlay (z-10),
+        // which lives in a later sibling and would otherwise paint over it.
+        <div className="absolute top-0 left-0 right-0 flex items-center justify-center py-1 z-20 pointer-events-none">
           <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
         </div>
       )}
@@ -1432,6 +1594,7 @@ export function SidebarConversationList({
                     data={rows}
                     itemSize={32}
                     bufferSize={400}
+                    onScroll={handleVirtuaScroll}
                   >
                     {(row: SidebarRow) => (
                       <div key={rowKey(row)}>{renderRow(row)}</div>
@@ -1448,6 +1611,39 @@ export function SidebarConversationList({
                   </div>
                 )}
               </ScrollArea>
+              {/*
+                Floating sticky folder header. Rendered AFTER ScrollArea so any
+                `[data-folder-id]` lookup still resolves the real in-list header
+                first (the real one stays mounted within virtua's buffer while
+                this overlay also shows). It is a real, accessible control: once
+                scrolled past, the in-list header is unmounted by virtua, so the
+                overlay is the keyboard/AT path to toggle/act on that folder.
+                `grip:false` — reordering is driven from the in-list header,
+                whose geometry the custom drag gesture relies on. `bg-sidebar`
+                lives inside themeWrap so it picks up the folder's themed
+                background and occludes the rows scrolling beneath it.
+              */}
+              {stickyFolderId !== null && (
+                <div
+                  ref={overlayRef}
+                  className={cn(
+                    "pointer-events-none absolute left-0 right-0 top-0 z-10",
+                    "px-1.5 [--conv-rail-axis:0.875rem]"
+                  )}
+                  style={{ willChange: "transform" }}
+                >
+                  {themeWrap(
+                    stickyFolderId,
+                    <div className="pointer-events-auto bg-sidebar">
+                      {folderHeaderElement(stickyFolderId, {
+                        dragging: false,
+                        grip: false,
+                        onToggle: handleOverlayToggle,
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </ContextMenuTrigger>
           <ContextMenuContent>

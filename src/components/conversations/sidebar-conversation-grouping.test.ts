@@ -2,10 +2,15 @@ import { describe, expect, it } from "vitest"
 import type { DbConversationSummary } from "@/lib/types"
 import {
   applyReorder,
+  buildOwnerHeaderIndex,
   buildRows,
+  computeStickyState,
   flatIndexOfConversation,
+  folderHeaderFlatIndices,
   formatRelative,
   groupByFolderWithReuse,
+  headerIndexForFolder,
+  nextHeaderAfter,
   pointerYToTargetIndex,
   reuseSelected,
   reuseSet,
@@ -271,6 +276,121 @@ describe("pointerYToTargetIndex", () => {
   it("is safe for degenerate inputs", () => {
     expect(pointerYToTargetIndex(150, 100, 0, 32, 0)).toBe(0)
     expect(pointerYToTargetIndex(150, 100, 0, 0, 5)).toBe(0)
+  })
+})
+
+describe("sticky overlay helpers", () => {
+  // F10 expanded (2 convs), F20 collapsed, F30 expanded (empty hint).
+  const rows: SidebarRow[] = [
+    { kind: "folder", folderId: 10 }, // 0
+    { kind: "conversation", conversation: conv(1, 10) }, // 1
+    { kind: "conversation", conversation: conv(2, 10) }, // 2
+    { kind: "folder", folderId: 20 }, // 3
+    { kind: "folder", folderId: 30 }, // 4
+    { kind: "empty", folderId: 30, totalConversationCount: 0 }, // 5
+  ]
+
+  describe("buildOwnerHeaderIndex", () => {
+    it("maps every row to the flat index of its owning folder header", () => {
+      expect(Array.from(buildOwnerHeaderIndex(rows))).toEqual([
+        0, 0, 0, 3, 4, 4,
+      ])
+    })
+
+    it("returns an empty array for no rows", () => {
+      expect(Array.from(buildOwnerHeaderIndex([]))).toEqual([])
+    })
+  })
+
+  describe("folderHeaderFlatIndices", () => {
+    it("lists folder header indices in ascending order", () => {
+      expect(folderHeaderFlatIndices(rows)).toEqual([0, 3, 4])
+    })
+  })
+
+  describe("nextHeaderAfter", () => {
+    it("returns the next header index strictly after the active one", () => {
+      const headers = [0, 3, 4]
+      expect(nextHeaderAfter(headers, 0)).toBe(3)
+      expect(nextHeaderAfter(headers, 3)).toBe(4)
+    })
+
+    it("returns null for the last folder", () => {
+      expect(nextHeaderAfter([0, 3, 4], 4)).toBeNull()
+      expect(nextHeaderAfter([], 0)).toBeNull()
+    })
+  })
+
+  describe("headerIndexForFolder", () => {
+    it("finds the header row index for a folder id", () => {
+      expect(headerIndexForFolder(rows, 10)).toBe(0)
+      expect(headerIndexForFolder(rows, 30)).toBe(4)
+    })
+
+    it("returns -1 when the folder has no header row", () => {
+      expect(headerIndexForFolder(rows, 999)).toBe(-1)
+    })
+  })
+
+  describe("computeStickyState", () => {
+    const base = {
+      activeHeaderOffset: 0,
+      nextHeaderOffset: 96,
+      headerHeight: 32,
+    }
+
+    it("hides the overlay when the real header is at the top", () => {
+      expect(computeStickyState({ ...base, scrollOffset: 0 })).toEqual({
+        visible: false,
+        translateY: 0,
+      })
+    })
+
+    it("shows the overlay with no offset mid-folder", () => {
+      expect(computeStickyState({ ...base, scrollOffset: 40 })).toEqual({
+        visible: true,
+        translateY: 0,
+      })
+    })
+
+    it("pushes the overlay up as the next header enters the handoff window", () => {
+      // next header at 96, scrolled to 80 → d=16 (<32) → translateY 16-32 = -16
+      expect(computeStickyState({ ...base, scrollOffset: 80 })).toEqual({
+        visible: true,
+        translateY: -16,
+      })
+    })
+
+    it("does not push while the next header is a full header height away", () => {
+      // d === headerHeight is the exclusive boundary → no push yet.
+      expect(computeStickyState({ ...base, scrollOffset: 64 })).toEqual({
+        visible: true,
+        translateY: 0,
+      })
+    })
+
+    it("never pushes for the last folder (no next header)", () => {
+      expect(
+        computeStickyState({
+          scrollOffset: 1000,
+          activeHeaderOffset: 320,
+          nextHeaderOffset: null,
+          headerHeight: 32,
+        })
+      ).toEqual({ visible: true, translateY: 0 })
+    })
+
+    it("rounds the handoff offset to whole pixels", () => {
+      // d = 95.4 - 80 = 15.4 → round(15.4 - 32) = round(-16.6) = -17
+      expect(
+        computeStickyState({
+          scrollOffset: 80,
+          activeHeaderOffset: 0,
+          nextHeaderOffset: 95.4,
+          headerHeight: 32,
+        }).translateY
+      ).toBe(-17)
+    })
   })
 })
 
