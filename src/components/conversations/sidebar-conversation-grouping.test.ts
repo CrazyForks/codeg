@@ -124,6 +124,58 @@ describe("groupByFolderWithReuse", () => {
     expect(second.get(10)).toBe(first.get(10))
     expect(second.get(20)).toBe(first.get(20))
   })
+
+  it("merges worktree child folders into their parent bucket", () => {
+    // folder 11 + 12 are worktrees of root folder 10.
+    const childToParent = new Map<number, number>([
+      [11, 10],
+      [12, 10],
+    ])
+    const list = [conv(1, 10), conv(2, 11), conv(3, 12), conv(4, 20)]
+    const grouped = groupByFolderWithReuse(
+      list,
+      "created",
+      new Map(),
+      childToParent
+    )
+
+    // No child folder gets its own bucket; everything lands under the root (10).
+    expect([...grouped.keys()].sort((a, b) => a - b)).toEqual([10, 20])
+    expect(
+      grouped
+        .get(10)!
+        .map((c) => c.id)
+        .sort()
+    ).toEqual([1, 2, 3])
+    // The merge never rewrites folder_id — each conversation keeps its own.
+    const merged = grouped.get(10)!
+    expect(merged.find((c) => c.id === 2)!.folder_id).toBe(11)
+    expect(merged.find((c) => c.id === 3)!.folder_id).toBe(12)
+  })
+
+  it("sorts the merged parent+worktree bucket as one list", () => {
+    const childToParent = new Map<number, number>([[11, 10]])
+    // ids encode created-at order (higher id = newer), interleaved across folders.
+    const list = [conv(1, 10), conv(4, 11), conv(2, 11), conv(3, 10)]
+    const grouped = groupByFolderWithReuse(
+      list,
+      "created",
+      new Map(),
+      childToParent
+    )
+    expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 2, 1])
+  })
+
+  it("leaves grouping unchanged when childToParent is empty/omitted", () => {
+    const list = [conv(1, 10), conv(2, 11)]
+    const withEmpty = groupByFolderWithReuse(
+      list,
+      "created",
+      new Map(),
+      new Map()
+    )
+    expect([...withEmpty.keys()].sort((a, b) => a - b)).toEqual([10, 11])
+  })
 })
 
 describe("reuseSet", () => {

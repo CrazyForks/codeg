@@ -1,4 +1,5 @@
 import {
+  createRef,
   type ReactNode,
   type Ref,
   useEffect,
@@ -9,7 +10,10 @@ import { act, fireEvent, render } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { SidebarConversationList } from "./sidebar-conversation-list"
+import {
+  SidebarConversationList,
+  type SidebarConversationListHandle,
+} from "./sidebar-conversation-list"
 import type { DbConversationSummary, FolderDetail } from "@/lib/types"
 import enMessages from "@/i18n/messages/en.json"
 
@@ -243,13 +247,18 @@ function conv(
   }
 }
 
-function folder(id: number, name: string): FolderDetail {
+function folder(
+  id: number,
+  name: string,
+  parentId: number | null = null
+): FolderDetail {
   return {
     id,
     name,
     path: `/p/${id}`,
     color: "blue",
     default_agent_type: null,
+    parent_id: parentId,
   } as unknown as FolderDetail
 }
 
@@ -610,5 +619,58 @@ describe("SidebarConversationList — sticky folder header overlay", () => {
     } finally {
       rectSpy.mockRestore()
     }
+  })
+})
+
+describe("SidebarConversationList — scrollToActive across a worktree merge", () => {
+  const EXPANDED_KEY = "workspace:sidebar-folder-expanded"
+
+  beforeEach(() => {
+    // Root folder 1 + worktree child folder 2 (parent_id = 1), one conversation
+    // in each. Select the worktree conversation via the active tab.
+    store.folders = [folder(1, "Root"), folder(2, "Worktree", 1)]
+    store.allFolders = store.folders
+    store.conversations = [conv(11, 1), conv(21, 2)]
+    store.activeTabId = "tab-21"
+    store.tabSpec = [
+      {
+        id: "tab-21",
+        conversationId: 21,
+        agentType: "claude_code",
+        folderId: 2,
+        title: "conv-21",
+        isPinned: false,
+      },
+    ]
+    // Collapse the parent (root) group so the merged worktree row is initially
+    // absent from the flat model.
+    localStorage.setItem(EXPANDED_KEY, JSON.stringify({ 1: false }))
+  })
+
+  afterEach(() => {
+    localStorage.removeItem(EXPANDED_KEY)
+  })
+
+  it("expands the parent group to reveal and scroll to a merged worktree conversation", () => {
+    const ref = createRef<SidebarConversationListHandle>()
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList showCompleted sortMode="created" ref={ref} />
+      </NextIntlClientProvider>
+    )
+
+    // Parent collapsed → the worktree row is not in the flat model, so no scroll
+    // can resolve yet.
+    expect(virtuaCtl.scrollToIndex).not.toHaveBeenCalled()
+
+    act(() => {
+      ref.current?.scrollToActive()
+    })
+
+    // The fix resolves the *display group* (parent folder 1), expands it, and the
+    // deferred scroll then finds the worktree row. Pre-fix this stayed at 0
+    // because it checked/expanded the child folder id (2) — never a rendered
+    // group — so the row never entered the flat model.
+    expect(virtuaCtl.scrollToIndex).toHaveBeenCalled()
   })
 })

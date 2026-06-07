@@ -129,17 +129,26 @@ export function reuseSelected(
  * affected row.
  *
  * `prev` is the map returned by the last call (the caller threads it via a ref).
+ *
+ * `childToParent` (optional) merges worktree child folders into their parent: a
+ * conversation whose `folder_id` is a key is bucketed under the mapped parent
+ * id instead, so the parent group renders the main repo's and all its worktrees'
+ * conversations together (sorted as one bucket). The conversation objects
+ * themselves are untouched — only the grouping key is redirected, never
+ * `folder_id` — so per-conversation cwd resolution stays correct.
  */
 export function groupByFolderWithReuse(
   filtered: readonly DbConversationSummary[],
   sortMode: SidebarSortMode,
-  prev: Map<number, DbConversationSummary[]>
+  prev: Map<number, DbConversationSummary[]>,
+  childToParent?: ReadonlyMap<number, number>
 ): Map<number, DbConversationSummary[]> {
   const next = new Map<number, DbConversationSummary[]>()
   for (const conv of filtered) {
-    const list = next.get(conv.folder_id)
+    const groupId = childToParent?.get(conv.folder_id) ?? conv.folder_id
+    const list = next.get(groupId)
     if (list) list.push(conv)
-    else next.set(conv.folder_id, [conv])
+    else next.set(groupId, [conv])
   }
 
   const comparator =

@@ -542,6 +542,7 @@ export function SidebarConversationList({
         path: string
         color: string
         defaultAgentType: AgentType | null
+        parentId: number | null
       }
     >()
     for (const f of allFolders)
@@ -550,6 +551,7 @@ export function SidebarConversationList({
         path: f.path,
         color: f.color,
         defaultAgentType: f.default_agent_type,
+        parentId: f.parent_id,
       })
     return map
   }, [allFolders])
@@ -723,6 +725,21 @@ export function SidebarConversationList({
     return conversations.filter((c) => c.status !== "completed")
   }, [conversations, showCompleted])
 
+  // Maps each open worktree child folder → its (open) root folder. A child is
+  // only redirected when its parent is also open, so a worktree whose root was
+  // closed/removed falls back to standing on its own (its conversations stay
+  // reachable). The merge is display-only: it never rewrites `conversation.folder_id`.
+  const childToParent = useMemo(() => {
+    const openIds = new Set(folders.map((f) => f.id))
+    const map = new Map<number, number>()
+    for (const f of folders) {
+      if (f.parent_id != null && openIds.has(f.parent_id)) {
+        map.set(f.id, f.parent_id)
+      }
+    }
+    return map
+  }, [folders])
+
   // Hold the previous grouping so unchanged folders keep their bucket array
   // reference across renders (lets memoized FolderGroupItems bail out). Updating
   // the ref inside the memo factory is a deliberate cache, idempotent under
@@ -732,22 +749,27 @@ export function SidebarConversationList({
     const grouped = groupByFolderWithReuse(
       filteredConversations,
       sortMode,
-      byFolderRef.current
+      byFolderRef.current,
+      childToParent
     )
     byFolderRef.current = grouped
     return grouped
-  }, [filteredConversations, sortMode])
+  }, [filteredConversations, sortMode, childToParent])
 
   const folderTotalCounts = useMemo(() => {
     const map = new Map<number, number>()
     for (const conv of conversations) {
-      map.set(conv.folder_id, (map.get(conv.folder_id) ?? 0) + 1)
+      const groupId = childToParent.get(conv.folder_id) ?? conv.folder_id
+      map.set(groupId, (map.get(groupId) ?? 0) + 1)
     }
     return map
-  }, [conversations])
+  }, [conversations, childToParent])
 
   const orderedFolderIds = useMemo(() => {
     const folderIdSet = new Set(folders.map((f) => f.id))
+    // Worktree child folders are merged into their parent group, so they never
+    // get their own header row.
+    const isMergedChild = (id: number) => childToParent.has(id)
     // During drag we honour the optimistic order so sibling folders shift live
     // as the user hovers over slots. We still filter/append against the source
     // of truth so newly-added or -removed folders don't disappear mid-drag.
@@ -755,13 +777,13 @@ export function SidebarConversationList({
       const seen = new Set<number>()
       const ids: number[] = []
       for (const id of dragOrder) {
-        if (folderIdSet.has(id) && !seen.has(id)) {
+        if (folderIdSet.has(id) && !seen.has(id) && !isMergedChild(id)) {
           seen.add(id)
           ids.push(id)
         }
       }
       for (const f of folders) {
-        if (!seen.has(f.id)) {
+        if (!seen.has(f.id) && !isMergedChild(f.id)) {
           seen.add(f.id)
           ids.push(f.id)
         }
@@ -772,13 +794,13 @@ export function SidebarConversationList({
     const seen = new Set<number>()
     const ids: number[] = []
     for (const f of folders) {
-      if (!seen.has(f.id)) {
+      if (!seen.has(f.id) && !isMergedChild(f.id)) {
         seen.add(f.id)
         ids.push(f.id)
       }
     }
     return ids
-  }, [folders, dragOrder])
+  }, [folders, dragOrder, childToParent])
 
   const darkMode = resolvedTheme === "dark"
 
@@ -840,12 +862,17 @@ export function SidebarConversationList({
         (c) => c.id === targetId && c.agent_type === targetAgent
       )
       if (!conv) return
-      if (!(folderExpanded[conv.folder_id] ?? true)) {
+      // A worktree conversation is rendered under its parent group, so the row's
+      // visibility is gated by the parent's expansion — expand the display group,
+      // not the (never-rendered) child folder id.
+      const displayFolderId =
+        childToParent.get(conv.folder_id) ?? conv.folder_id
+      if (!(folderExpanded[displayFolderId] ?? true)) {
         // Expand first; the row only exists in the flat model once expanded, so
         // defer the actual scroll to the next render (this effect re-runs on the
         // folderExpanded change with the rebuilt rows available via rowsRef).
         setFolderExpanded((prev) => {
-          const next = { ...prev, [conv.folder_id]: true }
+          const next = { ...prev, [displayFolderId]: true }
           saveFolderExpanded(next)
           return next
         })
@@ -870,7 +897,7 @@ export function SidebarConversationList({
       pendingScrollRef.current = false
       scrollToActiveRef.current()
     }
-  }, [selectedConversation, conversations, folderExpanded])
+  }, [selectedConversation, conversations, folderExpanded, childToParent])
 
   const toggleFolder = useCallback((folderId: number) => {
     setFolderExpanded((prev) => {
@@ -1476,8 +1503,11 @@ export function SidebarConversationList({
       )
     }
     const conv = row.conversation
+    // Worktree child folders render under their parent group, so theme the row
+    // by the display group (parent) for a unified look.
+    const groupId = childToParent.get(conv.folder_id) ?? conv.folder_id
     return themeWrap(
-      conv.folder_id,
+      groupId,
       <SidebarConversationCard
         conversation={conv}
         isSelected={
@@ -1485,6 +1515,9 @@ export function SidebarConversationList({
           selectedConversation?.id === conv.id
         }
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
+        isWorktreeBranch={
+          (folderIndex.get(conv.folder_id)?.parentId ?? null) != null
+        }
         timeLabel={formatRelative(
           sortMode === "updated" ? conv.updated_at : conv.created_at,
           now
@@ -1494,7 +1527,7 @@ export function SidebarConversationList({
         onRename={handleRename}
         onDelete={handleDelete}
         onStatusChange={handleStatusChange}
-        onNewConversation={handleNewConversation}
+        onNewConversation={handleNewConversationForFolder}
       />
     )
   }
@@ -1592,7 +1625,10 @@ export function SidebarConversationList({
                     ref={virtualizerRef}
                     scrollRef={viewportRef}
                     data={rows}
-                    itemSize={32}
+                    // Initial estimate only — virtua measures real heights after
+                    // mount. Conversation rows are now two lines (~44px); folder
+                    // headers/empty hints are measured individually.
+                    itemSize={44}
                     bufferSize={400}
                     onScroll={handleVirtuaScroll}
                   >
