@@ -153,17 +153,24 @@ export function ConversationMessageNav({
 
   if (entries.length === 0) return null
 
+  // The rail sits in the right gutter beside the centered max-w-3xl message
+  // column, horizontally centered within it: the column's right edge is at
+  // 50% + 24rem, so the gutter's centre is 75% + 12rem (clamped to stay
+  // on-screen when the gutter is narrow). Keeps the dots off the message text.
   return (
-    <div className="group absolute right-2 top-1/2 z-20 flex max-h-[80%] -translate-y-1/2 flex-col items-center">
+    <div
+      className="group absolute top-1/2 z-20 flex max-h-[80%] -translate-x-1/2 -translate-y-1/2 flex-col items-center"
+      style={{ left: "min(75% + 12rem, 100% - 1rem)" }}
+    >
       <button
         type="button"
         aria-label={expanded ? t("collapse") : t("expand")}
         aria-expanded={expanded}
         title={t("title")}
         onClick={() => setExpandedPersist(!expanded)}
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-60 transition-colors hover:bg-accent/40 hover:text-foreground hover:opacity-100 focus-visible:opacity-100"
+        className="flex size-4 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-60 transition-colors hover:bg-accent/40 hover:text-foreground hover:opacity-100 focus-visible:opacity-100"
       >
-        <ListTree className="h-3.5 w-3.5" />
+        <ListTree className="h-2.5 w-2.5" />
       </button>
 
       <ScrollArea className="flex-1 min-h-0">
@@ -178,20 +185,19 @@ export function ConversationMessageNav({
                 aria-current={active ? "true" : undefined}
                 title={`#${entry.ordinal} ${entry.label}`}
                 onClick={() => jump(entry.threadIndex)}
-                className="group/marker flex h-4 w-5 items-center justify-center"
+                className="group/marker flex size-4 items-center justify-center"
               >
                 <span
                   className={cn(
-                    "h-0.5 rounded-full transition-all",
-                    active ? "w-4" : "w-3",
+                    "rounded-full border transition-all",
+                    active ? "size-2" : "size-1.5",
                     entry.hasChanges
                       ? active
-                        ? "bg-primary"
-                        : "bg-primary/50 group-hover/marker:bg-primary"
+                        ? "border-primary bg-primary"
+                        : "border-primary/50 bg-transparent group-hover/marker:border-primary"
                       : active
-                        ? "bg-foreground/60"
-                        : "bg-muted-foreground/30 group-hover/marker:bg-muted-foreground/60",
-                    active && "ring-1 ring-primary/40"
+                        ? "border-foreground/60 bg-foreground/60"
+                        : "border-muted-foreground/40 bg-transparent group-hover/marker:border-muted-foreground/70"
                   )}
                 />
               </button>
