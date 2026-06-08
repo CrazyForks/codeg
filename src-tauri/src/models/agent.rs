@@ -10,6 +10,7 @@ pub enum AgentType {
     Gemini,
     OpenClaw,
     Cline,
+    Hermes,
 }
 
 impl fmt::Display for AgentType {
@@ -21,6 +22,7 @@ impl fmt::Display for AgentType {
             AgentType::Gemini => write!(f, "Gemini CLI"),
             AgentType::OpenClaw => write!(f, "OpenClaw"),
             AgentType::Cline => write!(f, "Cline"),
+            AgentType::Hermes => write!(f, "Hermes Agent"),
         }
     }
 }

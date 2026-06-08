@@ -364,6 +364,68 @@ async fn build_agent(
                 ),
             )
         }
+        AgentDistribution::Uvx {
+            package,
+            cmd,
+            args,
+            env,
+            system_cmd,
+            ..
+        } => {
+            let merged_env = merge_agent_env(env, runtime_env);
+            let mut parts: Vec<String> = Vec::new();
+            for (k, v) in &merged_env {
+                parts.push(format!("{k}={v}"));
+            }
+            if let Some(uvx_path) = crate::commands::acp::resolve_uvx_command() {
+                // Primary: `uvx --from <pinned package> <entry script>`.
+                // uvx fetches + caches the pinned package on first use.
+                parts.push(uvx_path.to_string_lossy().to_string());
+                parts.push("--from".into());
+                parts.push(package.to_string());
+                parts.push(cmd.to_string());
+                for a in args {
+                    parts.push((*a).into());
+                }
+            } else if let Some((sys_path, sys_args)) = system_cmd.and_then(|(c, a)| {
+                crate::commands::acp::resolve_command_on_path(c).map(|path| (path, a))
+            }) {
+                // Fallback: the agent's own CLI is already on PATH (e.g.
+                // `hermes acp`), installed via its official installer rather
+                // than provisioned through uvx.
+                eprintln!(
+                    "[ACP][{}] uvx unavailable; falling back to system command {:?}",
+                    meta.name, sys_path
+                );
+                // `system_cmd` is a complete launch recipe for the PATH binary;
+                // the uvx entry-script `args` don't necessarily apply to it
+                // (for Hermes both are empty / `["acp"]`, so this is exact).
+                parts.push(sys_path.to_string_lossy().to_string());
+                for a in sys_args {
+                    parts.push((*a).into());
+                }
+            } else {
+                // INVARIANT: the substring "is not installed" is matched
+                // verbatim by the frontend catch block in
+                // `src/contexts/acp-connections-context.tsx` to surface a
+                // localized install prompt. Do not change the wording.
+                return Err(AcpError::SdkNotInstalled(format!(
+                    "{} is not installed. Please install it in Agent Settings.",
+                    meta.name
+                )));
+            }
+            let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+            let agent_name = meta.name.to_string();
+            AcpAgent::from_args(&refs)
+                .map(|a| {
+                    a.with_debug(move |line, dir| {
+                        if dir == sacp_tokio::LineDirection::Stderr {
+                            eprintln!("[ACP][{agent_name}][stderr] {line}");
+                        }
+                    })
+                })
+                .map_err(|e| AcpError::SpawnFailed(e.to_string()))
+        }
     }
 }
 

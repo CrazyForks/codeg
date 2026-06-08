@@ -44,6 +44,7 @@ const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<AgentType>([
   "gemini",
   "cline",
   "open_claw",
+  "hermes",
 ])
 
 export type ParsedMeta = {

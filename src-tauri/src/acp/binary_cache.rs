@@ -19,6 +19,171 @@ pub(crate) fn cache_dir() -> Result<PathBuf, AcpError> {
     Ok(base.join("app.codeg").join("acp-binaries"))
 }
 
+/// Directory where codeg caches a managed `uv` toolchain (`uv` + `uvx`),
+/// downloaded on demand when the user has no system `uv` (used to launch
+/// Python ACP agents such as Hermes). Layout:
+/// `<cache_dir>/uv-tool/<platform>/{uv,uvx}`.
+pub(crate) fn uv_tool_dir() -> Result<PathBuf, AcpError> {
+    Ok(cache_dir()?
+        .join("uv-tool")
+        .join(registry::current_platform()))
+}
+
+/// Locate a codeg-managed uv tool binary (`uv` or `uvx`) if it has already
+/// been downloaded into the cache. Returns `None` when not present, so
+/// callers fall back to PATH / common install locations.
+pub fn find_cached_uv_tool(tool: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    };
+    let path = uv_tool_dir().ok()?.join(exe);
+    path.is_file().then_some(path)
+}
+
+/// Pinned `uv` toolchain version codeg downloads on demand when the user has no
+/// system `uv` (used to launch Python ACP agents such as Hermes).
+const UV_TOOL_VERSION: &str = "0.8.10";
+
+/// Build the astral-sh/uv release archive URL for the current platform.
+fn uv_archive_url() -> Option<String> {
+    let (target, ext) = match registry::current_platform() {
+        "darwin-aarch64" => ("aarch64-apple-darwin", "tar.gz"),
+        "darwin-x86_64" => ("x86_64-apple-darwin", "tar.gz"),
+        "linux-aarch64" => ("aarch64-unknown-linux-gnu", "tar.gz"),
+        "linux-x86_64" => ("x86_64-unknown-linux-gnu", "tar.gz"),
+        "windows-aarch64" => ("aarch64-pc-windows-msvc", "zip"),
+        "windows-x86_64" => ("x86_64-pc-windows-msvc", "zip"),
+        _ => return None,
+    };
+    Some(format!(
+        "https://github.com/astral-sh/uv/releases/download/{UV_TOOL_VERSION}/uv-{target}.{ext}"
+    ))
+}
+
+/// Download + cache the `uv` toolchain (`uv` + `uvx`) into codeg's cache when no
+/// system `uv` is available, so Python ACP agents work with zero prerequisites.
+/// Idempotent: returns the cached `uvx` path immediately if already present.
+pub async fn ensure_uv_tool(on_progress: impl Fn(&str)) -> Result<PathBuf, AcpError> {
+    if let Some(uvx) = find_cached_uv_tool("uvx") {
+        on_progress("uv already cached, skipping download");
+        return Ok(uvx);
+    }
+
+    let url = uv_archive_url().ok_or_else(|| {
+        AcpError::PlatformNotSupported(format!(
+            "uv is not available for platform {}",
+            registry::current_platform()
+        ))
+    })?;
+
+    let dir = uv_tool_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AcpError::DownloadFailed(format!("failed to create uv cache dir: {e}")))?;
+    let tmp_dir = dir.join(".tmp");
+    if tmp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| AcpError::DownloadFailed(format!("failed to create tmp dir: {e}")))?;
+
+    let (uv_name, uvx_name) = if cfg!(windows) {
+        ("uv.exe", "uvx.exe")
+    } else {
+        ("uv", "uvx")
+    };
+
+    let result: Result<PathBuf, AcpError> = async {
+        let archive_path = tmp_dir.join("archive");
+        on_progress(&format!("Downloading uv {UV_TOOL_VERSION}..."));
+        download_file_with_progress(&url, &archive_path, &on_progress).await?;
+
+        let extract_dir = tmp_dir.join("extracted");
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| AcpError::DownloadFailed(format!("failed to create extract dir: {e}")))?;
+
+        on_progress("Extracting uv...");
+        if url.ends_with(".tar.gz") {
+            extract_tar_gz(&archive_path, &extract_dir)?;
+        } else if url.ends_with(".zip") {
+            extract_zip(&archive_path, &extract_dir)?;
+        } else {
+            return Err(AcpError::DownloadFailed(format!(
+                "unsupported uv archive format: {url}"
+            )));
+        }
+
+        // The uv archive ships both `uv` and `uvx`; cache both so the resolver
+        // and any direct `uv` invocation find them.
+        let mut uvx_path: Option<PathBuf> = None;
+        for name in [uv_name, uvx_name] {
+            let extracted = find_binary_recursive(&extract_dir, name).ok_or_else(|| {
+                AcpError::DownloadFailed(format!("'{name}' not found in uv archive"))
+            })?;
+            let final_path = dir.join(name);
+            std::fs::copy(&extracted, &final_path)
+                .map_err(|e| AcpError::DownloadFailed(format!("failed to copy {name}: {e}")))?;
+            set_executable_permissions(&final_path)?;
+            if name == uvx_name {
+                uvx_path = Some(final_path);
+            }
+        }
+        on_progress("uv installed successfully");
+        uvx_path.ok_or_else(|| AcpError::DownloadFailed("uvx missing after install".into()))
+    }
+    .await;
+
+    // Only clean the temp extraction dir. Unlike per-agent binary caches,
+    // `uv_tool_dir` is shared across all Uvx agents, so removing it on failure
+    // could delete a `uv`/`uvx` that a concurrent install (or a live connect)
+    // just wrote. A half-written binary is harmless — the next attempt
+    // overwrites it, and `find_cached_uv_tool` only reports ready when `uvx` is
+    // actually present.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    result
+}
+
+/// Marker recording that a `Uvx` agent's package has been pre-fetched into
+/// uvx's cache (written by the prepare step). The file content is the prepared
+/// version string. Lets the connect/status paths report readiness without
+/// introspecting uvx's internal cache or triggering a download.
+fn uvx_prepared_marker(registry_id: &str) -> Result<PathBuf, AcpError> {
+    Ok(cache_dir()?.join("uvx-prepared").join(registry_id))
+}
+
+/// Return the prepared version for a Uvx agent, or `None` if it has not been
+/// prepared yet.
+pub fn uvx_prepared_version(agent_type: AgentType) -> Option<String> {
+    let path = uvx_prepared_marker(registry::registry_id_for(agent_type)).ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v = raw.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Record that a Uvx agent's package (at `version`) has been pre-fetched.
+pub fn mark_uvx_agent_prepared(agent_type: AgentType, version: &str) -> Result<(), AcpError> {
+    let path = uvx_prepared_marker(registry::registry_id_for(agent_type))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AcpError::DownloadFailed(format!("create uvx marker dir failed: {e}")))?;
+    }
+    std::fs::write(&path, version.as_bytes())
+        .map_err(|e| AcpError::DownloadFailed(format!("write uvx marker failed: {e}")))
+}
+
+/// Remove a Uvx agent's prepared marker (used on uninstall). Absent marker is OK.
+pub fn clear_uvx_agent_prepared(agent_type: AgentType) -> Result<(), AcpError> {
+    let path = uvx_prepared_marker(registry::registry_id_for(agent_type))?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AcpError::DownloadFailed(format!(
+            "remove uvx marker failed: {e}"
+        ))),
+    }
+}
+
 fn normalize_version_label(version: &str) -> String {
     let trimmed = version.trim();
     if let Some(stripped) = trimmed

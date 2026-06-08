@@ -19,6 +19,24 @@ pub enum AgentDistribution {
         env: &'static [(&'static str, &'static str)],
         platforms: &'static [PlatformBinary],
     },
+    /// Python agents launched through `uvx` (the `uv` tool runner), which
+    /// fetches + caches the pinned package on first use — analogous to npx.
+    /// Used for ACP agents distributed as Python packages (e.g. Hermes).
+    Uvx {
+        version: &'static str,
+        /// The `uvx --from` package spec, e.g. "hermes-agent[acp]==0.16.0".
+        package: &'static str,
+        /// The console-script entry point to run, e.g. "hermes-acp".
+        cmd: &'static str,
+        args: &'static [&'static str],
+        env: &'static [(&'static str, &'static str)],
+        /// Minimum `uv` version required, e.g. "0.5.0". None means no specific requirement.
+        uv_required: Option<&'static str>,
+        /// Fallback command resolvable on PATH when `uvx` is unavailable, e.g.
+        /// `Some(("hermes", &["acp"]))` — lets users who installed the agent via
+        /// its official installer launch it without `uv`.
+        system_cmd: Option<(&'static str, &'static [&'static str])>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -38,9 +56,9 @@ pub struct AcpAgentMeta {
 impl AcpAgentMeta {
     pub fn registry_version(&self) -> Option<&'static str> {
         match &self.distribution {
-            AgentDistribution::Npx { version, .. } | AgentDistribution::Binary { version, .. } => {
-                Some(*version)
-            }
+            AgentDistribution::Npx { version, .. }
+            | AgentDistribution::Binary { version, .. }
+            | AgentDistribution::Uvx { version, .. } => Some(*version),
         }
     }
 }
@@ -80,6 +98,7 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::OpenClaw,
         AgentType::OpenCode,
         AgentType::Cline,
+        AgentType::Hermes,
     ]
 }
 
@@ -91,6 +110,7 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::OpenClaw => "openclaw-acp",
         AgentType::OpenCode => "opencode",
         AgentType::Cline => "cline",
+        AgentType::Hermes => "hermes",
     }
 }
 
@@ -102,6 +122,7 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "openclaw-acp" => Some(AgentType::OpenClaw),
         "opencode" => Some(AgentType::OpenCode),
         "cline" => Some(AgentType::Cline),
+        "hermes" => Some(AgentType::Hermes),
         _ => None,
     }
 }
@@ -238,6 +259,20 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 ],
             },
         },
+        AgentType::Hermes => AcpAgentMeta {
+            agent_type,
+            name: "Hermes Agent",
+            description: "Nous Research's self-improving agent (ACP via uvx)",
+            distribution: AgentDistribution::Uvx {
+                version: "0.16.0",
+                package: "hermes-agent[acp]==0.16.0",
+                cmd: "hermes-acp",
+                args: &[],
+                env: &[],
+                uv_required: Some("0.5.0"),
+                system_cmd: Some(("hermes", &["acp"])),
+            },
+        },
     }
 }
 
@@ -264,8 +299,33 @@ mod tests {
                 assert_eq!(node_required, expected_node_required);
                 assert_eq!(meta.registry_version(), Some(expected_version));
             }
-            AgentDistribution::Binary { .. } => {
-                panic!("expected npx distribution for {agent_type:?}");
+            other => {
+                panic!("expected npx distribution for {agent_type:?}, got {other:?}");
+            }
+        }
+    }
+
+    fn assert_uvx_version(
+        agent_type: AgentType,
+        expected_version: &str,
+        expected_package: &str,
+        expected_uv_required: Option<&str>,
+    ) {
+        let meta = get_agent_meta(agent_type);
+        match meta.distribution {
+            AgentDistribution::Uvx {
+                version,
+                package,
+                uv_required,
+                ..
+            } => {
+                assert_eq!(version, expected_version);
+                assert_eq!(package, expected_package);
+                assert_eq!(uv_required, expected_uv_required);
+                assert_eq!(meta.registry_version(), Some(expected_version));
+            }
+            other => {
+                panic!("expected uvx distribution for {agent_type:?}, got {other:?}");
             }
         }
     }
@@ -291,8 +351,8 @@ mod tests {
                     );
                 }
             }
-            AgentDistribution::Npx { .. } => {
-                panic!("expected binary distribution for {agent_type:?}");
+            other => {
+                panic!("expected binary distribution for {agent_type:?}, got {other:?}");
             }
         }
     }
@@ -314,5 +374,11 @@ mod tests {
         assert_npx_version(AgentType::Cline, "3.0.9", "cline@3.0.9", None);
         assert_binary_version(AgentType::Codex, "0.15.0", "/releases/download/v0.15.0/");
         assert_binary_version(AgentType::OpenCode, "1.16.2", "/releases/download/v1.16.2/");
+        assert_uvx_version(
+            AgentType::Hermes,
+            "0.16.0",
+            "hermes-agent[acp]==0.16.0",
+            Some("0.5.0"),
+        );
     }
 }

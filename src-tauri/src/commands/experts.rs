@@ -778,6 +778,7 @@ fn supported_agents() -> Vec<AgentType> {
         AgentType::Gemini,
         AgentType::OpenClaw,
         AgentType::Cline,
+        AgentType::Hermes,
     ];
     ALL.iter()
         .filter(|a| skill_storage_spec(**a).is_some())

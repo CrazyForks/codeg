@@ -47,7 +47,7 @@ import { toErrorMessage } from "@/lib/app-error"
 // prefix makes a collision implausible.
 const DEFAULT_SENTINEL = "__codeg_default__"
 
-// Tab-switch debounce. Without this, rapid clicks across the 6 agent
+// Tab-switch debounce. Without this, rapid clicks across the agent
 // buttons would each kick off a real probe (which on the backend now
 // serializes per agent_type, but every queued probe still spawns the
 // CLI). 250ms is below the threshold of feeling laggy while comfortably
@@ -61,6 +61,7 @@ const AGENT_TYPES: AgentType[] = [
   "gemini",
   "open_claw",
   "cline",
+  "hermes",
 ]
 
 interface CachedSnapshot {

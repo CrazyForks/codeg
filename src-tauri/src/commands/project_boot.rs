@@ -304,6 +304,7 @@ fn agent_type_for_skill_id(skill_agent: &str) -> Option<AgentType> {
         "gemini-cli" => AgentType::Gemini,
         "openclaw" => AgentType::OpenClaw,
         "cline" => AgentType::Cline,
+        "hermes" => AgentType::Hermes,
         _ => return None,
     })
 }

@@ -2109,7 +2109,16 @@ pub fn read_servers_for_agent_type(
         AgentType::Gemini => read_gemini_servers(),
         AgentType::OpenClaw => read_openclaw_servers(),
         AgentType::Cline => read_cline_servers(),
+        AgentType::Hermes => read_hermes_servers(),
     }
+}
+
+/// Hermes self-manages its MCP servers in `~/.hermes/config.yaml` (under
+/// `mcp_servers`), configured via `hermes mcp` / the Hermes CLI. codeg neither
+/// reads nor writes that file (there is no `McpAppType::Hermes` write path), so
+/// it surfaces no servers here.
+fn read_hermes_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
+    Ok(BTreeMap::new())
 }
 
 fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandError> {

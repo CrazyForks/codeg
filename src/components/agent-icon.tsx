@@ -235,6 +235,58 @@ const ClaudeCodeColorIcon = memo(function ClaudeCodeColorIcon({
   )
 })
 
+const HermesMonoIcon = memo(function HermesMonoIcon({
+  size = "1em",
+}: IconProps) {
+  return (
+    <svg
+      fill="none"
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 16 16"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>Hermes Agent</title>
+      <path
+        d="M8 1.5v13"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+      <path
+        d="M8 3.25c-2.35-1.4-4.7-.95-6.25.35 1.85-.2 3.8.2 5.55 1.55"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8 3.25c2.35-1.4 4.7-.95 6.25.35-1.85-.2-3.8.2-5.55 1.55"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8 13.25c-2.3-1-3.05-2.65-1.35-4.15-2 .8-2.35 2.95-.35 4"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8 13.25c2.3-1 3.05-2.65 1.35-4.15 2 .8 2.35 2.95.35 4"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="8" cy="1.8" r="1.1" fill="currentColor" />
+    </svg>
+  )
+})
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyIcon = React.ComponentType<any>
 
@@ -248,6 +300,7 @@ const COLOR_ICONS: Partial<Record<AgentType, AnyIcon>> = {
 const MONO_ICONS: Partial<Record<AgentType, AnyIcon>> = {
   open_code: OpenCodeMonoIcon,
   cline: ClineMonoIcon,
+  hermes: HermesMonoIcon,
 }
 
 // Text-color versions for Mono icons

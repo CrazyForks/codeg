@@ -193,8 +193,118 @@ pub(crate) async fn is_cmd_available(cmd: &str) -> bool {
     resolve_npx_command(cmd).await.is_some()
 }
 
-fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
     which::which(cmd).ok()
+}
+
+/// Resolve the `uvx` (uv tool runner) executable used to launch Python ACP
+/// agents (e.g. Hermes). Checks PATH first (respecting a user's own `uv`),
+/// then codeg's managed uv cache, then the common install locations the
+/// official `uv` installer / cargo use (`~/.local/bin`, `~/.cargo/bin`).
+pub(crate) fn resolve_uvx_command() -> Option<PathBuf> {
+    if let Some(path) = resolve_command_on_path("uvx") {
+        return Some(path);
+    }
+    if let Some(path) = crate::acp::binary_cache::find_cached_uv_tool("uvx") {
+        return Some(path);
+    }
+    let exe = if cfg!(windows) { "uvx.exe" } else { "uvx" };
+    let home = home_dir_or_default();
+    for dir in [home.join(".local").join("bin"), home.join(".cargo").join("bin")] {
+        let cand = dir.join(exe);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Whether a `Uvx` agent can actually be launched on this machine right now:
+/// the `uvx` runner is resolvable (codeg auto-provisions it on install, so this
+/// holds post-prepare), or the agent's own CLI is on PATH (system fallback).
+/// The connect gate (`verify_agent_installed`) and the Settings status/list
+/// paths all use this so they agree on readiness. Note: the prepared-version
+/// marker is deliberately NOT consulted here — it records what was fetched (for
+/// the installed-version badge), not whether the launcher is currently present.
+fn uvx_agent_launchable(system_cmd: Option<(&'static str, &'static [&'static str])>) -> bool {
+    resolve_uvx_command().is_some()
+        || system_cmd
+            .map(|(c, _)| resolve_command_on_path(c).is_some())
+            .unwrap_or(false)
+}
+
+/// Pre-fetch a `Uvx` agent's pinned package into uvx's cache by running
+/// `uvx --from <package> <cmd> --version`, so the first real connect doesn't
+/// pay the download cost. Streams progress to the install event stream.
+async fn prewarm_uvx_agent(
+    agent_name: &str,
+    package: &str,
+    cmd: &str,
+    task_id: &str,
+    emitter: &EventEmitter,
+) -> Result<(), AcpError> {
+    let uvx = match resolve_uvx_command() {
+        Some(path) => path,
+        None => {
+            // Zero-prerequisite UX: provision the uv toolchain on demand, then
+            // re-resolve. Failure propagates as a normal install error.
+            emit_agent_install_event(
+                emitter,
+                task_id,
+                AgentInstallEventKind::Log,
+                "uv not found — installing uv toolchain...".to_string(),
+            );
+            let emitter_clone = emitter.clone();
+            let task_id_clone = task_id.to_string();
+            crate::acp::binary_cache::ensure_uv_tool(move |msg| {
+                emit_agent_install_event(
+                    &emitter_clone,
+                    &task_id_clone,
+                    AgentInstallEventKind::Log,
+                    msg.to_string(),
+                );
+            })
+            .await?;
+            resolve_uvx_command().ok_or_else(|| {
+                AcpError::SdkNotInstalled(
+                    "uv installation did not produce a usable uvx".to_string(),
+                )
+            })?
+        }
+    };
+    emit_agent_install_event(
+        emitter,
+        task_id,
+        AgentInstallEventKind::Log,
+        format!("$ uvx --from {package} {cmd} --version"),
+    );
+    let output = crate::process::tokio_command(&uvx)
+        .arg("--from")
+        .arg(package)
+        .arg(cmd)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| AcpError::SpawnFailed(format!("failed to run uvx: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines().chain(stdout.lines()) {
+        if !line.trim().is_empty() {
+            emit_agent_install_event(
+                emitter,
+                task_id,
+                AgentInstallEventKind::Log,
+                line.to_string(),
+            );
+        }
+    }
+    if !output.status.success() {
+        return Err(AcpError::protocol(format!(
+            "uvx prepare for {agent_name} failed: {}",
+            stderr.lines().last().unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) async fn resolve_npx_command(cmd: &str) -> Option<PathBuf> {
@@ -374,6 +484,20 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             Ok(())
         }
+        registry::AgentDistribution::Uvx { system_cmd, .. } => {
+            // Launchable when uvx is resolvable (codeg auto-provisions it on
+            // install, so this holds post-prepare) or the agent's own CLI is on
+            // PATH. Kept consistent with the Settings status/list paths via the
+            // shared helper, so connect and the UI never disagree on readiness.
+            if uvx_agent_launchable(system_cmd) {
+                Ok(())
+            } else {
+                Err(AcpError::SdkNotInstalled(format!(
+                    "{} is not installed. Please install it in Agent Settings.",
+                    meta.name
+                )))
+            }
+        }
     }
 }
 
@@ -444,6 +568,7 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
                 .ok()
                 .flatten()
         }
+        registry::AgentDistribution::Uvx { .. } => binary_cache::uvx_prepared_version(agent_type),
     }
 }
 
@@ -818,6 +943,33 @@ fn codex_home_dir() -> PathBuf {
             }
         }
         None => home_dir_or_default().join(".codex"),
+    }
+}
+
+/// Hermes config/data directory. Honors `HERMES_HOME`, defaults to `~/.hermes`.
+/// Hermes self-manages credentials (`.env`), config (`config.yaml`), session
+/// store (`state.db`), and skills (`skills/`) here.
+pub(crate) fn hermes_home_dir() -> PathBuf {
+    let configured = std::env::var("HERMES_HOME").ok().and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    match configured {
+        Some(value) => {
+            if value == "~" {
+                home_dir_or_default()
+            } else if let Some(remain) = value.strip_prefix("~/") {
+                home_dir_or_default().join(remain)
+            } else {
+                PathBuf::from(value)
+            }
+        }
+        None => home_dir_or_default().join(".hermes"),
     }
 }
 
@@ -1650,6 +1802,11 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
                 ".claude/skills",
             ],
         }),
+        AgentType::Hermes => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![hermes_home_dir().join("skills")],
+            project_rel_dirs: vec![],
+        }),
     }
 }
 
@@ -2239,6 +2396,10 @@ fn cascade_update_agent_config(
         }
         AgentType::OpenClaw => {
             // agent_local_config_path returns None for OpenClaw — no-op
+        }
+        AgentType::Hermes => {
+            // Hermes self-manages credentials in ~/.hermes/.env via
+            // `hermes model` / `hermes setup`; codeg writes no provider creds.
         }
         AgentType::Codex => {
             let auth_path = codex_auth_json_path();
@@ -2855,6 +3016,10 @@ pub(crate) async fn acp_get_agent_status_core(
                 .flatten();
             (platforms.iter().any(|p| p.platform == platform), detected)
         }
+        registry::AgentDistribution::Uvx { system_cmd, .. } => (
+            uvx_agent_launchable(*system_cmd),
+            binary_cache::uvx_prepared_version(agent_type),
+        ),
     };
 
     Ok(crate::acp::types::AcpAgentStatus {
@@ -2923,6 +3088,11 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                     detected,
                 )
             }
+            registry::AgentDistribution::Uvx { system_cmd, .. } => (
+                uvx_agent_launchable(*system_cmd),
+                "uvx",
+                binary_cache::uvx_prepared_version(agent_type),
+            ),
         };
 
         let mut env = setting
@@ -3475,6 +3645,9 @@ pub(crate) async fn acp_download_agent_binary_core(
         registry::AgentDistribution::Npx { .. } => Err(AcpError::protocol(
             "download is only supported for binary agents",
         )),
+        registry::AgentDistribution::Uvx { .. } => Err(AcpError::protocol(
+            "download is only supported for binary agents",
+        )),
     };
 
     match &result {
@@ -3654,6 +3827,38 @@ pub(crate) async fn acp_prepare_npx_agent_core(
         registry::AgentDistribution::Binary { .. } => Err(AcpError::protocol(
             "prepare is only supported for npx agents",
         )),
+        registry::AgentDistribution::Uvx {
+            package,
+            cmd,
+            version,
+            ..
+        } => {
+            let default = agent_setting_service::AgentDefaultInput {
+                agent_type,
+                registry_id: registry::registry_id_for(agent_type).to_string(),
+                default_sort_order: i32::MAX / 2,
+            };
+            agent_setting_service::ensure_defaults(&db.conn, &[default])
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
+
+            // Pre-fetch the pinned package into uvx's cache so the first
+            // connect doesn't pay the download cost. The version is pinned in
+            // the package spec, so `version_override` does not apply here.
+            prewarm_uvx_agent(meta.name, package, cmd, &task_id, emitter).await?;
+
+            let resolved = version.to_string();
+            binary_cache::mark_uvx_agent_prepared(agent_type, &resolved)?;
+            agent_setting_service::set_installed_version(
+                &db.conn,
+                agent_type,
+                Some(resolved.clone()),
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
+            emit_acp_agents_updated(emitter, "uvx_prepared", Some(agent_type));
+            Ok(resolved)
+        }
     };
 
     match &result {
@@ -3741,6 +3946,9 @@ pub(crate) async fn acp_uninstall_agent_core(
             }
             registry::AgentDistribution::Npx { package, .. } => {
                 uninstall_npm_global_package(package).await?;
+            }
+            registry::AgentDistribution::Uvx { .. } => {
+                binary_cache::clear_uvx_agent_prepared(agent_type)?;
             }
         }
 

@@ -64,6 +64,11 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
             platforms,
             ..
         } => check_binary_environment(agent_type, version, cmd, platforms).await,
+        AgentDistribution::Uvx {
+            uv_required,
+            system_cmd,
+            ..
+        } => check_uv_environment(*uv_required, *system_cmd).await,
     };
 
     let passed = checks
@@ -280,6 +285,108 @@ fn build_node_version_check(current_version: Option<&str>, required: &str) -> Ch
             label: "Node.js version".into(),
             status: CheckStatus::Warn,
             message: format!("Cannot parse Node.js version; required >={required}"),
+            fixes: vec![],
+        },
+    }
+}
+
+/// Preflight for `Uvx` agents (Python ACP agents launched via `uvx`, e.g.
+/// Hermes). Passes when either the `uv` tool runner is resolvable, or — as a
+/// fallback — the agent's own CLI is already installed on PATH.
+async fn check_uv_environment(
+    uv_required: Option<&str>,
+    system_cmd: Option<(&str, &[&str])>,
+) -> Vec<CheckItem> {
+    // Primary: the `uv` tool runner (uvx) fetches + launches the agent package.
+    if let Some(uvx_path) = crate::commands::acp::resolve_uvx_command() {
+        let version = run_uv_version(&uvx_path).await;
+        let mut checks = vec![CheckItem {
+            check_id: "uv_available".into(),
+            label: "uv".into(),
+            status: CheckStatus::Pass,
+            message: match &version {
+                Some(v) => format!("uv {v} available"),
+                None => "uv available".into(),
+            },
+            fixes: vec![],
+        }];
+        if let Some(required) = uv_required {
+            checks.push(build_uv_version_check(version.as_deref(), required));
+        }
+        return checks;
+    }
+
+    // Fallback: the agent's own CLI is already installed on PATH (e.g. a user
+    // who ran the official installer has `hermes` available).
+    if let Some((cmd, _)) = system_cmd {
+        if crate::commands::acp::resolve_command_on_path(cmd).is_some() {
+            return vec![CheckItem {
+                check_id: "uv_available".into(),
+                label: "uv".into(),
+                status: CheckStatus::Warn,
+                message: format!(
+                    "uv not found; will launch via the system `{cmd}` command on PATH"
+                ),
+                fixes: vec![],
+            }];
+        }
+    }
+
+    // Not a hard failure: codeg auto-provisions the uv toolchain on demand when
+    // the agent is installed (see `prewarm_uvx_agent` → `ensure_uv_tool`).
+    vec![CheckItem {
+        check_id: "uv_available".into(),
+        label: "uv".into(),
+        status: CheckStatus::Warn,
+        message:
+            "uv (the Python tool runner) isn't installed yet; codeg will install it automatically when you install this agent"
+                .into(),
+        fixes: vec![],
+    }]
+}
+
+/// Run `<uvx> --version` and extract the version token (output looks like
+/// "uvx 0.8.10 (hash date)").
+async fn run_uv_version(uvx_path: &std::path::Path) -> Option<String> {
+    let output = crate::process::tokio_command(uvx_path)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace().nth(1).map(|s| s.to_string())
+}
+
+/// Build a `CheckItem` for the `uv` minimum-version requirement. Too-old is a
+/// `Warn` (not `Fail`): recent uv releases are backward compatible for the
+/// `uvx --from <pkg>==<ver>` invocation, so an old uv should not hard-block.
+fn build_uv_version_check(current: Option<&str>, required: &str) -> CheckItem {
+    match (current.and_then(parse_node_version), parse_node_version(required)) {
+        (Some(cur), Some(req)) if cur >= req => CheckItem {
+            check_id: "uv_version".into(),
+            label: "uv version".into(),
+            status: CheckStatus::Pass,
+            message: format!("uv {} meets the minimum requirement (>={required})", current.unwrap_or("")),
+            fixes: vec![],
+        },
+        (Some(_), Some(_)) => CheckItem {
+            check_id: "uv_version".into(),
+            label: "uv version".into(),
+            status: CheckStatus::Warn,
+            message: format!(
+                "uv {} is older than the recommended >={required}; consider `uv self update`",
+                current.unwrap_or("")
+            ),
+            fixes: vec![],
+        },
+        _ => CheckItem {
+            check_id: "uv_version".into(),
+            label: "uv version".into(),
+            status: CheckStatus::Warn,
+            message: format!("Cannot parse uv version; recommended >={required}"),
             fixes: vec![],
         },
     }
