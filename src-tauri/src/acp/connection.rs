@@ -502,9 +502,9 @@ pub async fn spawn_agent_connection(
         .await;
 
         // Revoke the per-launch token + cascade cancel any still-pending
-        // delegations owned by this parent connection. Both are best-effort:
-        // a missing token entry is a no-op, and `cancel_by_parent` is safe
-        // to call on an empty pending map.
+        // delegations AND questions owned by this parent connection. All are
+        // best-effort: a missing token entry is a no-op, and both
+        // `cancel_by_parent` calls are safe on an empty pending map.
         if let Some(inj) = delegation_for_cleanup {
             let token = {
                 let snap = state_clone.read().await;
@@ -514,6 +514,10 @@ pub async fn spawn_agent_connection(
                 inj.tokens.revoke(&tok).await;
             }
             inj.broker.cancel_by_parent(&conn_id).await;
+            // Reclaim a parked `ask_user_question` instead of waiting for the
+            // companion's ask socket to close (which a reparented/hard-killed
+            // agent may never do); the dropped sender declines the tool cleanly.
+            inj.questions.cancel_questions_by_parent(&conn_id).await;
         }
 
         if let Err(e) = result {
@@ -891,6 +895,12 @@ pub struct DelegationInjection {
     /// of the three is on, and the companion's `--features` lists `ask` to expose
     /// the `ask_user_question` tool.
     pub ask: crate::acp::question::QuestionRuntimeConfig,
+    /// Question registry handle for the teardown cascade. The `run_connection`
+    /// cleanup guard calls `cancel_questions_by_parent` through this so a pending
+    /// `ask_user_question` is reclaimed synchronously on disconnect, mirroring
+    /// the delegation `broker.cancel_by_parent` cleanup. Shares the same backing
+    /// `ConnectionManager` as the listener's question lookup.
+    pub questions: Arc<dyn crate::acp::question::SessionQuestionAccess>,
 }
 
 /// Locate the `codeg-mcp` companion binary across the supported deployment
@@ -4471,12 +4481,27 @@ mod tests {
         // exact state a fresh install reaches before the user touches the
         // settings panel. Feedback is likewise disabled by default, so with
         // BOTH features off the companion isn't injected at all.
+        struct NoQuestions;
+        #[async_trait::async_trait]
+        impl crate::acp::question::SessionQuestionAccess for NoQuestions {
+            async fn register_question(
+                &self,
+                _parent_connection_id: &str,
+                _questions: Vec<crate::acp::question::QuestionSpec>,
+            ) -> Option<crate::acp::question::RegisteredQuestion> {
+                None
+            }
+            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
+            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
+        }
         let injection = DelegationInjection {
             broker,
             tokens: Arc::new(TokenRegistry::default()),
             socket_path: std::path::PathBuf::from("/tmp/codeg-mcp.sock"),
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
+            questions: Arc::new(NoQuestions)
+                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
         };
 
         let mut servers: Vec<McpServer> = Vec::new();

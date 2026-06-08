@@ -159,6 +159,14 @@ pub trait SessionQuestionAccess: Send + Sync {
     /// (peer-close) or the connection is tearing down. Removes it and clears
     /// the card on every client. No-op if it was already answered / gone.
     async fn cancel_question(&self, parent_connection_id: &str, question_id: &str);
+
+    /// Cancel every pending question parked on a connection that is tearing
+    /// down. Called from the `run_connection` cleanup guard (alongside the
+    /// delegation `cancel_by_parent` cascade) so a question entry — and the
+    /// listener task parked on it — is reclaimed synchronously on disconnect,
+    /// rather than lingering until the companion's ask socket happens to close.
+    /// No-op when the connection has no pending ask.
+    async fn cancel_questions_by_parent(&self, parent_connection_id: &str);
 }
 
 /// Validate + parse the MCP `ask_user_question` arguments into typed
@@ -271,6 +279,82 @@ pub fn parse_questions(arguments: &Value) -> Result<Vec<QuestionSpec>, String> {
         });
     }
     Ok(out)
+}
+
+/// Re-assert the [`parse_questions`] count + size bounds on already-typed specs.
+/// The companion validates before sending, but the broker socket is only
+/// token-gated, so a hand-rolled client could bypass that path and ride
+/// oversized or malformed specs straight into the broadcast `QuestionRequest`
+/// event and the `pending_question` snapshot. The listener registers through
+/// this, declining the ask on `Err` rather than trusting unbounded input — the
+/// authoritative answer-side bounds already live in [`build_outcome`], so this
+/// closes the matching gap on the request side. Bounds mirror `parse_questions`.
+pub fn validate_specs(specs: &[QuestionSpec]) -> Result<(), String> {
+    if specs.is_empty() || specs.len() > MAX_QUESTIONS {
+        return Err(format!(
+            "expected 1..={MAX_QUESTIONS} questions, got {}",
+            specs.len()
+        ));
+    }
+    let mut seen_ids = std::collections::HashSet::new();
+    for (qi, q) in specs.iter().enumerate() {
+        // `parse_questions` mints a fresh uuid per question; a hand-rolled client
+        // could send empty / colliding ids, and the answer routing + UI state map
+        // key on `id`, so duplicates would misroute or collide.
+        if q.id.trim().is_empty() {
+            return Err(format!("questions[{qi}] has an empty `id`"));
+        }
+        if !seen_ids.insert(q.id.as_str()) {
+            return Err(format!("questions[{qi}] has a duplicate `id` {:?}", q.id));
+        }
+        if q.question.trim().is_empty() {
+            return Err(format!("questions[{qi}] has an empty `question`"));
+        }
+        if q.question.chars().count() > MAX_QUESTION_TEXT_CHARS {
+            return Err(format!(
+                "questions[{qi}] `question` exceeds {MAX_QUESTION_TEXT_CHARS} characters"
+            ));
+        }
+        if q.header.trim().is_empty() {
+            return Err(format!("questions[{qi}] has an empty `header`"));
+        }
+        if q.header.chars().count() > MAX_HEADER_CHARS {
+            return Err(format!(
+                "questions[{qi}] `header` exceeds {MAX_HEADER_CHARS} characters"
+            ));
+        }
+        if q.options.len() < MIN_OPTIONS || q.options.len() > MAX_OPTIONS {
+            return Err(format!(
+                "questions[{qi}] must have between {MIN_OPTIONS} and {MAX_OPTIONS} options"
+            ));
+        }
+        let mut seen_labels = std::collections::HashSet::new();
+        for (oi, o) in q.options.iter().enumerate() {
+            if o.label.trim().is_empty() {
+                return Err(format!("questions[{qi}].options[{oi}] has an empty `label`"));
+            }
+            if o.label.chars().count() > MAX_QUESTION_TEXT_CHARS {
+                return Err(format!(
+                    "questions[{qi}].options[{oi}] `label` exceeds {MAX_QUESTION_TEXT_CHARS} characters"
+                ));
+            }
+            // Mirror parse_questions: labels are the React key + selection identity
+            // and answers are submitted by label, so duplicates (trimmed) are
+            // ambiguous.
+            if !seen_labels.insert(o.label.trim()) {
+                return Err(format!(
+                    "questions[{qi}] has a duplicate option label {:?}",
+                    o.label
+                ));
+            }
+            if o.description.chars().count() > MAX_QUESTION_TEXT_CHARS {
+                return Err(format!(
+                    "questions[{qi}].options[{oi}] `description` exceeds {MAX_QUESTION_TEXT_CHARS} characters"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Join the user's submission with the original questions into a self-describing
@@ -401,6 +485,96 @@ mod tests {
         assert!(!qs[0].multi_select);
         assert_eq!(qs[0].options.len(), 2);
         assert!(!qs[0].id.is_empty());
+    }
+
+    #[test]
+    fn validate_specs_accepts_well_formed_and_rejects_malformed() {
+        // What parse_questions mints passes the request-side re-check.
+        let good = parse_questions(&valid_args()).unwrap();
+        assert!(validate_specs(&good).is_ok());
+
+        // Build a spec with a tunable question, option count, and first-label
+        // length so each bound can be tripped independently.
+        let spec = |question: &str, options: usize, first_label_len: usize| QuestionSpec {
+            id: "q".into(),
+            question: question.into(),
+            header: "H".into(),
+            multi_select: false,
+            options: (0..options)
+                .map(|i| QuestionOption {
+                    label: if first_label_len > 0 && i == 0 {
+                        "x".repeat(first_label_len)
+                    } else {
+                        format!("opt{i}")
+                    },
+                    description: String::new(),
+                })
+                .collect(),
+        };
+
+        assert!(validate_specs(&[]).is_err(), "empty set");
+        assert!(
+            validate_specs(&[spec(&"q".repeat(MAX_QUESTION_TEXT_CHARS + 1), 2, 0)]).is_err(),
+            "oversized question text"
+        );
+        assert!(
+            validate_specs(&[spec("ok", MIN_OPTIONS - 1, 0)]).is_err(),
+            "too few options"
+        );
+        assert!(
+            validate_specs(&[spec("ok", MAX_OPTIONS + 1, 0)]).is_err(),
+            "too many options"
+        );
+        assert!(
+            validate_specs(&[spec("ok", 2, MAX_QUESTION_TEXT_CHARS + 1)]).is_err(),
+            "oversized option label"
+        );
+        assert!(validate_specs(&[spec("   ", 2, 0)]).is_err(), "blank question");
+
+        // Duplicate question id across the set (spec() hardcodes id "q") — answer
+        // routing + UI state key on id, so duplicates must be rejected.
+        assert!(
+            validate_specs(&[spec("a", 2, 0), spec("b", 2, 0)]).is_err(),
+            "duplicate question id"
+        );
+        let blank_id = QuestionSpec {
+            id: "  ".into(),
+            question: "ok".into(),
+            header: "H".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "a".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "b".into(),
+                    description: String::new(),
+                },
+            ],
+        };
+        assert!(validate_specs(&[blank_id]).is_err(), "blank id");
+        // Duplicate option label within one question (parse_questions rejects it).
+        let dup_label = QuestionSpec {
+            id: "q".into(),
+            question: "ok".into(),
+            header: "H".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "same".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: " same ".into(),
+                    description: String::new(),
+                },
+            ],
+        };
+        assert!(
+            validate_specs(&[dup_label]).is_err(),
+            "duplicate option label (trimmed)"
+        );
     }
 
     #[test]

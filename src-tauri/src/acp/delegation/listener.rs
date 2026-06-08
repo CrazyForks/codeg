@@ -262,6 +262,20 @@ impl DelegationListener {
                 };
                 let question_id = reg.question_id;
                 let mut answer_rx = reg.answer_rx;
+                // Close the teardown race: `ask_target` validated the token, but the
+                // parent connection may have been revoked + swept
+                // (`cancel_questions_by_parent`) in the window before the insert
+                // above — the sweep would have missed this just-registered entry,
+                // leaving it parked until peer-close. The token is revoked before
+                // the sweep, so a re-check that now finds it gone means teardown is
+                // underway: cancel immediately so the ask can't linger.
+                if self.tokens.lookup(&req.token).await.is_none() {
+                    self.questions
+                        .cancel_question(&parent_conn_id, &question_id)
+                        .await;
+                    write_frame(conn, &ask_declined_response()?).await?;
+                    return Ok(());
+                }
                 let mut probe = [0u8; 1];
                 let outcome = tokio::select! {
                     biased;
@@ -686,6 +700,11 @@ mod tests {
         async fn cancel_question(&self, _parent_connection_id: &str, question_id: &str) {
             self.pending.lock().await.remove(question_id);
             self.canceled.lock().await.push(question_id.to_string());
+        }
+        async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {
+            // Not exercised by the listener unit tests (the teardown sweep lives
+            // in connection.rs); drop all parked senders to satisfy the trait.
+            self.pending.lock().await.clear();
         }
     }
     impl StubQuestion {

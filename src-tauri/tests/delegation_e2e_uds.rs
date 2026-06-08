@@ -8,7 +8,9 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +23,17 @@ use codeg_lib::acp::delegation::listener::{
 };
 use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
 use codeg_lib::acp::delegation::transport::{
-    client_round_trip, client_status_round_trip, BrokerRequest, BrokerStatusRequest,
+    client_ask_round_trip, client_round_trip, client_status_round_trip, BrokerAskRequest,
+    BrokerRequest, BrokerStatusRequest,
 };
 use codeg_lib::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+use codeg_lib::acp::question::{
+    QuestionAnsweredItem, QuestionOption, QuestionOutcome, QuestionSpec, RegisteredQuestion,
+    SessionQuestionAccess,
+};
 use codeg_lib::models::AgentType;
 use serde_json::json;
+use tokio::sync::oneshot;
 
 struct AlwaysRoot;
 #[async_trait]
@@ -54,6 +62,57 @@ impl codeg_lib::acp::feedback::SessionFeedbackAccess for NoFeedback {
         Vec::new()
     }
     async fn commit_feedback_delivered(&self, _parent_connection_id: &str, _ids: Vec<String>) {}
+}
+
+/// Controllable question access for the ask round-trip test: `register_question`
+/// parks a sender keyed by a freshly-minted id; the test pops it via
+/// `take_pending` and resolves it, exactly as a user answering the card would.
+/// The delegation tests pass it as the 5th `DelegationListener::new` arg but
+/// never trigger the ask path.
+#[derive(Default)]
+struct StubQuestions {
+    pending: tokio::sync::Mutex<HashMap<String, (String, oneshot::Sender<QuestionOutcome>)>>,
+    counter: AtomicUsize,
+}
+
+impl StubQuestions {
+    /// Pop one registered-but-unanswered question's answer sender. `None` until
+    /// the listener has registered the ask.
+    async fn take_pending(&self) -> Option<oneshot::Sender<QuestionOutcome>> {
+        let mut pending = self.pending.lock().await;
+        let key = pending.keys().next().cloned()?;
+        let (_id, (_parent, tx)) = pending.remove_entry(&key).unwrap();
+        Some(tx)
+    }
+}
+
+#[async_trait]
+impl SessionQuestionAccess for StubQuestions {
+    async fn register_question(
+        &self,
+        parent_connection_id: &str,
+        _questions: Vec<QuestionSpec>,
+    ) -> Option<RegisteredQuestion> {
+        let question_id = format!("q{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .await
+            .insert(question_id.clone(), (parent_connection_id.to_string(), tx));
+        Some(RegisteredQuestion {
+            question_id,
+            answer_rx: rx,
+        })
+    }
+    async fn cancel_question(&self, _parent_connection_id: &str, question_id: &str) {
+        self.pending.lock().await.remove(question_id);
+    }
+    async fn cancel_questions_by_parent(&self, parent_connection_id: &str) {
+        self.pending
+            .lock()
+            .await
+            .retain(|_, (parent, _)| parent != parent_connection_id);
+    }
 }
 
 #[tokio::test]
@@ -90,6 +149,7 @@ async fn end_to_end_uds_happy_path() {
         tokens,
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
     );
 
     // PID-scoped socket inside the OS temp dir — no clashes across test bins.
@@ -203,6 +263,7 @@ async fn end_to_end_uds_batch_status() {
         tokens,
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -287,6 +348,7 @@ async fn end_to_end_uds_invalid_token_rejected() {
         tokens,
         Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -317,4 +379,217 @@ async fn end_to_end_uds_invalid_token_rejected() {
 
     assert_eq!(resp.outcome["status"], "canceled");
     assert_eq!(resp.outcome["error_code"], "canceled");
+}
+
+/// End-to-end ask: a companion-style client sends an `ask_user_question` frame
+/// over the real UDS socket; the listener resolves the token to its parent,
+/// registers the question through `SessionQuestionAccess`, and parks. The test
+/// answers via the parked sender (as a user submitting the card would), and the
+/// blocked client round-trip returns the self-describing outcome over the wire.
+#[tokio::test]
+async fn end_to_end_uds_ask_question_round_trip() {
+    let mock = Arc::new(MockSpawner::new());
+    let broker = Arc::new(DelegationBroker::new(
+        mock as Arc<dyn ConnectionSpawner>,
+        Arc::new(AlwaysRoot) as Arc<dyn ConversationDepthLookup>,
+    ));
+    // The Ask arm doesn't gate on delegation config, so no set_config is needed.
+
+    let tokens = Arc::new(TokenRegistry::default());
+    tokens
+        .register(
+            "tok".into(),
+            TokenEntry {
+                parent_connection_id: "p1".into(),
+                working_dir: PathBuf::from("/tmp"),
+            },
+        )
+        .await;
+
+    let questions = Arc::new(StubQuestions::default());
+    let listener = DelegationListener::new(
+        broker.clone(),
+        tokens,
+        Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
+        Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        questions.clone() as Arc<dyn SessionQuestionAccess>,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("codeg-e2e-ask.sock");
+    let socket_for_listener = socket.clone();
+    let listener_task = tokio::spawn(async move {
+        let _ = listener.run(socket_for_listener).await;
+    });
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists(), "listener never bound the socket");
+
+    // Companion side: blocks on the ask round-trip until the user answers.
+    let socket_str = socket.to_string_lossy().to_string();
+    let ask_task = tokio::spawn(async move {
+        let req = BrokerAskRequest {
+            token: "tok".into(),
+            questions: vec![QuestionSpec {
+                id: "qa".into(),
+                question: "Which approach?".into(),
+                header: "Approach".into(),
+                multi_select: false,
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        description: String::new(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+        };
+        client_ask_round_trip(&socket_str, &req).await
+    });
+
+    // User side: wait (bounded) for the listener to register, then answer "A".
+    let mut sender = None;
+    for _ in 0..200 {
+        if let Some(tx) = questions.take_pending().await {
+            sender = Some(tx);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let sender = sender.expect("listener registered the question");
+    sender
+        .send(QuestionOutcome {
+            answers: vec![QuestionAnsweredItem {
+                question: "Which approach?".into(),
+                header: "Approach".into(),
+                multi_select: false,
+                selected: vec!["A".into()],
+            }],
+            declined: false,
+        })
+        .expect("listener still parked on the answer");
+
+    let resp = ask_task
+        .await
+        .expect("ask task joined")
+        .expect("ask round-trip");
+    listener_task.abort();
+
+    assert_eq!(resp.outcome["declined"], false);
+    assert_eq!(resp.outcome["answers"][0]["question"], "Which approach?");
+    assert_eq!(resp.outcome["answers"][0]["selected"][0], "A");
+}
+
+/// Teardown race: an Ask passes token lookup, then the parent is revoked + swept
+/// before the question parks. The listener's post-register token re-check must
+/// catch the now-revoked token and decline rather than leave the ask lingering.
+/// The stub revokes the token AT register time, forcing the race deterministically
+/// (no sleeps): `ask_target` sees a valid token, `register_question` revokes it,
+/// the re-check finds it gone → declined.
+#[tokio::test]
+async fn end_to_end_uds_ask_revoked_after_register_declines() {
+    struct RevokingQuestions {
+        inner: StubQuestions,
+        tokens: Arc<TokenRegistry>,
+        token: String,
+    }
+    #[async_trait]
+    impl SessionQuestionAccess for RevokingQuestions {
+        async fn register_question(
+            &self,
+            parent_connection_id: &str,
+            questions: Vec<QuestionSpec>,
+        ) -> Option<RegisteredQuestion> {
+            // Simulate the teardown sweep racing in between ask_target and parking.
+            self.tokens.revoke(&self.token).await;
+            self.inner
+                .register_question(parent_connection_id, questions)
+                .await
+        }
+        async fn cancel_question(&self, parent_connection_id: &str, question_id: &str) {
+            self.inner
+                .cancel_question(parent_connection_id, question_id)
+                .await
+        }
+        async fn cancel_questions_by_parent(&self, parent_connection_id: &str) {
+            self.inner.cancel_questions_by_parent(parent_connection_id).await
+        }
+    }
+
+    let mock = Arc::new(MockSpawner::new());
+    let broker = Arc::new(DelegationBroker::new(
+        mock as Arc<dyn ConnectionSpawner>,
+        Arc::new(AlwaysRoot) as Arc<dyn ConversationDepthLookup>,
+    ));
+    let tokens = Arc::new(TokenRegistry::default());
+    tokens
+        .register(
+            "tok".into(),
+            TokenEntry {
+                parent_connection_id: "p1".into(),
+                working_dir: PathBuf::from("/tmp"),
+            },
+        )
+        .await;
+
+    let questions = Arc::new(RevokingQuestions {
+        inner: StubQuestions::default(),
+        tokens: tokens.clone(),
+        token: "tok".into(),
+    });
+    let listener = DelegationListener::new(
+        broker.clone(),
+        tokens.clone(),
+        Arc::new(FixedParent(1)) as Arc<dyn ParentSessionLookup>,
+        Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        questions as Arc<dyn SessionQuestionAccess>,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("codeg-e2e-ask-revoked.sock");
+    let socket_for_listener = socket.clone();
+    let listener_task = tokio::spawn(async move {
+        let _ = listener.run(socket_for_listener).await;
+    });
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists(), "listener never bound the socket");
+
+    let req = BrokerAskRequest {
+        token: "tok".into(),
+        questions: vec![QuestionSpec {
+            id: "qa".into(),
+            question: "Which approach?".into(),
+            header: "Approach".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: String::new(),
+                },
+            ],
+        }],
+    };
+    let resp = client_ask_round_trip(&socket.to_string_lossy(), &req)
+        .await
+        .expect("ask round-trip");
+    listener_task.abort();
+
+    // The re-check found the revoked token → declined, not a parked/hung ask.
+    assert_eq!(resp.outcome["declined"], true);
 }

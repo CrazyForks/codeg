@@ -1875,6 +1875,12 @@ impl ConnectionManager {
         conn_id: &str,
         questions: Vec<QuestionSpec>,
     ) -> Option<RegisteredQuestion> {
+        // Defense-in-depth: the companion validates, but the broker socket is
+        // only token-gated, so refuse to broadcast malformed/oversized specs
+        // (None → the listener declines the ask, as for any other None path).
+        if crate::acp::question::validate_specs(&questions).is_err() {
+            return None;
+        }
         let (state, emitter) = self.get_state_and_emitter(conn_id).await?;
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1903,10 +1909,49 @@ impl ConnectionManager {
             },
         )
         .await;
+        // Teardown event-ordering race: `cancel_questions_by_parent` may have
+        // drained this entry between the insert above and the emit just now. The
+        // QuestionRequest we broadcast would then have no waiter, and the sweep's
+        // QuestionResolved may have raced ahead of it — leaving a card up with no
+        // live backend waiter. Emit a compensating QuestionResolved (ordered after
+        // our QuestionRequest) and decline. (The listener's post-register token
+        // re-check covers the complementary case: a register that lands entirely
+        // after the sweep, which this presence check would not catch.)
+        if self
+            .compensate_if_question_drained(&question_id, &state, &emitter)
+            .await
+        {
+            return None;
+        }
         Some(RegisteredQuestion {
             question_id,
             answer_rx: rx,
         })
+    }
+
+    /// Returns `true` — after emitting a clearing `QuestionResolved` — when
+    /// `question_id` is no longer pending, i.e. a teardown sweep drained it in the
+    /// window after its `QuestionRequest` was broadcast. The compensating event is
+    /// ordered after the request so no client keeps a card with no live backend
+    /// waiter. Returns `false` (no emit) while the entry is still parked.
+    async fn compensate_if_question_drained(
+        &self,
+        question_id: &str,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
+        emitter: &EventEmitter,
+    ) -> bool {
+        if self.pending_questions.lock().await.contains_key(question_id) {
+            return false;
+        }
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::QuestionResolved {
+                question_id: question_id.to_string(),
+            },
+        )
+        .await;
+        true
     }
 
     /// Resolve a pending `ask_user_question` with the user's submission (from any
@@ -1968,6 +2013,44 @@ impl ConnectionManager {
                 },
             )
             .await;
+        }
+    }
+
+    /// Cancel every pending `ask_user_question` parked on a connection that is
+    /// tearing down. The `run_connection` cleanup guard calls this (alongside
+    /// the delegation `DelegationBroker::cancel_by_parent` cascade) so question
+    /// entries — and the listener tasks parked on them — are reclaimed
+    /// synchronously on disconnect, instead of lingering until the companion's
+    /// ask socket happens to close. Dropping each entry's sender unblocks its
+    /// listener with a declined outcome; the `QuestionResolved` broadcast clears
+    /// the card on every client. No-op when nothing is pending for this parent.
+    pub async fn cancel_questions_by_parent(&self, conn_id: &str) {
+        // Remove every entry for this parent under the lock (dropping their
+        // senders unblocks the parked listeners), then emit outside the lock —
+        // the registry mutex is never held across an await.
+        let drained: Vec<String> = {
+            let mut reg = self.pending_questions.lock().await;
+            let ids: Vec<String> = reg
+                .iter()
+                .filter(|(_, e)| e.parent_connection_id == conn_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                reg.remove(id);
+            }
+            ids
+        };
+        if drained.is_empty() {
+            return;
+        }
+        // Best-effort card clear: depending on the teardown path the connection
+        // may already be out of the map (`disconnect` removes it before the
+        // run_connection cleanup guard fires this sweep), so tolerate `None` — the
+        // core removal above already ran and the frontend clears on disconnect.
+        if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
+            for question_id in drained {
+                emit_with_state(&state, &emitter, AcpEvent::QuestionResolved { question_id }).await;
+            }
         }
     }
 
@@ -2279,6 +2362,12 @@ impl SessionQuestionAccess for ConnectionManagerQuestionLookup {
     async fn cancel_question(&self, parent_connection_id: &str, question_id: &str) {
         self.manager
             .cancel_question(parent_connection_id, question_id)
+            .await
+    }
+
+    async fn cancel_questions_by_parent(&self, parent_connection_id: &str) {
+        self.manager
+            .cancel_questions_by_parent(parent_connection_id)
             .await
     }
 }
@@ -4884,6 +4973,93 @@ mod tests {
             .await
             .pending_question
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_questions_by_parent_drops_only_matching_connection() {
+        // The run_connection teardown guard sweeps a tearing-down connection's
+        // parked ask without touching other connections' pending questions.
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("ca", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mgr.insert_test_connection("cb", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let reg_a = mgr.register_question("ca", q_spec()).await.unwrap();
+        let reg_b = mgr.register_question("cb", q_spec()).await.unwrap();
+
+        // Tear down only connection "ca".
+        mgr.cancel_questions_by_parent("ca").await;
+
+        // ca's parked listener is unblocked (sender dropped → recv error) and its
+        // card cleared; cb is untouched.
+        assert!(reg_a.answer_rx.await.is_err());
+        assert!(mgr
+            .get_state("ca")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_none());
+        assert!(mgr
+            .get_state("cb")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_some());
+
+        // cb still resolves normally afterwards.
+        mgr.answer_question("cb", &reg_b.question_id, Default::default())
+            .await
+            .unwrap();
+        assert!(reg_b.answer_rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn compensate_clears_card_when_entry_drained_before_request_emit() {
+        // Regression for the teardown event-ordering race: register inserts, the
+        // sweep drains the entry, THEN register's QuestionRequest emit lands. The
+        // post-emit presence check must emit a compensating QuestionResolved so no
+        // client keeps a card with no live backend waiter, and signal decline.
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cc", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let (state, emitter) = mgr.get_state_and_emitter("cc").await.unwrap();
+
+        // Simulate register's QuestionRequest emit for an entry that has already
+        // been drained (never inserted here): the card shows, nothing is parked.
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::QuestionRequest {
+                question_id: "q1".into(),
+                questions: q_spec(),
+            },
+        )
+        .await;
+        assert!(state.read().await.pending_question.is_some(), "card shown");
+
+        // Missing entry → compensate clears the card and reports decline.
+        assert!(
+            mgr.compensate_if_question_drained("q1", &state, &emitter)
+                .await,
+            "missing entry is compensated"
+        );
+        assert!(
+            state.read().await.pending_question.is_none(),
+            "compensating QuestionResolved cleared the card"
+        );
+
+        // A genuinely-parked entry is left alone (no false compensation).
+        let reg = mgr.register_question("cc", q_spec()).await.unwrap();
+        assert!(
+            !mgr.compensate_if_question_drained(&reg.question_id, &state, &emitter)
+                .await,
+            "present entry is not compensated"
+        );
+        assert!(state.read().await.pending_question.is_some());
     }
 
     #[tokio::test]
