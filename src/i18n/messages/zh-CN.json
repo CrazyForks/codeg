@@ -1004,7 +1004,8 @@
       "sectionFolders": "文件夹",
       "sectionChats": "聊天",
       "noChats": "没有聊天",
-      "newChatAction": "新建聊天"
+      "newChatAction": "新建聊天",
+      "loops": "循环工程"
     },
     "conversation": {
       "reloadFailed": "会话重新加载失败：{message}",
@@ -2895,5 +2896,115 @@
     "saved": "提问设置已保存",
     "saveFailed": "保存提问设置失败",
     "loadFailed": "加载失败：{detail}"
+  },
+  "Loops": {
+    "workbench": {
+      "title": "循环工程",
+      "subtitle": "只需创建议题，引擎自动驱动需求、设计、实现、验证与评审。",
+      "newSpace": "新建空间",
+      "empty": "还没有循环空间。绑定一个 git 仓库创建第一个空间。",
+      "spaceIssues": "{count, plural, other {# 个议题}}",
+      "spaceRunning": "{count} 个运行中",
+      "detached": "文件夹缺失",
+      "rename": "重命名",
+      "deleteSpace": "删除",
+      "confirmDeleteTitle": "删除循环空间？",
+      "confirmDeleteDescription": "删除「{name}」？其议题、工件与记忆将被永久移除，无法撤销。",
+      "loadFailed": "加载空间失败：{message}"
+    },
+    "spaceForm": {
+      "createTitle": "新建循环空间",
+      "editTitle": "重命名循环空间",
+      "nameLabel": "名称",
+      "namePlaceholder": "例如：支付重构",
+      "folderLabel": "仓库文件夹",
+      "folderHint": "必须是 git 仓库。",
+      "chooseFolder": "选择文件夹…",
+      "noFolder": "未选择文件夹",
+      "create": "创建",
+      "save": "保存",
+      "cancel": "取消"
+    },
+    "spaceDetail": {
+      "back": "全部空间",
+      "tabIssues": "议题",
+      "tabIterations": "迭代",
+      "tabArtifacts": "工件",
+      "tabInbox": "收件箱",
+      "tabMemory": "记忆",
+      "comingSoon": "即将到来。"
+    },
+    "issueList": {
+      "title": "议题",
+      "newIssue": "新建议题",
+      "empty": "还没有议题。创建后会停在「待触发」，由你点击触发。",
+      "filterStatus": "状态",
+      "filterAll": "全部",
+      "deleteIssue": "删除",
+      "confirmDeleteTitle": "删除议题？",
+      "confirmDeleteDescription": "将永久删除该议题及其工件，无法撤销。",
+      "trigger": "触发",
+      "triggerComingSoon": "引擎将在下一阶段接入。",
+      "pause": "暂停",
+      "resume": "恢复"
+    },
+    "issueForm": {
+      "createTitle": "新建议题",
+      "titleLabel": "标题",
+      "titlePlaceholder": "这个循环要达成什么？",
+      "descriptionLabel": "描述",
+      "descriptionPlaceholder": "目标、范围、约束、验收标准…",
+      "priorityLabel": "优先级",
+      "create": "创建",
+      "cancel": "取消"
+    },
+    "issueDetail": {
+      "selectPrompt": "选择一个议题查看其循环。",
+      "tokenUsage": "Token",
+      "tokenWithBudget": "{used} / {budget}",
+      "settings": "设置",
+      "subtabGraph": "图",
+      "subtabBoard": "看板",
+      "subtabIterations": "迭代",
+      "subtabArtifacts": "工件",
+      "graphPlaceholder": "触发议题后，DAG 将在此展开。",
+      "boardPlaceholder": "只读看板视图将随引擎一并提供。",
+      "rootArtifact": "议题",
+      "noIterations": "还没有迭代。",
+      "noArtifacts": "目前只有根议题工件。"
+    },
+    "status": {
+      "pending": "待触发",
+      "running": "运行中",
+      "paused": "已暂停",
+      "blocked": "受阻",
+      "done": "完成",
+      "cancelled": "已取消"
+    },
+    "priority": {
+      "high": "高",
+      "medium": "中",
+      "low": "低"
+    },
+    "route": {
+      "undecided": "未定",
+      "full": "完整",
+      "skip_design": "跳过设计",
+      "direct": "直接实现"
+    },
+    "toasts": {
+      "spaceCreated": "已创建空间 {name}",
+      "spaceCreateFailed": "创建空间失败：{message}",
+      "spaceUpdateFailed": "重命名空间失败：{message}",
+      "spaceDeleteFailed": "删除空间失败：{message}",
+      "notGitRepo": "该文件夹不是 git 仓库。请选择 git 仓库，或先执行 git init。",
+      "issueCreated": "已创建议题 {title}",
+      "issueCreateFailed": "创建议题失败：{message}",
+      "issueDeleteFailed": "删除议题失败：{message}"
+    },
+    "common": {
+      "cancel": "取消",
+      "delete": "删除"
+    }
   }
 }

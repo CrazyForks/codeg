@@ -1004,7 +1004,8 @@
       "sectionFolders": "資料夾",
       "sectionChats": "聊天",
       "noChats": "沒有聊天",
-      "newChatAction": "新增聊天"
+      "newChatAction": "新增聊天",
+      "loops": "循環工程"
     },
     "conversation": {
       "reloadFailed": "會話重新載入失敗：{message}",
@@ -2895,5 +2896,115 @@
     "saved": "提問設定已儲存",
     "saveFailed": "儲存提問設定失敗",
     "loadFailed": "載入失敗：{detail}"
+  },
+  "Loops": {
+    "workbench": {
+      "title": "循環工程",
+      "subtitle": "只需建立議題，引擎自動驅動需求、設計、實作、驗證與評審。",
+      "newSpace": "新增空間",
+      "empty": "還沒有循環空間。綁定一個 git 儲存庫建立第一個空間。",
+      "spaceIssues": "{count, plural, other {# 個議題}}",
+      "spaceRunning": "{count} 個執行中",
+      "detached": "資料夾遺失",
+      "rename": "重新命名",
+      "deleteSpace": "刪除",
+      "confirmDeleteTitle": "刪除循環空間？",
+      "confirmDeleteDescription": "刪除「{name}」？其議題、工件與記憶將被永久移除，無法復原。",
+      "loadFailed": "載入空間失敗：{message}"
+    },
+    "spaceForm": {
+      "createTitle": "新增循環空間",
+      "editTitle": "重新命名循環空間",
+      "nameLabel": "名稱",
+      "namePlaceholder": "例如：付款重構",
+      "folderLabel": "儲存庫資料夾",
+      "folderHint": "必須是 git 儲存庫。",
+      "chooseFolder": "選擇資料夾…",
+      "noFolder": "未選擇資料夾",
+      "create": "建立",
+      "save": "儲存",
+      "cancel": "取消"
+    },
+    "spaceDetail": {
+      "back": "全部空間",
+      "tabIssues": "議題",
+      "tabIterations": "迭代",
+      "tabArtifacts": "工件",
+      "tabInbox": "收件匣",
+      "tabMemory": "記憶",
+      "comingSoon": "即將推出。"
+    },
+    "issueList": {
+      "title": "議題",
+      "newIssue": "新增議題",
+      "empty": "還沒有議題。建立後會停在「待觸發」，由你點擊觸發。",
+      "filterStatus": "狀態",
+      "filterAll": "全部",
+      "deleteIssue": "刪除",
+      "confirmDeleteTitle": "刪除議題？",
+      "confirmDeleteDescription": "將永久刪除該議題及其工件，無法復原。",
+      "trigger": "觸發",
+      "triggerComingSoon": "引擎將在下一階段接入。",
+      "pause": "暫停",
+      "resume": "恢復"
+    },
+    "issueForm": {
+      "createTitle": "新增議題",
+      "titleLabel": "標題",
+      "titlePlaceholder": "這個循環要達成什麼？",
+      "descriptionLabel": "描述",
+      "descriptionPlaceholder": "目標、範圍、限制、驗收標準…",
+      "priorityLabel": "優先順序",
+      "create": "建立",
+      "cancel": "取消"
+    },
+    "issueDetail": {
+      "selectPrompt": "選擇一個議題查看其循環。",
+      "tokenUsage": "Token",
+      "tokenWithBudget": "{used} / {budget}",
+      "settings": "設定",
+      "subtabGraph": "圖",
+      "subtabBoard": "看板",
+      "subtabIterations": "迭代",
+      "subtabArtifacts": "工件",
+      "graphPlaceholder": "觸發議題後，DAG 將在此展開。",
+      "boardPlaceholder": "唯讀看板檢視將隨引擎一併提供。",
+      "rootArtifact": "議題",
+      "noIterations": "還沒有迭代。",
+      "noArtifacts": "目前只有根議題工件。"
+    },
+    "status": {
+      "pending": "待觸發",
+      "running": "執行中",
+      "paused": "已暫停",
+      "blocked": "受阻",
+      "done": "完成",
+      "cancelled": "已取消"
+    },
+    "priority": {
+      "high": "高",
+      "medium": "中",
+      "low": "低"
+    },
+    "route": {
+      "undecided": "未定",
+      "full": "完整",
+      "skip_design": "跳過設計",
+      "direct": "直接實作"
+    },
+    "toasts": {
+      "spaceCreated": "已建立空間 {name}",
+      "spaceCreateFailed": "建立空間失敗：{message}",
+      "spaceUpdateFailed": "重新命名空間失敗：{message}",
+      "spaceDeleteFailed": "刪除空間失敗：{message}",
+      "notGitRepo": "該資料夾不是 git 儲存庫。請選擇 git 儲存庫，或先執行 git init。",
+      "issueCreated": "已建立議題 {title}",
+      "issueCreateFailed": "建立議題失敗：{message}",
+      "issueDeleteFailed": "刪除議題失敗：{message}"
+    },
+    "common": {
+      "cancel": "取消",
+      "delete": "刪除"
+    }
   }
 }

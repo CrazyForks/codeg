@@ -1004,7 +1004,8 @@
       "sectionFolders": "フォルダ",
       "sectionChats": "チャット",
       "noChats": "チャットがありません",
-      "newChatAction": "新しいチャット"
+      "newChatAction": "新しいチャット",
+      "loops": "Loop Engineering"
     },
     "conversation": {
       "reloadFailed": "会話の再読み込みに失敗しました: {message}",
@@ -2895,5 +2896,115 @@
     "saved": "質問設定を保存しました",
     "saveFailed": "質問設定の保存に失敗しました",
     "loadFailed": "読み込みに失敗しました：{detail}"
+  },
+  "Loops": {
+    "workbench": {
+      "title": "Loop Engineering",
+      "subtitle": "Create issues — the engine drives requirements, design, implementation, validation and review automatically.",
+      "newSpace": "New space",
+      "empty": "No loop spaces yet. Create one bound to a git repository to get started.",
+      "spaceIssues": "{count, plural, one {# issue} other {# issues}}",
+      "spaceRunning": "{count} running",
+      "detached": "Folder missing",
+      "rename": "Rename",
+      "deleteSpace": "Delete",
+      "confirmDeleteTitle": "Delete loop space?",
+      "confirmDeleteDescription": "Delete “{name}”? Its issues, artifacts and memory are permanently removed. This cannot be undone.",
+      "loadFailed": "Failed to load spaces: {message}"
+    },
+    "spaceForm": {
+      "createTitle": "New loop space",
+      "editTitle": "Rename loop space",
+      "nameLabel": "Name",
+      "namePlaceholder": "e.g. Payments revamp",
+      "folderLabel": "Repository folder",
+      "folderHint": "Must be a git repository.",
+      "chooseFolder": "Choose folder…",
+      "noFolder": "No folder selected",
+      "create": "Create",
+      "save": "Save",
+      "cancel": "Cancel"
+    },
+    "spaceDetail": {
+      "back": "All spaces",
+      "tabIssues": "Issues",
+      "tabIterations": "Iterations",
+      "tabArtifacts": "Artifacts",
+      "tabInbox": "Inbox",
+      "tabMemory": "Memory",
+      "comingSoon": "Coming soon."
+    },
+    "issueList": {
+      "title": "Issues",
+      "newIssue": "New issue",
+      "empty": "No issues. Create one — it stays Pending until you trigger it.",
+      "filterStatus": "Status",
+      "filterAll": "All",
+      "deleteIssue": "Delete",
+      "confirmDeleteTitle": "Delete issue?",
+      "confirmDeleteDescription": "This permanently deletes the issue and its artifacts. This cannot be undone.",
+      "trigger": "Trigger",
+      "triggerComingSoon": "The engine connects in the next phase.",
+      "pause": "Pause",
+      "resume": "Resume"
+    },
+    "issueForm": {
+      "createTitle": "New issue",
+      "titleLabel": "Title",
+      "titlePlaceholder": "What should the loop accomplish?",
+      "descriptionLabel": "Description",
+      "descriptionPlaceholder": "Goal, scope, constraints, acceptance criteria…",
+      "priorityLabel": "Priority",
+      "create": "Create",
+      "cancel": "Cancel"
+    },
+    "issueDetail": {
+      "selectPrompt": "Select an issue to see its loop.",
+      "tokenUsage": "Tokens",
+      "tokenWithBudget": "{used} / {budget}",
+      "settings": "Settings",
+      "subtabGraph": "Graph",
+      "subtabBoard": "Board",
+      "subtabIterations": "Iterations",
+      "subtabArtifacts": "Artifacts",
+      "graphPlaceholder": "The DAG expands here once the issue is triggered.",
+      "boardPlaceholder": "A read-only board view arrives with the engine.",
+      "rootArtifact": "Issue",
+      "noIterations": "No iterations yet.",
+      "noArtifacts": "Only the root issue artifact so far."
+    },
+    "status": {
+      "pending": "Pending",
+      "running": "Running",
+      "paused": "Paused",
+      "blocked": "Blocked",
+      "done": "Done",
+      "cancelled": "Cancelled"
+    },
+    "priority": {
+      "high": "High",
+      "medium": "Medium",
+      "low": "Low"
+    },
+    "route": {
+      "undecided": "Undecided",
+      "full": "Full",
+      "skip_design": "Skip design",
+      "direct": "Direct"
+    },
+    "toasts": {
+      "spaceCreated": "Created space {name}",
+      "spaceCreateFailed": "Failed to create space: {message}",
+      "spaceUpdateFailed": "Failed to rename space: {message}",
+      "spaceDeleteFailed": "Failed to delete space: {message}",
+      "notGitRepo": "That folder is not a git repository. Choose a git repo or run git init first.",
+      "issueCreated": "Created issue {title}",
+      "issueCreateFailed": "Failed to create issue: {message}",
+      "issueDeleteFailed": "Failed to delete issue: {message}"
+    },
+    "common": {
+      "cancel": "Cancel",
+      "delete": "Delete"
+    }
   }
 }
