@@ -6,6 +6,7 @@ pub mod conversation_service;
 pub mod folder_command_service;
 pub mod folder_service;
 pub mod import_service;
+pub mod loop_service;
 pub mod model_provider_service;
 pub mod quick_message_service;
 pub mod remote_workspace_connection_service;
