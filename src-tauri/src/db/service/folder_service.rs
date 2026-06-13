@@ -190,6 +190,67 @@ pub async fn add_chat_folder(
     Ok(to_detail(model))
 }
 
+/// Register (or re-attach) the hidden folder backing an issue's git worktree.
+///
+/// `kind = loop_worktree` keeps it out of every user-facing folder list while
+/// still resolvable by id for cwd. `parent_id` is the space's repo-root folder,
+/// written authoritatively on both insert and reopen so crash recovery can
+/// re-attach the same path without leaving a stale relationship or kind.
+pub async fn add_loop_worktree_folder(
+    conn: &DatabaseConnection,
+    path: &str,
+    parent_id: i32,
+) -> Result<FolderHistoryEntry, DbError> {
+    let now = Utc::now();
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    let existing = folder::Entity::find()
+        .filter(folder::Column::Path.eq(path))
+        .one(conn)
+        .await?;
+
+    let model = if let Some(row) = existing {
+        let mut active = row.into_active_model();
+        active.name = Set(name);
+        active.last_opened_at = Set(now);
+        active.updated_at = Set(now);
+        active.deleted_at = Set(None);
+        active.is_open = Set(true);
+        active.parent_id = Set(Some(parent_id));
+        active.kind = Set(FolderKind::LoopWorktree);
+        active.update(conn).await?
+    } else {
+        let max_order = folder::Entity::find()
+            .order_by_desc(folder::Column::SortOrder)
+            .one(conn)
+            .await?
+            .map(|m| m.sort_order)
+            .unwrap_or(0);
+        let active = folder::ActiveModel {
+            id: NotSet,
+            name: Set(name),
+            path: Set(path.to_string()),
+            git_branch: Set(None),
+            default_agent_type: Set(None),
+            last_opened_at: Set(now),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            is_open: Set(true),
+            sort_order: Set(max_order + 1),
+            color: Set(DEFAULT_FOLDER_COLOR.to_string()),
+            parent_id: Set(Some(parent_id)),
+            kind: Set(FolderKind::LoopWorktree),
+        };
+        active.insert(conn).await?
+    };
+
+    Ok(to_entry(model))
+}
+
 pub async fn update_folder_color(
     conn: &DatabaseConnection,
     folder_id: i32,

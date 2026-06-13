@@ -23,6 +23,7 @@ use crate::web::event_bridge::EventEmitter;
 
 pub mod error;
 pub mod transitions;
+pub mod worktree;
 
 pub use error::LoopError;
 

@@ -18,12 +18,22 @@ pub enum LoopError {
     NotGitRepo,
     #[error("merge conflict")]
     MergeConflict,
+    #[error("git command failed: {0}")]
+    Git(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("acp error: {0}")]
     Acp(String),
     #[error(transparent)]
-    Db(#[from] sea_orm::DbErr),
+    Db(#[from] crate::db::error::DbError),
+}
+
+// The state machine (transitions.rs) runs raw sea_orm queries, while the
+// service layer returns the wrapper `DbError`. Support `?` on both.
+impl From<sea_orm::DbErr> for LoopError {
+    fn from(e: sea_orm::DbErr) -> Self {
+        LoopError::Db(crate::db::error::DbError::from(e))
+    }
 }
 
 impl From<LoopError> for AppCommandError {
@@ -51,6 +61,10 @@ impl From<LoopError> for AppCommandError {
                 AppErrorCode::ExternalCommandFailed,
                 "Merge conflict while integrating the issue branch",
             ),
+            LoopError::Git(m) => {
+                AppCommandError::new(AppErrorCode::ExternalCommandFailed, "Git command failed")
+                    .with_detail(m)
+            }
             LoopError::InvalidInput(m) => AppCommandError::invalid_input(m),
             LoopError::Acp(m) => AppCommandError::task_execution_failed(m),
             LoopError::Db(err) => {
