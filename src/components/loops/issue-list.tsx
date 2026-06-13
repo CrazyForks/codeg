@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Loader2, MoreVertical, Plus, Trash2 } from "lucide-react"
+import { Loader2, MoreVertical, Play, Plus, Trash2 } from "lucide-react"
 
 import {
   createLoopIssue,
   deleteLoopIssue,
   listLoopIssues,
+  triggerLoopIssue,
 } from "@/lib/loops-api"
 import type {
   LoopIssuePriority,
@@ -120,6 +121,15 @@ export function IssueList({
     })
   }
 
+  const handleTrigger = async (issue: LoopIssueRow) => {
+    try {
+      await triggerLoopIssue(issue.id)
+      toast.success(tToasts("issueTriggered", { title: issue.title }))
+    } catch (err) {
+      toast.error(tToasts("actionFailed", { message: toErrorMessage(err) }))
+    }
+  }
+
   const handleDelete = async () => {
     if (!deleting) return
     setDeleteBusy(true)
@@ -221,6 +231,14 @@ export function IssueList({
                         align="end"
                         onClick={(e) => e.stopPropagation()}
                       >
+                        {issue.status === "pending" && (
+                          <DropdownMenuItem
+                            onSelect={() => void handleTrigger(issue)}
+                          >
+                            <Play className="h-3.5 w-3.5" />
+                            {t("trigger")}
+                          </DropdownMenuItem>
+                        )}
                         <DropdownMenuItem
                           onSelect={() => setDeleting(issue)}
                           className="text-destructive focus:text-destructive"

@@ -2946,7 +2946,11 @@
       "trigger": "Trigger",
       "triggerComingSoon": "The engine connects in the next phase.",
       "pause": "Pause",
-      "resume": "Resume"
+      "resume": "Resume",
+      "cancel": "Cancel",
+      "cancelConfirmTitle": "Cancel issue?",
+      "cancelConfirmDescription": "This stops the engine and removes the issue's worktree. Artifacts and history are kept; the issue can't be resumed.",
+      "cancelConfirmAction": "Cancel issue"
     },
     "issueForm": {
       "createTitle": "New issue",
@@ -3000,7 +3004,9 @@
       "notGitRepo": "That folder is not a git repository. Choose a git repo or run git init first.",
       "issueCreated": "Created issue {title}",
       "issueCreateFailed": "Failed to create issue: {message}",
-      "issueDeleteFailed": "Failed to delete issue: {message}"
+      "issueDeleteFailed": "Failed to delete issue: {message}",
+      "issueTriggered": "Triggered {title}",
+      "actionFailed": "Action failed: {message}"
     },
     "common": {
       "cancel": "Cancel",

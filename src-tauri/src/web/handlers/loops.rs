@@ -158,6 +158,40 @@ pub async fn update_loop_issue_config(
     Ok(Json(()))
 }
 
+// ─── Engine actions (trigger / pause / resume / cancel) ─────────────────────
+
+pub async fn trigger_loop_issue(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::trigger_loop_issue_core(&state.db.conn, &state.emitter, &state.loop_engine, p.id).await?;
+    Ok(Json(()))
+}
+
+pub async fn pause_loop_issue(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::pause_loop_issue_core(&state.db.conn, &state.emitter, &state.loop_engine, p.id).await?;
+    Ok(Json(()))
+}
+
+pub async fn resume_loop_issue(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::resume_loop_issue_core(&state.db.conn, &state.emitter, &state.loop_engine, p.id).await?;
+    Ok(Json(()))
+}
+
+pub async fn cancel_loop_issue(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::cancel_loop_issue_core(&state.db.conn, &state.emitter, &state.loop_engine, p.id).await?;
+    Ok(Json(()))
+}
+
 // ─── Artifacts / DAG ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

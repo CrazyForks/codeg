@@ -2,18 +2,32 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
-import { Loader2, Play, Settings2 } from "lucide-react"
+import { Ban, Loader2, Pause, Play, Settings2 } from "lucide-react"
+import { toast } from "sonner"
 
-import { getLoopDag, getLoopIssue } from "@/lib/loops-api"
+import {
+  cancelLoopIssue,
+  getLoopDag,
+  getLoopIssue,
+  pauseLoopIssue,
+  resumeLoopIssue,
+  triggerLoopIssue,
+} from "@/lib/loops-api"
 import type { LoopArtifactRow, LoopIssueDetail } from "@/lib/types"
+import { toErrorMessage } from "@/lib/app-error"
 import { useLoopChanged } from "@/hooks/use-loop-changed"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import {
   IssuePriorityBadge,
   IssueRouteBadge,
@@ -23,10 +37,14 @@ import {
 export function IssueDetail({ issueId }: { issueId: number | null }) {
   const t = useTranslations("Loops.issueDetail")
   const tList = useTranslations("Loops.issueList")
+  const tCommon = useTranslations("Loops.common")
+  const tToasts = useTranslations("Loops.toasts")
 
   const [issue, setIssue] = useState<LoopIssueDetail | null>(null)
   const [artifacts, setArtifacts] = useState<LoopArtifactRow[]>([])
   const [loading, setLoading] = useState(false)
+  const [actionBusy, setActionBusy] = useState(false)
+  const [cancelOpen, setCancelOpen] = useState(false)
 
   const refresh = useCallback(async () => {
     if (issueId == null) {
@@ -54,6 +72,23 @@ export function IssueDetail({ issueId }: { issueId: number | null }) {
   useLoopChanged(() => {
     void refresh()
   }, issue?.space_id)
+
+  // Run an engine action; the resulting `loop://changed` event refreshes the
+  // view. `onOk` carries any success-only side effect (e.g. a toast).
+  const runAction = useCallback(
+    async (action: () => Promise<void>, onOk?: () => void) => {
+      setActionBusy(true)
+      try {
+        await action()
+        onOk?.()
+      } catch (err) {
+        toast.error(tToasts("actionFailed", { message: toErrorMessage(err) }))
+      } finally {
+        setActionBusy(false)
+      }
+    },
+    [tToasts]
+  )
 
   if (issueId == null) {
     return (
@@ -104,18 +139,66 @@ export function IssueDetail({ issueId }: { issueId: number | null }) {
             <div>{t("tokenUsage")}</div>
             <div className="font-mono text-sm text-foreground">{tokenText}</div>
           </div>
-          {/* Engine actions arrive in the next phase; shown disabled for shape. */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span tabIndex={0}>
-                <Button size="sm" className="h-8" disabled>
-                  <Play className="mr-1 h-3.5 w-3.5" />
-                  {tList("trigger")}
-                </Button>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>{tList("triggerComingSoon")}</TooltipContent>
-          </Tooltip>
+          {issue.status === "pending" && (
+            <Button
+              size="sm"
+              className="h-8"
+              disabled={actionBusy}
+              onClick={() =>
+                runAction(
+                  () => triggerLoopIssue(issue.id),
+                  () =>
+                    toast.success(
+                      tToasts("issueTriggered", { title: issue.title })
+                    )
+                )
+              }
+            >
+              {actionBusy ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="mr-1 h-3.5 w-3.5" />
+              )}
+              {tList("trigger")}
+            </Button>
+          )}
+          {issue.status === "running" && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              disabled={actionBusy}
+              onClick={() => runAction(() => pauseLoopIssue(issue.id))}
+            >
+              <Pause className="mr-1 h-3.5 w-3.5" />
+              {tList("pause")}
+            </Button>
+          )}
+          {issue.status === "paused" && (
+            <Button
+              size="sm"
+              className="h-8"
+              disabled={actionBusy}
+              onClick={() => runAction(() => resumeLoopIssue(issue.id))}
+            >
+              <Play className="mr-1 h-3.5 w-3.5" />
+              {tList("resume")}
+            </Button>
+          )}
+          {(issue.status === "running" ||
+            issue.status === "paused" ||
+            issue.status === "blocked") && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 text-destructive hover:text-destructive"
+              disabled={actionBusy}
+              onClick={() => setCancelOpen(true)}
+            >
+              <Ban className="mr-1 h-3.5 w-3.5" />
+              {tList("cancel")}
+            </Button>
+          )}
           <Button size="icon" variant="ghost" className="h-8 w-8" disabled>
             <Settings2 className="h-4 w-4" />
             <span className="sr-only">{t("settings")}</span>
@@ -193,6 +276,39 @@ export function IssueDetail({ issueId }: { issueId: number | null }) {
           </TabsContent>
         </Tabs>
       </div>
+
+      <AlertDialog
+        open={cancelOpen}
+        onOpenChange={(o) => !o && setCancelOpen(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{tList("cancelConfirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {tList("cancelConfirmDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={actionBusy}>
+              {tCommon("cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault()
+                void runAction(
+                  () => cancelLoopIssue(issue.id),
+                  () => setCancelOpen(false)
+                )
+              }}
+              disabled={actionBusy}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {actionBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {tList("cancelConfirmAction")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

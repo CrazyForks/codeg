@@ -2946,7 +2946,11 @@
       "trigger": "触发",
       "triggerComingSoon": "引擎将在下一阶段接入。",
       "pause": "暂停",
-      "resume": "恢复"
+      "resume": "恢复",
+      "cancel": "取消",
+      "cancelConfirmTitle": "取消议题？",
+      "cancelConfirmDescription": "这会停止引擎并移除该议题的工作树。工件与历史会保留；议题无法再恢复。",
+      "cancelConfirmAction": "取消议题"
     },
     "issueForm": {
       "createTitle": "新建议题",
@@ -3000,7 +3004,9 @@
       "notGitRepo": "该文件夹不是 git 仓库。请选择 git 仓库，或先执行 git init。",
       "issueCreated": "已创建议题 {title}",
       "issueCreateFailed": "创建议题失败：{message}",
-      "issueDeleteFailed": "删除议题失败：{message}"
+      "issueDeleteFailed": "删除议题失败：{message}",
+      "issueTriggered": "已触发 {title}",
+      "actionFailed": "操作失败：{message}"
     },
     "common": {
       "cancel": "取消",

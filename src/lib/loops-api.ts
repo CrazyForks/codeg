@@ -31,7 +31,10 @@ export function createLoopSpace(name: string, folderId: number) {
 }
 
 export function updateLoopSpace(id: number, name: string) {
-  return getTransport().call<LoopSpaceSummary>("update_loop_space", { id, name })
+  return getTransport().call<LoopSpaceSummary>("update_loop_space", {
+    id,
+    name,
+  })
 }
 
 export function deleteLoopSpace(id: number) {
@@ -81,6 +84,24 @@ export function updateLoopIssueConfig(
     config,
     tokenBudget,
   })
+}
+
+// ─── Engine actions (trigger / pause / resume / cancel) ─────────────────────
+
+export function triggerLoopIssue(id: number) {
+  return getTransport().call<void>("trigger_loop_issue", { id })
+}
+
+export function pauseLoopIssue(id: number) {
+  return getTransport().call<void>("pause_loop_issue", { id })
+}
+
+export function resumeLoopIssue(id: number) {
+  return getTransport().call<void>("resume_loop_issue", { id })
+}
+
+export function cancelLoopIssue(id: number) {
+  return getTransport().call<void>("cancel_loop_issue", { id })
 }
 
 // ─── Artifacts / DAG ───────────────────────────────────────────────────────

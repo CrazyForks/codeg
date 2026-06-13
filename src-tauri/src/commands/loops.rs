@@ -17,7 +17,9 @@ use crate::models::loops::{
     IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopChanged, LoopDagView, LoopInboxItemRow,
     LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary,
 };
+use crate::loop_engine::LoopEngine;
 use crate::web::event_bridge::{emit_event, EventEmitter};
+use std::sync::Arc;
 
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
@@ -174,6 +176,64 @@ pub async fn update_loop_issue_config_core(
     if let Some(space_id) = space_id {
         emit_loop_changed(emitter, space_id, Some(id), "issue", id, "updated");
     }
+    Ok(())
+}
+
+// ─── Engine actions (trigger / pause / resume / cancel) ─────────────────────
+
+pub async fn trigger_loop_issue_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    let issue = issue::get_issue(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
+    engine.trigger_issue(id).await?;
+    emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "triggered");
+    Ok(())
+}
+
+pub async fn pause_loop_issue_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    let issue = issue::get_issue(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
+    engine.pause_issue(id).await?;
+    emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "paused");
+    Ok(())
+}
+
+pub async fn resume_loop_issue_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    let issue = issue::get_issue(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
+    engine.resume_issue(id).await?;
+    emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "resumed");
+    Ok(())
+}
+
+pub async fn cancel_loop_issue_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    let issue = issue::get_issue(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
+    engine.cancel_issue(id).await?;
+    emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "cancelled");
     Ok(())
 }
 
@@ -375,6 +435,50 @@ pub async fn update_loop_issue_config(
 ) -> Result<(), AppCommandError> {
     update_loop_issue_config_core(&db.conn, &EventEmitter::Tauri(app), id, config, token_budget)
         .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn trigger_loop_issue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    trigger_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn pause_loop_issue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    pause_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn resume_loop_issue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    resume_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn cancel_loop_issue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    cancel_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
 }
 
 #[cfg(feature = "tauri-runtime")]

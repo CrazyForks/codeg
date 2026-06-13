@@ -69,6 +69,10 @@ pub fn build_router(
             "/update_loop_issue_config",
             post(handlers::loops::update_loop_issue_config),
         )
+        .route("/trigger_loop_issue", post(handlers::loops::trigger_loop_issue))
+        .route("/pause_loop_issue", post(handlers::loops::pause_loop_issue))
+        .route("/resume_loop_issue", post(handlers::loops::resume_loop_issue))
+        .route("/cancel_loop_issue", post(handlers::loops::cancel_loop_issue))
         .route("/get_loop_dag", post(handlers::loops::get_loop_dag))
         .route(
             "/list_loop_artifacts",

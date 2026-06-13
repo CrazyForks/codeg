@@ -25,6 +25,7 @@ use crate::db::entities::loop_iteration::{self, IterationStatus};
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
+pub mod actions;
 pub mod briefing;
 pub mod dispatch;
 pub mod driver;
