@@ -11,6 +11,7 @@ pub mod db;
 pub mod git_credential;
 pub mod git_repo;
 pub mod keyring_store;
+pub mod loop_engine;
 pub mod models;
 mod network;
 pub mod parsers;
