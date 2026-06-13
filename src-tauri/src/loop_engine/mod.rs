@@ -30,6 +30,7 @@ pub mod dispatch;
 pub mod driver;
 pub mod error;
 pub mod ingest;
+pub mod recovery;
 pub mod transitions;
 pub mod worktree;
 
@@ -120,8 +121,20 @@ impl LoopEngine {
     }
 
     /// On boot, reconcile interrupted iterations and restart a driver for every
-    /// still-`running` issue. Idempotent. Reconciliation lands in Task 1.7.
-    pub async fn recover_on_boot(self: &Arc<Self>) {}
+    /// still-`running` issue. Idempotent — safe on every process start,
+    /// including a clean boot with nothing in flight. Reconciliation (releasing
+    /// stale leases + restoring worktrees) is pure DB+git and lives in
+    /// [`recovery`]; this wrapper only restarts the drivers it identifies.
+    pub async fn recover_on_boot(self: &Arc<Self>) {
+        match recovery::reconcile_on_boot(&self.db).await {
+            Ok(running_ids) => {
+                for issue_id in running_ids {
+                    self.start_issue(issue_id).await;
+                }
+            }
+            Err(e) => eprintln!("[loop] recover_on_boot failed: {e}"),
+        }
+    }
 
     /// Subscribe to the in-process event bus and settle + wake loop iterations
     /// as their turns complete. This is the engine's completion-awareness: a
