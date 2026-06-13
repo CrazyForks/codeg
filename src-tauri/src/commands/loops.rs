@@ -15,7 +15,7 @@ use crate::db::service::folder_service;
 use crate::db::service::loop_service::{artifact, inbox, issue, iteration, memory, space};
 use crate::models::loops::{
     IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopChanged, LoopDagView, LoopInboxItemRow,
-    LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary,
+    LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary, LOOP_CHANGED_EVENT,
 };
 use crate::loop_engine::LoopEngine;
 use crate::web::event_bridge::{emit_event, EventEmitter};
@@ -23,8 +23,6 @@ use std::sync::Arc;
 
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
-
-pub const LOOP_CHANGED_EVENT: &str = "loop://changed";
 
 fn emit_loop_changed(
     emitter: &EventEmitter,

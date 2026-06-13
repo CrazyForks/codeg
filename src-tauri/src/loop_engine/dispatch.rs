@@ -42,11 +42,31 @@ use crate::db::service::folder_service;
 use crate::db::service::loop_service::{inbox, iteration};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
-use crate::web::event_bridge::EventEmitter;
+use crate::models::loops::{LoopChanged, LOOP_CHANGED_EVENT};
+use crate::web::event_bridge::{emit_event, EventEmitter};
 
 use crate::loop_engine::briefing::{assemble_briefing, BriefingOutput};
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{cas_iteration_status, try_claim_iteration, IterationClaim};
+
+/// Emit the coarse `loop://changed` event so every client refetches the issue's
+/// DAG. The autonomous pipeline (dispatch + settle) is the engine's own write
+/// path — distinct from the command layer's CRUD emits — so without this a
+/// triggered issue would grow its DAG silently until something else refetched.
+fn emit_changed(emitter: &EventEmitter, space_id: i32, issue_id: i32, subject_id: i32, kind: &str) {
+    emit_event(
+        emitter,
+        LOOP_CHANGED_EVENT,
+        LoopChanged {
+            v: 1,
+            space_id,
+            issue_id: Some(issue_id),
+            subject_kind: "iteration".to_string(),
+            subject_id,
+            kind: kind.to_string(),
+        },
+    );
+}
 
 /// The frontier decision the driver hands to dispatch: which iteration to run
 /// for which issue / stage / target. Everything here is chosen upstream;
@@ -218,7 +238,7 @@ pub async fn dispatch_iteration(
         db,
         data_dir,
         spawner,
-        emitter,
+        emitter.clone(),
         &input,
         &issue,
         &iter,
@@ -228,7 +248,18 @@ pub async fn dispatch_iteration(
     )
     .await
     {
-        Ok(handle) => Ok(Some(handle)),
+        Ok(handle) => {
+            // A new iteration is now running — surface it live so the DAG's
+            // "executing now" highlight appears without waiting for settlement.
+            emit_changed(
+                &emitter,
+                input.space_id,
+                input.issue_id,
+                handle.iteration_id,
+                "dispatched",
+            );
+            Ok(Some(handle))
+        }
         Err(e) => {
             fail_iteration(conn, &input, &iter, &e).await;
             Err(e)
@@ -386,6 +417,7 @@ async fn fail_iteration(
 /// no-progress breaker.
 pub async fn settle_iteration(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     iteration_id: i32,
 ) -> Result<SettleOutcome, LoopError> {
     let conn = &db.conn;
@@ -458,6 +490,16 @@ pub async fn settle_iteration(
                 .await?;
         }
     }
+
+    // The iteration's outputs (new artifacts, route, token totals) have landed —
+    // tell every client to refetch so the DAG grows in real time.
+    emit_changed(
+        emitter,
+        iter.space_id,
+        iter.issue_id,
+        iteration_id,
+        "settled",
+    );
 
     Ok(SettleOutcome {
         iteration_id,
@@ -800,7 +842,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = settle_iteration(&db, iter.id).await.unwrap();
+        let outcome = settle_iteration(&db, &EventEmitter::Noop, iter.id).await.unwrap();
         assert!(outcome.made_progress);
         assert_eq!(outcome.produced_artifact_ids, vec![produced.id]);
 
@@ -852,7 +894,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = settle_iteration(&db, iter.id).await.unwrap();
+        let outcome = settle_iteration(&db, &EventEmitter::Noop, iter.id).await.unwrap();
         assert!(!outcome.made_progress);
         assert!(outcome.produced_artifact_ids.is_empty());
 

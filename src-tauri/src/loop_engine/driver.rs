@@ -449,7 +449,7 @@ mod tests {
                 }
                 other => panic!("unexpected stage dispatched in M2.1: {other:?}"),
             }
-            settle_iteration(db, it.id).await.unwrap();
+            settle_iteration(db, &EventEmitter::Noop, it.id).await.unwrap();
         }
     }
 

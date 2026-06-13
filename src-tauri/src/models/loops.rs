@@ -229,3 +229,8 @@ pub struct LoopChanged {
     pub subject_id: i32,
     pub kind: String,
 }
+
+/// Event name for [`LoopChanged`]. Lives beside the payload so both the command
+/// layer (CRUD writes) and the engine (autonomous dispatch/settle) emit the same
+/// channel without one depending on the other.
+pub const LOOP_CHANGED_EVENT: &str = "loop://changed";

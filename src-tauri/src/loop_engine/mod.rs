@@ -218,6 +218,6 @@ impl LoopEngine {
         &self,
         iteration_id: i32,
     ) -> Result<dispatch::SettleOutcome, LoopError> {
-        dispatch::settle_iteration(&self.db, iteration_id).await
+        dispatch::settle_iteration(&self.db, &self.emitter, iteration_id).await
     }
 }
