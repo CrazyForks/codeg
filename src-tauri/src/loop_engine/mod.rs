@@ -21,6 +21,7 @@ use crate::acp::manager::ConnectionManager;
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 
+pub mod briefing;
 pub mod error;
 pub mod ingest;
 pub mod transitions;
