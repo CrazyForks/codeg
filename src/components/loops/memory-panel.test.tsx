@@ -10,6 +10,14 @@ vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 vi.mock("@/hooks/use-loop-changed", () => ({ useLoopChanged: () => {} }))
 
+// MessageResponse (Streamdown) pulls in the link-safety hook + heavy markdown
+// deps; stub it to a passthrough that renders the raw content.
+vi.mock("@/components/ai-elements/message", () => ({
+  MessageResponse: ({ children }: { children: string }) => (
+    <div data-testid="markdown">{children}</div>
+  ),
+}))
+
 const listLoopMemory = vi.fn()
 const createLoopMemory = vi.fn().mockResolvedValue(undefined)
 const updateLoopMemory = vi.fn().mockResolvedValue(undefined)

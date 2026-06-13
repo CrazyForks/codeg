@@ -33,6 +33,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { MessageResponse } from "@/components/ai-elements/message"
 
 const MEMORY_KINDS: LoopMemoryKind[] = [
   "constitution",
@@ -211,9 +212,11 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
                     </Button>
                   </div>
                   {m.content.trim() && (
-                    <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">
-                      {m.content}
-                    </p>
+                    // Rendered through the shared safe Streamdown pipeline
+                    // (same as chat) — no raw HTML, no dangerouslySetInnerHTML.
+                    <div className="mt-1 break-words text-xs text-muted-foreground">
+                      <MessageResponse>{m.content}</MessageResponse>
+                    </div>
                   )}
                 </li>
               )

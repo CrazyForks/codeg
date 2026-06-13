@@ -39,6 +39,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { MessageResponse } from "@/components/ai-elements/message"
 
 type Gate = "design" | "merge"
 
@@ -198,9 +199,12 @@ export function ArtifactDrawer({
             <div className="space-y-5 pt-1">
               <Section title={t("contentHeading")}>
                 {latest && latest.content.trim().length > 0 ? (
-                  <p className="whitespace-pre-wrap break-words text-sm">
-                    {latest.content}
-                  </p>
+                  // Agent/human-authored markdown, rendered through the same
+                  // safe Streamdown pipeline as chat (no raw HTML, links routed
+                  // through link-safety) — never raw `dangerouslySetInnerHTML`.
+                  <div className="break-words text-sm">
+                    <MessageResponse>{latest.content}</MessageResponse>
+                  </div>
                 ) : (
                   <p className="text-sm text-muted-foreground">
                     {t("noContent")}

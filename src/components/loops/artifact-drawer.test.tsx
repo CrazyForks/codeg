@@ -13,6 +13,15 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }))
 
+// MessageResponse (Streamdown) pulls in the link-safety hook (workspace
+// context) and heavy markdown deps jsdom lacks; stub it to a passthrough that
+// renders the raw content so content assertions stay simple.
+vi.mock("@/components/ai-elements/message", () => ({
+  MessageResponse: ({ children }: { children: string }) => (
+    <div data-testid="markdown">{children}</div>
+  ),
+}))
+
 const getLoopArtifact = vi.fn()
 const getLoopIssue = vi.fn()
 const approveLoopDesign = vi.fn().mockResolvedValue(undefined)
