@@ -8,9 +8,16 @@ import { LOOP_CHANGED_EVENT, type LoopChanged } from "@/lib/types"
  * events for that space invoke `cb`. The callback is held in a ref so the
  * subscription is set up once and never re-attaches on every render.
  */
-export function useLoopChanged(cb: (event: LoopChanged) => void, spaceId?: number) {
+export function useLoopChanged(
+  cb: (event: LoopChanged) => void,
+  spaceId?: number
+) {
   const cbRef = useRef(cb)
-  cbRef.current = cb
+  // Keep the latest callback in a ref, updated in an effect (not during render)
+  // so the subscription below attaches once and never re-runs its setup.
+  useEffect(() => {
+    cbRef.current = cb
+  })
 
   useEffect(() => {
     let disposed = false

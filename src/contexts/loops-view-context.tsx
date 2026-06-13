@@ -24,7 +24,9 @@ const LoopsViewContext = createContext<LoopsViewContextValue | null>(null)
 function readStored(): LoopsView {
   if (typeof window === "undefined") return "chat"
   try {
-    return window.localStorage.getItem(STORAGE_KEY) === "loops" ? "loops" : "chat"
+    return window.localStorage.getItem(STORAGE_KEY) === "loops"
+      ? "loops"
+      : "chat"
   } catch {
     return "chat"
   }

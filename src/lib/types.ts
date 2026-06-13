@@ -445,8 +445,16 @@ export type LoopArtifactStatus =
   | "superseded"
   | "cancelled"
 export type LoopReviewVerdict = "pass" | "fail"
-export type LoopLinkKind = "derives_from" | "skips_to" | "reviews" | "results_from"
-export type LoopInboxKind = "approval" | "blocked" | "budget_exhausted" | "question"
+export type LoopLinkKind =
+  | "derives_from"
+  | "skips_to"
+  | "reviews"
+  | "results_from"
+export type LoopInboxKind =
+  | "approval"
+  | "blocked"
+  | "budget_exhausted"
+  | "question"
 export type LoopInboxStatus = "pending" | "handled"
 export type LoopMemoryKind =
   | "constitution"
