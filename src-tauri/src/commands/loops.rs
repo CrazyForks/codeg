@@ -8,11 +8,12 @@ use sea_orm::DatabaseConnection;
 
 use crate::app_error::AppCommandError;
 use crate::db::entities::loop_artifact_revision::ActorKind;
-use crate::db::entities::loop_inbox_item::InboxStatus;
+use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
 use crate::db::entities::loop_memory::{MemoryKind, MemoryStatus};
 use crate::db::service::folder_service;
 use crate::db::service::loop_service::{artifact, inbox, issue, iteration, memory, space};
+use crate::loop_engine::transitions::cas_issue_status;
 use crate::models::loops::{
     IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopChanged, LoopDagView, LoopInboxItemRow,
     LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary, LOOP_CHANGED_EVENT,
@@ -232,6 +233,67 @@ pub async fn cancel_loop_issue_core(
         .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
     engine.cancel_issue(id).await?;
     emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "cancelled");
+    Ok(())
+}
+
+// ─── Merge gate (approve / reject the result) ───────────────────────────────
+
+/// Approve a finalized issue's merge: the engine lands its loop branch on the
+/// base branch (under a per-repo lock, with the stale-base check) and closes the
+/// issue, or blocks it with an inbox card on any fault. The engine emits the
+/// `loop://changed` event itself, covering both this path and auto-merge.
+pub async fn approve_loop_merge_core(
+    _conn: &DatabaseConnection,
+    _emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    engine.merge_issue(id).await?;
+    Ok(())
+}
+
+/// Reject a finalized issue's merge: the work does not land. The issue is blocked
+/// for human follow-up (cancel, or adjust and retrigger) with a card carrying the
+/// reviewer's comment; any pending merge-approval card is marked handled.
+pub async fn reject_loop_merge_core(
+    conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    id: i32,
+    comment: Option<String>,
+) -> Result<(), AppCommandError> {
+    let issue = issue::get_issue(conn, id)
+        .await?
+        .ok_or_else(|| AppCommandError::not_found("Issue not found"))?;
+    // Clear a pending merge-approval card if the approval gate filed one.
+    let pending = inbox::list_inbox(conn, issue.space_id, Some(InboxStatus::Pending)).await?;
+    if let Some(card) = pending
+        .into_iter()
+        .find(|c| c.kind == InboxKind::Approval && c.subject_key == format!("merge:{id}"))
+    {
+        inbox::handle_inbox(
+            conn,
+            card.id,
+            serde_json::json!({ "action": "reject", "comment": comment }),
+        )
+        .await?;
+    }
+    if !cas_issue_status(conn, id, IssueStatus::Running, IssueStatus::Blocked).await? {
+        return Err(crate::loop_engine::LoopError::Conflict.into());
+    }
+    inbox::upsert_inbox(
+        conn,
+        issue.space_id,
+        id,
+        None,
+        InboxKind::Blocked,
+        &format!("merge_rejected:{id}"),
+        serde_json::json!({ "reason": "merge_rejected", "comment": comment }),
+    )
+    .await?;
+    // Wake the parked driver so it re-ticks, sees the non-running status, and exits.
+    engine.wake(id).await;
+    emit_loop_changed(emitter, issue.space_id, Some(id), "issue", id, "merge_rejected");
     Ok(())
 }
 
@@ -477,6 +539,29 @@ pub async fn cancel_loop_issue(
     id: i32,
 ) -> Result<(), AppCommandError> {
     cancel_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn approve_loop_merge(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+) -> Result<(), AppCommandError> {
+    approve_loop_merge_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn reject_loop_merge(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    id: i32,
+    comment: Option<String>,
+) -> Result<(), AppCommandError> {
+    reject_loop_merge_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id, comment).await
 }
 
 #[cfg(feature = "tauri-runtime")]

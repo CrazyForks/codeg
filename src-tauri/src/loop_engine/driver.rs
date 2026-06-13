@@ -44,6 +44,10 @@ pub(crate) enum TickOutcome {
     /// Nothing to dispatch right now (frontier empty / all in-flight / lease
     /// held). The driver parks until the next completion or external wake.
     Idle,
+    /// The result is produced and `auto_merge` is on — the driver should land it
+    /// via the engine merge gate (which needs `&LoopEngine`, so `tick_once` only
+    /// signals; `run_driver` performs the merge).
+    AutoMerge,
 }
 
 /// One unit of work the frontier wants dispatched.
@@ -332,11 +336,17 @@ pub(crate) async fn tick_once(
         worktree_folder_id,
     )
     .await?;
-    Ok(if finalized {
-        TickOutcome::Dispatched
-    } else {
-        TickOutcome::Idle
-    })
+    if finalized {
+        return Ok(TickOutcome::Dispatched);
+    }
+
+    // Result produced → merge gate. With `auto_merge` on, signal the driver to
+    // land it (the merge needs `&LoopEngine`). Otherwise idle: the human gate
+    // awaits an explicit approve_merge (its inbox card arrives in Task 2.7).
+    if config.auto_merge && dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result) {
+        return Ok(TickOutcome::AutoMerge);
+    }
+    Ok(TickOutcome::Idle)
 }
 
 /// The per-issue driver task body: tick, then park on the wake `Notify` until a
@@ -354,6 +364,19 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
         .await
         {
             Ok(TickOutcome::Stop) => break,
+            Ok(TickOutcome::AutoMerge) => {
+                // Land the finalized work without a human gate. `merge_issue`
+                // moves the issue to a terminal (or blocked) state, so re-tick
+                // immediately — the next tick observes the new status and stops.
+                // On error, fall through and park to avoid busy-spinning on a
+                // transient failure (a later wake retries).
+                match engine.merge_issue(issue_id).await {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        eprintln!("[loop][driver] auto-merge failed for issue {issue_id}: {e}");
+                    }
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[loop][driver] tick failed for issue {issue_id}: {e}");

@@ -1042,6 +1042,8 @@ mod tauri_app {
                 loops_commands::pause_loop_issue,
                 loops_commands::resume_loop_issue,
                 loops_commands::cancel_loop_issue,
+                loops_commands::approve_loop_merge,
+                loops_commands::reject_loop_merge,
                 loops_commands::get_loop_dag,
                 loops_commands::list_loop_artifacts,
                 loops_commands::get_loop_artifact,

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -58,6 +58,11 @@ pub struct LoopEngine {
     /// Process-internal single-instance guard: at most one driver task per
     /// issue. NOT the concurrency authority — that is the DB dispatch lease.
     drivers: Mutex<HashMap<i32, DriverHandle>>,
+    /// Per-repo merge serialization: two issues that share a base repo must not
+    /// run their `--no-ff` landings concurrently (they would race on the base
+    /// branch ref and working tree). Keyed by repo path; entries are created on
+    /// demand and never removed (bounded by the number of distinct repos).
+    merge_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl LoopEngine {
@@ -73,7 +78,19 @@ impl LoopEngine {
             data_dir,
             emitter,
             drivers: Mutex::new(HashMap::new()),
+            merge_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The merge lock for `repo_path`, created on first use. Held across an
+    /// issue's entire merge so concurrent merges into the same repo serialize.
+    pub(crate) async fn repo_merge_lock(&self, repo_path: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.merge_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(repo_path.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     /// Start the per-issue driver task (no-op if one is already registered —

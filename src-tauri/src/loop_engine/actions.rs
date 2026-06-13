@@ -7,28 +7,37 @@
 //! - **pause**: running → paused(manual); stop the driver. In-flight agents are
 //!   left alive — a pause halts *new* dispatch, it does not kill running work.
 //! - **resume**: paused → running; start a fresh driver.
-//! - **cancel**: → cancelled; stop the driver, invalidate every in-flight
-//!   iteration's capability token (so the host rejects late submissions), and
-//!   remove the worktree. (Killing the agent subprocess is M2.2; M2.1 closes the
-//!   DB state and the worktree.)
+//! - **cancel**: → cancelled; stop the driver, kill every in-flight iteration's
+//!   agent subprocess, invalidate its capability token (so the host rejects late
+//!   submissions), and remove the worktree.
+//!
+//! The **merge gate** (§4.10) also lives here: [`LoopEngine::merge_issue`] lands
+//! a finalized issue's loop branch onto its base branch under a per-repo lock,
+//! with a stale-base check; a clean landing closes the issue, any fault blocks it
+//! with an inbox card.
 //!
 //! Every transition is guarded: a miss (the issue is not in the expected source
 //! state) surfaces as [`LoopError::Conflict`], which the frontend retries.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
 
+use crate::db::entities::loop_artifact::ArtifactKind;
+use crate::db::entities::loop_inbox_item::{self, InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{self, IssueStatus, PauseReason};
 use crate::db::entities::loop_iteration::{self, IterationStatus};
 use crate::db::service::folder_service;
-use crate::db::service::loop_service::{issue, space};
+use crate::db::service::loop_service::{artifact, inbox, issue, space};
+use crate::models::loops::{IssueConfig, LoopChanged, LOOP_CHANGED_EVENT};
+use crate::web::event_bridge::emit_event;
 
 use crate::loop_engine::transitions::cas_issue_status;
-use crate::loop_engine::{worktree, LoopEngine, LoopError};
+use crate::loop_engine::worktree::{self, MergeOutcome};
+use crate::loop_engine::{LoopEngine, LoopError};
 
 impl LoopEngine {
     /// Trigger a pending issue: create its worktree, flip it running, and start
@@ -131,10 +140,13 @@ impl LoopEngine {
         if res.rows_affected != 1 {
             return Err(LoopError::Conflict);
         }
-        // Stop the driver, then invalidate every in-flight iteration: marking
-        // them cancelled releases their leases AND makes the host reject any late
-        // capability-token submission (ingest requires a `running` iteration).
+        // Stop the driver, kill the agent processes, then invalidate every
+        // in-flight iteration: marking them cancelled releases their leases AND
+        // makes the host reject any late capability-token submission (ingest
+        // requires a `running` iteration). Killing precedes the worktree removal
+        // so no agent is still writing into the tree as it is torn down.
         self.stop_issue(issue_id).await;
+        self.kill_in_flight_agents(issue_id).await;
         loop_iteration::Entity::update_many()
             .col_expr(
                 loop_iteration::Column::Status,
@@ -184,18 +196,213 @@ impl LoopEngine {
             eprintln!("[loop] cancel: remove worktree {} failed: {e}", folder.path);
         }
     }
+
+    /// Tear down the OS processes of an issue's in-flight iterations. Each live
+    /// iteration's `conversation_id` resolves to its agent connection;
+    /// `disconnect` sends the connection its shutdown command, reaping the child.
+    /// Best-effort: a connection that already exited just isn't found. Reads the
+    /// iteration rows directly (independent of the subsequent cancel CAS).
+    async fn kill_in_flight_agents(&self, issue_id: i32) {
+        let in_flight = match loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::IssueId.eq(issue_id))
+            .filter(
+                loop_iteration::Column::Status
+                    .is_in([IterationStatus::Queued, IterationStatus::Running]),
+            )
+            .all(&self.db.conn)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("[loop] cancel: load in-flight iterations failed: {e}");
+                return;
+            }
+        };
+        for it in in_flight {
+            let Some(cid) = it.conversation_id else {
+                continue;
+            };
+            if let Some(conn_id) = self.manager.find_connection_by_conversation_id(cid).await {
+                if let Err(e) = self.manager.disconnect(&conn_id).await {
+                    eprintln!("[loop] cancel: disconnect {conn_id} failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Land a finalized issue's work onto its base branch — the merge gate
+    /// (§4.10). Invoked by `approve_merge` (the human gate) or the driver
+    /// (auto-merge); both take the same per-repo lock and run the same stale-base
+    /// checks. A clean landing closes the issue (`done`) and removes its
+    /// worktree; any fault (conflict / dirty base / failed re-validation / missing
+    /// base) blocks the issue with an inbox card naming the cause. Returns
+    /// [`LoopError::Conflict`] when the issue is not in a mergeable state (not
+    /// running, or no `result` artifact has been produced yet).
+    pub async fn merge_issue(&self, issue_id: i32) -> Result<(), LoopError> {
+        let conn = &self.db.conn;
+        let issue = issue::get_issue(conn, issue_id)
+            .await?
+            .ok_or_else(|| LoopError::NotFound(format!("issue {issue_id}")))?;
+        // Mergeable only while running with a produced result (finalize done).
+        if issue.status != IssueStatus::Running {
+            return Err(LoopError::Conflict);
+        }
+        let dag = artifact::list_dag(conn, issue_id).await?;
+        if !dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result) {
+            return Err(LoopError::Conflict);
+        }
+
+        let folder_id = issue
+            .worktree_folder_id
+            .ok_or_else(|| LoopError::NotFound(format!("issue {issue_id} worktree")))?;
+        let folder = folder_service::get_folder_by_id(conn, folder_id)
+            .await?
+            .ok_or(LoopError::Detached)?;
+        let space_row = space::get_space(conn, issue.space_id)
+            .await?
+            .ok_or_else(|| LoopError::NotFound(format!("space {}", issue.space_id)))?;
+        let repo = folder_service::get_folder_by_id(conn, space_row.folder_id)
+            .await?
+            .ok_or(LoopError::Detached)?;
+        let repo_path = PathBuf::from(&repo.path);
+        let worktree_path = PathBuf::from(&folder.path);
+        let branch = format!("loop/{}/issue-{}", issue.space_id, issue.seq_no);
+        let base_branch = issue
+            .base_branch
+            .clone()
+            .ok_or_else(|| LoopError::Git("issue has no recorded base branch".into()))?;
+        let base_commit = issue
+            .base_commit
+            .clone()
+            .ok_or_else(|| LoopError::Git("issue has no recorded base commit".into()))?;
+        let config: IssueConfig = serde_json::from_str(&issue.config).unwrap_or_default();
+
+        // Serialize merges per base repo: two issues sharing a repo must not race
+        // their --no-ff landings on the base branch ref / working tree.
+        let lock = self.repo_merge_lock(&repo_path).await;
+        let _guard = lock.lock().await;
+
+        let outcome = worktree::merge_issue(
+            &repo_path,
+            &worktree_path,
+            &branch,
+            &base_branch,
+            &base_commit,
+            &config.validation_commands,
+            config.iteration_timeout_secs,
+        )
+        .await?;
+
+        let merged = matches!(outcome, MergeOutcome::Merged { .. });
+        if merged {
+            // Best-effort teardown; the DB closure below is the source of truth —
+            // a merged issue never restarts, so a stale folder/worktree is inert.
+            let _ = worktree::remove_worktree(&repo_path, &worktree_path).await;
+            let _ = folder_service::remove_folder(conn, &folder.path).await;
+            clear_merge_card(conn, issue_id, serde_json::json!({ "action": "merged" })).await?;
+            let now = Utc::now();
+            loop_issue::Entity::update_many()
+                .col_expr(
+                    loop_issue::Column::Status,
+                    Expr::value(IssueStatus::Done.to_value()),
+                )
+                .col_expr(loop_issue::Column::EndedAt, Expr::value(now))
+                .col_expr(loop_issue::Column::UpdatedAt, Expr::value(now))
+                .filter(loop_issue::Column::Id.eq(issue_id))
+                .filter(loop_issue::Column::Status.eq(IssueStatus::Running))
+                .exec(conn)
+                .await?;
+        } else {
+            let (reason, detail) = describe_merge_fault(&outcome);
+            cas_issue_status(conn, issue_id, IssueStatus::Running, IssueStatus::Blocked).await?;
+            inbox::upsert_inbox(
+                conn,
+                issue.space_id,
+                issue_id,
+                None,
+                InboxKind::Blocked,
+                &format!("merge_blocked:{issue_id}"),
+                serde_json::json!({ "reason": reason, "detail": detail }),
+            )
+            .await?;
+        }
+
+        emit_event(
+            &self.emitter,
+            LOOP_CHANGED_EVENT,
+            LoopChanged {
+                v: 1,
+                space_id: issue.space_id,
+                issue_id: Some(issue_id),
+                subject_kind: "issue".to_string(),
+                subject_id: issue_id,
+                kind: if merged { "merged" } else { "blocked" }.to_string(),
+            },
+        );
+        // Nudge the driver: on a merge it re-ticks and stops (issue terminal); on
+        // a block it re-ticks, sees a non-running status, and exits.
+        self.wake(issue_id).await;
+        Ok(())
+    }
+}
+
+/// Mark a pending merge-approval inbox card (`kind=approval`, `merge:{issue_id}`)
+/// handled. No-op when no such card exists — the card is created by the approval
+/// gate (Task 2.7); auto-merge and direct calls run fine without one.
+async fn clear_merge_card(
+    conn: &sea_orm::DatabaseConnection,
+    issue_id: i32,
+    resolution: serde_json::Value,
+) -> Result<(), LoopError> {
+    if let Some(card) = loop_inbox_item::Entity::find()
+        .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+        .filter(loop_inbox_item::Column::Kind.eq(InboxKind::Approval))
+        .filter(loop_inbox_item::Column::SubjectKey.eq(format!("merge:{issue_id}")))
+        .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+        .one(conn)
+        .await?
+    {
+        inbox::handle_inbox(conn, card.id, resolution).await?;
+    }
+    Ok(())
+}
+
+/// Map a non-`Merged` outcome to an inbox `(reason, detail)` pair.
+fn describe_merge_fault(outcome: &MergeOutcome) -> (&'static str, String) {
+    match outcome {
+        MergeOutcome::BaseGone => ("base_gone", "base branch no longer exists".to_string()),
+        MergeOutcome::BaseDirty => (
+            "base_dirty",
+            "base repo working tree has uncommitted changes".to_string(),
+        ),
+        MergeOutcome::Conflict { stage, detail } => {
+            let reason = if *stage == "integrate" {
+                "merge_conflict_integrate"
+            } else {
+                "merge_conflict"
+            };
+            (reason, detail.clone())
+        }
+        MergeOutcome::RevalidationFailed { output } => ("revalidation_failed", output.clone()),
+        // Not reached: the success arm is handled before this is called.
+        MergeOutcome::Merged { .. } => ("merged", String::new()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp::manager::ConnectionManager;
+    use crate::db::entities::loop_artifact::{self, ArtifactStatus};
+    use crate::db::entities::loop_artifact_revision::ActorKind;
     use crate::db::entities::loop_issue::IssuePriority;
     use crate::db::entities::loop_iteration::Stage;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::db::test_helpers::{fresh_disk_db, fresh_in_memory_db, seed_folder};
     use crate::loop_engine::transitions::{cas_iteration_status, try_claim_iteration, IterationClaim};
+    use crate::models::agent::AgentType;
     use crate::models::loops::IssueConfig;
     use crate::web::event_bridge::EventEmitter;
+    use std::process::Command as StdCommand;
 
     /// Build an engine + a single issue already marked `running` (without going
     /// through trigger, so no worktree or driver is created — the pause/cancel
@@ -295,6 +502,209 @@ mod tests {
         // Cancelling an already-terminal issue is a conflict.
         assert!(matches!(
             engine.cancel_issue(issue_id).await,
+            Err(LoopError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_disconnects_live_agent() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        // An in-flight running iteration bound to a conversation.
+        let iter = try_claim_iteration(
+            &conn,
+            IterationClaim {
+                space_id,
+                issue_id,
+                stage: Stage::Triage,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cas_iteration_status(&conn, iter.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        let convo = 4242;
+        loop_iteration::Entity::update_many()
+            .col_expr(loop_iteration::Column::ConversationId, Expr::value(convo))
+            .filter(loop_iteration::Column::Id.eq(iter.id))
+            .exec(&conn)
+            .await
+            .unwrap();
+        // A live agent connection whose session is bound to that conversation.
+        engine
+            .manager
+            .insert_test_connection("agent-conn", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        engine
+            .manager
+            .get_state("agent-conn")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(convo);
+        assert!(engine
+            .manager
+            .find_connection_by_conversation_id(convo)
+            .await
+            .is_some());
+
+        engine.cancel_issue(issue_id).await.unwrap();
+
+        assert!(
+            engine
+                .manager
+                .find_connection_by_conversation_id(convo)
+                .await
+                .is_none(),
+            "the agent process connection is killed on cancel"
+        );
+    }
+
+    // ── Merge gate (real git repo) ──────────────────────────────────────────
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "tester"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Engine + real git repo + an issue triggered (worktree created, running)
+    /// carrying one loop commit and a produced `result` artifact — i.e. a fully
+    /// finalized issue sitting at the merge gate.
+    async fn setup_repo() -> (
+        Arc<LoopEngine>,
+        sea_orm::DatabaseConnection,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        i32,
+        i32,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let data = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(data.path()).await;
+        let conn = db.conn.clone();
+        let folder_id = seed_folder(&db, &repo.path().to_string_lossy()).await;
+        let space = space::create_space(&conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &conn,
+            space.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            &IssueConfig::default(),
+        )
+        .await
+        .unwrap();
+        let engine = LoopEngine::new(
+            db,
+            ConnectionManager::new(),
+            data.path().to_path_buf(),
+            EventEmitter::Noop,
+        );
+        // Trigger: create the worktree (records the base), flip running.
+        let ctx = worktree::ensure_worktree(&conn, data.path(), issue.row.id)
+            .await
+            .unwrap();
+        cas_issue_status(&conn, issue.row.id, IssueStatus::Pending, IssueStatus::Running)
+            .await
+            .unwrap();
+        // One loop commit so the landing has content.
+        std::fs::write(ctx.worktree_path.join("feature.txt"), "work\n").unwrap();
+        worktree::checkpoint(&ctx.worktree_path, "loop: feature")
+            .await
+            .unwrap()
+            .expect("committed");
+        // Finalize produced the result artifact.
+        artifact::create_artifact(
+            &conn,
+            space.id,
+            issue.row.id,
+            ArtifactKind::Result,
+            "result",
+            ArtifactStatus::Done,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        (engine, conn, repo, data, issue.row.id, ctx.worktree_folder_id)
+    }
+
+    #[tokio::test]
+    async fn merge_issue_success_closes_issue_and_removes_worktree() {
+        let (engine, conn, repo, _data, issue_id, folder_id) = setup_repo().await;
+        let worktree_path = PathBuf::from(
+            folder_service::get_folder_by_id(&conn, folder_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+        );
+
+        engine.merge_issue(issue_id).await.unwrap();
+
+        let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+        assert_eq!(issue.status, IssueStatus::Done);
+        assert!(issue.ended_at.is_some());
+        // Worktree folder soft-deleted + directory gone.
+        assert!(folder_service::get_folder_by_id(&conn, folder_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!worktree_path.exists());
+        // The loop work landed on the base branch.
+        assert!(repo.path().join("feature.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_issue_dirty_base_blocks_with_inbox() {
+        let (engine, conn, repo, _data, issue_id, _folder_id) = setup_repo().await;
+        std::fs::write(repo.path().join("dirty.txt"), "uncommitted\n").unwrap();
+
+        engine.merge_issue(issue_id).await.unwrap();
+
+        let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+        assert_eq!(issue.status, IssueStatus::Blocked);
+        let cards = inbox::list_inbox(&conn, issue.space_id, Some(InboxStatus::Pending))
+            .await
+            .unwrap();
+        assert!(cards.iter().any(|c| c.kind == InboxKind::Blocked
+            && c.subject_key == format!("merge_blocked:{issue_id}")));
+        // Nothing landed on the base branch.
+        assert!(!repo.path().join("feature.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_issue_without_result_conflicts() {
+        let (engine, conn, _repo, _data, issue_id, _folder_id) = setup_repo().await;
+        // Drop the result artifact to simulate "finalize not done".
+        loop_artifact::Entity::delete_many()
+            .filter(loop_artifact::Column::IssueId.eq(issue_id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Result))
+            .exec(&conn)
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.merge_issue(issue_id).await,
             Err(LoopError::Conflict)
         ));
     }

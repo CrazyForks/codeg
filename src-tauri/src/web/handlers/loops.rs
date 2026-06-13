@@ -192,6 +192,36 @@ pub async fn cancel_loop_issue(
     Ok(Json(()))
 }
 
+pub async fn approve_loop_merge(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<IdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::approve_loop_merge_core(&state.db.conn, &state.emitter, &state.loop_engine, p.id).await?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectMergeParams {
+    pub id: i32,
+    pub comment: Option<String>,
+}
+
+pub async fn reject_loop_merge(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<RejectMergeParams>,
+) -> Result<Json<()>, AppCommandError> {
+    core::reject_loop_merge_core(
+        &state.db.conn,
+        &state.emitter,
+        &state.loop_engine,
+        p.id,
+        p.comment,
+    )
+    .await?;
+    Ok(Json(()))
+}
+
 // ─── Artifacts / DAG ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

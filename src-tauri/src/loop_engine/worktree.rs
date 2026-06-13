@@ -11,11 +11,12 @@
 //! side-effects (never rewinds a committed checkpoint).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sea_orm::{ActiveModelTrait, DatabaseConnection, IntoActiveModel, Set};
 
 use crate::db::service::{folder_service, loop_service};
-use crate::loop_engine::LoopError;
+use crate::loop_engine::{validation, LoopError};
 
 /// Identity stamped on engine checkpoint commits.
 const ENGINE_NAME: &str = "codeg loop engine";
@@ -50,6 +51,21 @@ fn stderr_of(out: &std::process::Output) -> String {
 
 fn stdout_trimmed(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// stdout followed by stderr (trimmed) — git writes conflict reports to both, so
+/// merge-fault details want the union.
+fn combined_output(out: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if !err.is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(err);
+    }
+    s
 }
 
 async fn ensure_git_repo(repo: &Path) -> Result<(), LoopError> {
@@ -225,6 +241,128 @@ pub async fn is_clean(worktree_path: &Path) -> Result<bool, LoopError> {
     Ok(stdout_trimmed(&out).is_empty())
 }
 
+/// Outcome of attempting to land an issue's loop branch onto its base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The loop branch merged into the base branch (a `--no-ff` merge commit
+    /// landed). The caller closes the issue and removes the worktree.
+    Merged { merge_commit: String },
+    /// `base_branch` no longer exists — a human deleted or renamed it.
+    BaseGone,
+    /// The base repo's working tree has uncommitted changes; we refuse to merge
+    /// rather than disturb the human's in-progress state.
+    BaseDirty,
+    /// A merge conflict. `stage` is `"integrate"` when folding an advanced base
+    /// into the loop branch, `"merge"` on the final landing. The merge was
+    /// aborted and the trees restored; `detail` is git's conflict report.
+    Conflict { stage: &'static str, detail: String },
+    /// The base advanced and was folded in cleanly, but re-running the issue's
+    /// validation suite on the integrated tree failed — the new base broke the
+    /// work, so it must not land.
+    RevalidationFailed { output: String },
+}
+
+/// Land an issue's loop branch onto its base branch (spec §4.10). Pure git +
+/// deterministic validation — no DB, no engine state; the caller (engine
+/// `merge_issue`) owns the per-repo serialization lock and the post-merge DB
+/// lifecycle.
+///
+/// Stale-base aware: if `base_branch` advanced past the `base_commit` recorded
+/// at trigger time, the new base is first folded into the loop branch (in the
+/// worktree) and the issue's validation suite re-run there; only a clean,
+/// re-validated integration proceeds to the final `--no-ff` landing. The landing
+/// happens in the base repo's working tree, on `base_branch`, so that tree must
+/// be clean — we never clobber uncommitted human state. A successful landing
+/// leaves the base repo checked out on `base_branch` at the new merge commit.
+#[allow(clippy::too_many_arguments)]
+pub async fn merge_issue(
+    repo_path: &Path,
+    worktree_path: &Path,
+    loop_branch: &str,
+    base_branch: &str,
+    base_commit: &str,
+    validation_commands: &[String],
+    iteration_timeout_secs: Option<u64>,
+) -> Result<MergeOutcome, LoopError> {
+    // 1. Base must still exist; its current tip tells us whether it advanced.
+    let verify = run_git(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{base_branch}"),
+        ],
+    )
+    .await?;
+    if !verify.status.success() {
+        return Ok(MergeOutcome::BaseGone);
+    }
+    let base_tip = stdout_trimmed(&verify);
+
+    // 2. Base advanced since trigger → fold it into the loop branch and re-validate
+    //    on the integrated tree before landing.
+    if base_tip != base_commit {
+        let integrate = run_git(worktree_path, &["merge", "--no-edit", base_branch]).await?;
+        if !integrate.status.success() {
+            let detail = combined_output(&integrate);
+            let _ = run_git(worktree_path, &["merge", "--abort"]).await;
+            return Ok(MergeOutcome::Conflict {
+                stage: "integrate",
+                detail,
+            });
+        }
+        let commands: Vec<String> = validation_commands
+            .iter()
+            .filter(|c| !c.trim().is_empty())
+            .cloned()
+            .collect();
+        if !commands.is_empty() {
+            let report = validation::run_validation(
+                worktree_path,
+                &commands,
+                iteration_timeout_secs.map(Duration::from_secs),
+            )
+            .await?;
+            if !report.passed() {
+                return Ok(MergeOutcome::RevalidationFailed {
+                    output: report.output,
+                });
+            }
+        }
+    }
+
+    // 3. Land the loop branch on the base branch, in the base repo's working tree.
+    //    Refuse a dirty tree outright — never clobber uncommitted human state.
+    if !is_clean(repo_path).await? {
+        return Ok(MergeOutcome::BaseDirty);
+    }
+    let original_branch = current_branch(repo_path).await?;
+    if original_branch != base_branch {
+        let checkout = run_git(repo_path, &["checkout", base_branch]).await?;
+        if !checkout.status.success() {
+            return Err(LoopError::Git(format!(
+                "checkout {base_branch}: {}",
+                stderr_of(&checkout)
+            )));
+        }
+    }
+    let merge = run_git(repo_path, &["merge", "--no-ff", "--no-edit", loop_branch]).await?;
+    if !merge.status.success() {
+        let detail = combined_output(&merge);
+        let _ = run_git(repo_path, &["merge", "--abort"]).await;
+        if original_branch != base_branch {
+            let _ = run_git(repo_path, &["checkout", &original_branch]).await;
+        }
+        return Ok(MergeOutcome::Conflict {
+            stage: "merge",
+            detail,
+        });
+    }
+    let merge_commit = head_commit(repo_path).await?;
+    Ok(MergeOutcome::Merged { merge_commit })
+}
+
 /// Remove the worktree directory and its administrative entry (best-effort
 /// `--force` to tolerate a dirty tree). The branch is left intact.
 pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<(), LoopError> {
@@ -379,5 +517,209 @@ mod tests {
             !ctx.worktree_path.join("scratch.txt").exists(),
             "untracked file removed"
         );
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// One loop commit (a feature file) checkpointed onto the issue branch.
+    async fn loop_commit(worktree_path: &Path, file: &str, body: &str) {
+        std::fs::write(worktree_path.join(file), body).unwrap();
+        checkpoint(worktree_path, &format!("loop: {file}"))
+            .await
+            .unwrap()
+            .expect("committed");
+    }
+
+    fn parent_count(repo: &Path) -> usize {
+        git_out(repo, &["log", "-1", "--format=%P"])
+            .split_whitespace()
+            .count()
+    }
+
+    #[tokio::test]
+    async fn merge_clean_base_unchanged_lands_loop() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::Merged { .. }));
+        // The base repo (on the base branch) now carries the loop's work behind a
+        // no-ff merge commit (two parents).
+        assert!(repo.path().join("feature.txt").exists());
+        assert_eq!(parent_count(repo.path()), 2, "--no-ff merge commit");
+    }
+
+    #[tokio::test]
+    async fn merge_stale_base_integrates_then_lands() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+
+        // Advance the base branch (a non-conflicting file) after the worktree was cut.
+        std::fs::write(repo.path().join("base-new.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base advance"]);
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::Merged { .. }));
+        // Both the advanced base file and the loop work are present on the base.
+        assert!(repo.path().join("base-new.txt").exists());
+        assert!(repo.path().join("feature.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_conflict_integrate_aborts_and_preserves_base() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        // Loop and base both edit README differently → integrate conflicts.
+        loop_commit(&ctx.worktree_path, "README.md", "loop change\n").await;
+        std::fs::write(repo.path().join("README.md"), "base change\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base readme"]);
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            MergeOutcome::Conflict { stage: "integrate", .. }
+        ));
+        // Worktree restored (merge aborted) and the base branch untouched.
+        assert!(is_clean(&ctx.worktree_path).await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "base change\n"
+        );
+        assert_eq!(parent_count(repo.path()), 1, "no merge landed on base");
+    }
+
+    #[tokio::test]
+    async fn merge_revalidation_failure_does_not_land() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+        // Advance base on a different file so integration is clean.
+        std::fs::write(repo.path().join("base-new.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base advance"]);
+
+        // A validation command that exits non-zero (git is available cross-platform).
+        let cmds = vec!["git rev-parse --verify refs/heads/no-such-ref".to_string()];
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &cmds,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::RevalidationFailed { .. }));
+        // The loop work never reached the base branch.
+        assert!(!repo.path().join("feature.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_dirty_base_refuses() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+        // Leave the base repo working tree dirty.
+        std::fs::write(repo.path().join("dirty.txt"), "uncommitted\n").unwrap();
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            &ctx.base_branch,
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::BaseDirty));
+        assert!(!repo.path().join("feature.txt").exists(), "nothing landed");
+    }
+
+    #[tokio::test]
+    async fn merge_base_gone() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+
+        let outcome = merge_issue(
+            repo.path(),
+            &ctx.worktree_path,
+            &ctx.branch,
+            "no-such-base",
+            &ctx.base_commit,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::BaseGone));
     }
 }
