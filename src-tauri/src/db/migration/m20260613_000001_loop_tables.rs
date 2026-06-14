@@ -10,6 +10,13 @@
 //! (`produced_by_iteration_id` / `target_artifact_id`) is intentionally left
 //! without FK constraints to avoid a circular dependency; every other loop-table
 //! reference is a real FK enforced in the test pool.
+//!
+//! Every enum-backed column carries a `CHECK (col IN (...))` mirroring its
+//! `DeriveActiveEnum` `string_value`s — the DB is the last line of defence
+//! against a stray write, not just the Rust layer. `loop_space.default_config`
+//! is `NOT NULL` (every space stores a concrete `IssueConfig`); `loop_issue.config`
+//! is nullable, where `NULL` means "inherit the space default" (single source of
+//! truth — there is no separate inherit flag).
 
 use sea_orm::ConnectionTrait;
 use sea_orm_migration::prelude::*;
@@ -22,6 +29,7 @@ const UP: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         folder_id INTEGER NOT NULL,
+        default_config TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )",
@@ -31,11 +39,14 @@ const UP: &[&str] = &[
         seq_no INTEGER NOT NULL,
         title TEXT NOT NULL,
         description TEXT NOT NULL,
-        priority TEXT NOT NULL DEFAULT 'medium',
-        status TEXT NOT NULL DEFAULT 'pending',
-        pause_reason TEXT,
-        route TEXT NOT NULL DEFAULT 'undecided',
-        config TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'medium'
+            CHECK (priority IN ('high','medium','low')),
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','running','paused','blocked','done','cancelled')),
+        pause_reason TEXT CHECK (pause_reason IS NULL OR pause_reason IN ('manual','budget')),
+        route TEXT NOT NULL DEFAULT 'undecided'
+            CHECK (route IN ('undecided','full','skip_design','direct')),
+        config TEXT,
         worktree_folder_id INTEGER,
         base_branch TEXT,
         base_commit TEXT,
@@ -53,12 +64,14 @@ const UP: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('issue','requirement','design','task','review','result')),
         title TEXT NOT NULL,
-        status TEXT NOT NULL,
-        origin TEXT NOT NULL,
+        status TEXT NOT NULL
+            CHECK (status IN ('pending','in_progress','awaiting_approval','done','blocked','superseded','cancelled')),
+        origin TEXT NOT NULL CHECK (origin IN ('human','agent')),
         produced_by_iteration_id INTEGER,
-        verdict TEXT,
+        verdict TEXT CHECK (verdict IS NULL OR verdict IN ('pass','fail')),
         attempt INTEGER NOT NULL DEFAULT 0,
         last_failure_sig TEXT,
         sort INTEGER NOT NULL DEFAULT 0,
@@ -67,12 +80,13 @@ const UP: &[&str] = &[
     )",
     "CREATE INDEX idx_loop_artifact_issue_kind ON loop_artifact(issue_id, kind)",
     "CREATE INDEX idx_loop_artifact_space ON loop_artifact(space_id)",
+    "CREATE INDEX idx_loop_artifact_produced_by ON loop_artifact(produced_by_iteration_id)",
     "CREATE TABLE loop_artifact_revision (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         seq INTEGER NOT NULL,
         content TEXT NOT NULL,
-        actor_kind TEXT NOT NULL,
+        actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human','agent')),
         iteration_id INTEGER,
         created_at TEXT NOT NULL
     )",
@@ -82,10 +96,12 @@ const UP: &[&str] = &[
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         from_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         to_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('derives_from','skips_to','reviews','results_from')),
         created_at TEXT NOT NULL
     )",
     "CREATE UNIQUE INDEX uniq_loop_link ON loop_link(from_artifact_id, to_artifact_id, kind)",
+    "CREATE INDEX idx_loop_link_to ON loop_link(to_artifact_id, kind)",
     "CREATE TABLE loop_criterion (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
@@ -93,17 +109,20 @@ const UP: &[&str] = &[
         text TEXT NOT NULL,
         sort INTEGER NOT NULL DEFAULT 0
     )",
+    "CREATE INDEX idx_loop_criterion_artifact ON loop_criterion(artifact_id)",
     "CREATE TABLE loop_iteration (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
-        stage TEXT NOT NULL,
+        stage TEXT NOT NULL
+            CHECK (stage IN ('triage','refine','design','plan','implement','review','finalize')),
         target_artifact_id INTEGER,
         slot_no INTEGER,
         conversation_id INTEGER,
         capability_token TEXT NOT NULL,
-        status TEXT NOT NULL,
-        launched_by TEXT NOT NULL,
+        status TEXT NOT NULL
+            CHECK (status IN ('queued','running','succeeded','failed','interrupted','cancelled')),
+        launched_by TEXT NOT NULL CHECK (launched_by IN ('engine','human')),
         attempt INTEGER NOT NULL DEFAULT 0,
         tokens_used BIGINT NOT NULL DEFAULT 0,
         context_manifest TEXT,
@@ -135,32 +154,41 @@ const UP: &[&str] = &[
         passed BOOLEAN NOT NULL,
         created_at TEXT NOT NULL
     )",
+    "CREATE INDEX idx_loop_validation_run_issue ON loop_validation_run(issue_id)",
+    "CREATE INDEX idx_loop_validation_run_task ON loop_validation_run(task_artifact_id)",
+    "CREATE INDEX idx_loop_validation_run_iter ON loop_validation_run(iteration_id)",
     "CREATE TABLE loop_inbox_item (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
         iteration_id INTEGER,
-        kind TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('approval','blocked','budget_exhausted','question')),
         subject_key TEXT NOT NULL,
         payload TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','handled')),
         resolution TEXT,
         created_at TEXT NOT NULL,
         handled_at TEXT
     )",
     "CREATE UNIQUE INDEX uniq_inbox_pending ON loop_inbox_item(issue_id, kind, subject_key) \
      WHERE status = 'pending'",
+    "CREATE INDEX idx_loop_inbox_space_status ON loop_inbox_item(space_id, status)",
     "CREATE TABLE loop_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL,
-        source TEXT NOT NULL,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('constitution','constraint','decision','preference','pitfall')),
+        source TEXT NOT NULL CHECK (source IN ('human','agent')),
         title TEXT NOT NULL,
         content TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active','archived')),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )",
+    "CREATE INDEX idx_loop_memory_lookup ON loop_memory(space_id, kind, status)",
 ];
 
 /// Reverse dependency order (children before parents).
@@ -239,10 +267,20 @@ mod tests {
         }
 
         for index in [
+            // Partial unique dispatch leases + pending-inbox dedupe.
             "uniq_active_write",
             "uniq_active_node",
             "uniq_review_slot",
             "uniq_inbox_pending",
+            // Plain lookup indexes.
+            "idx_loop_artifact_produced_by",
+            "idx_loop_link_to",
+            "idx_loop_criterion_artifact",
+            "idx_loop_validation_run_issue",
+            "idx_loop_validation_run_task",
+            "idx_loop_validation_run_iter",
+            "idx_loop_inbox_space_status",
+            "idx_loop_memory_lookup",
         ] {
             assert_eq!(count(&conn, "index", index).await, 1, "index {index} missing");
         }

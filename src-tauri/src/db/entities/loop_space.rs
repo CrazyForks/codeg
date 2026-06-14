@@ -9,11 +9,12 @@ pub struct Model {
     /// Bound root folder (must be a git repo). Plain column — cross-subsystem
     /// reference to `folder.id`, no FK.
     pub folder_id: i32,
+    /// Space default `IssueConfig` (JSON), `NOT NULL` — every space stores a
+    /// concrete config (the engine default is written at creation). Issues whose
+    /// own `config` is `NULL` resolve against this at read time.
+    pub default_config: String,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
-    /// Space default `IssueConfig` (JSON). NULL = engine default. Issues with
-    /// `config_inherits` resolve their config from this at read time.
-    pub default_config: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
