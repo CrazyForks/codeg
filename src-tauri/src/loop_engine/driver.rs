@@ -649,9 +649,12 @@ async fn recover_undecided_triage(
     Ok(TickOutcome::Idle)
 }
 
-/// How often the driver re-ticks absent a wake, so the liveness reconcile runs.
-/// A poll cadence for a real signal (connection liveness), not a cap on work.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Backstop cadence for the liveness reconcile. The happy path is event-driven
+/// (turn-complete → settle → wake); a `Lagged` burst is swept immediately by the
+/// completion watcher. This heartbeat is only a coarse net for a missed wake, and
+/// is armed ONLY while the issue has in-flight iterations — an idle driver parks
+/// on `wake` alone and issues no periodic query.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The per-issue driver task body: tick, then park on the wake `Notify` until a
 /// completion (or external nudge) arrives. Exits when the issue leaves
@@ -728,14 +731,37 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
             }
         }
         // Park until an iteration settles (the completion watcher fires `wake`)
-        // or the periodic heartbeat elapses (which runs the reconcile above).
-        // `notify_one` buffers a permit, so a wake that races ahead is not lost.
-        tokio::select! {
-            _ = wake.notified() => {}
-            _ = heartbeat.tick() => {}
+        // or — only while work is actually in flight — the periodic heartbeat
+        // elapses (which runs the reconcile above). An idle issue waits purely on
+        // `wake` and issues no blind periodic query. `notify_one` buffers a
+        // permit, so a wake that races ahead is not lost.
+        if has_inflight_iteration(&engine.db, issue_id).await {
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = heartbeat.tick() => {}
+            }
+        } else {
+            wake.notified().await;
         }
     }
     engine.deregister_driver(issue_id).await;
+}
+
+/// Whether the issue has any queued/running iteration. Gates the periodic
+/// reconcile heartbeat so an idle driver parks on `wake` alone (uses the new
+/// `(issue_id, status)` index).
+async fn has_inflight_iteration(db: &AppDatabase, issue_id: i32) -> bool {
+    loop_iteration::Entity::find()
+        .filter(loop_iteration::Column::IssueId.eq(issue_id))
+        .filter(
+            loop_iteration::Column::Status
+                .is_in([IterationStatus::Queued, IterationStatus::Running]),
+        )
+        .one(&db.conn)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 #[cfg(test)]
@@ -775,6 +801,41 @@ mod tests {
         let plan = resolve_agent_spec(&cfg, Stage::Plan);
         assert_eq!(plan.agent, AgentType::ClaudeCode);
         assert!(plan.mode_id.is_none() && plan.config_values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn has_inflight_reflects_queued_and_running_only() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/inflight").await;
+        let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(&db.conn, space.id, "I", "b", IssuePriority::Medium, Some(&IssueConfig::default()))
+            .await
+            .unwrap();
+        assert!(!has_inflight_iteration(&db, issue.row.id).await, "no iterations → idle");
+        let it = crate::loop_engine::transitions::try_claim_iteration(
+            &db.conn,
+            crate::loop_engine::transitions::IterationClaim {
+                space_id: space.id,
+                issue_id: issue.row.id,
+                stage: Stage::Triage,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "t".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(has_inflight_iteration(&db, issue.row.id).await, "queued → in flight");
+        crate::loop_engine::transitions::cas_iteration_status(&db.conn, it.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        assert!(has_inflight_iteration(&db, issue.row.id).await, "running → in flight");
+        crate::loop_engine::transitions::cas_iteration_status(&db.conn, it.id, IterationStatus::Running, IterationStatus::Succeeded)
+            .await
+            .unwrap();
+        assert!(!has_inflight_iteration(&db, issue.row.id).await, "terminal → idle");
     }
 
     /// Simulate a human approving the design gate (route=full), so the read

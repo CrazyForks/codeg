@@ -15,7 +15,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::task::AbortHandle;
 
@@ -221,6 +221,37 @@ impl LoopEngine {
         }
     }
 
+    /// Reconcile every issue that currently has an in-flight iteration. Called
+    /// when the completion watcher detects it dropped events (broadcast lag): a
+    /// precise, immediate backstop so a missed `TurnComplete` still settles
+    /// promptly instead of waiting for the next per-issue heartbeat. Idempotent
+    /// (settles are CAS).
+    pub(crate) async fn reconcile_all_inflight(self: &Arc<Self>) {
+        let issue_ids = match loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .select_only()
+            .column(loop_iteration::Column::IssueId)
+            .distinct()
+            .into_tuple::<i32>()
+            .all(&self.db.conn)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("[loop][lag-sweep] listing in-flight issues failed: {e}");
+                return;
+            }
+        };
+        for issue_id in issue_ids {
+            if let Err(e) =
+                driver::reconcile_orphaned_iterations(&self.db, &self.emitter, &self.manager, issue_id)
+                    .await
+            {
+                eprintln!("[loop][lag-sweep] reconcile failed for issue {issue_id}: {e}");
+            }
+        }
+    }
+
     /// Subscribe to the in-process event bus synchronously and return the
     /// completion-watcher loop future; the caller spawns it with the
     /// mode-appropriate spawner (`tauri::async_runtime::spawn` from the desktop
@@ -266,9 +297,16 @@ impl LoopEngine {
                         }
                         _ => {}
                     },
-                    // Fell behind the broadcast buffer — keep going; a missed
-                    // event is reconciled by crash recovery (Task 1.7).
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Dropped `n` in-process events — a `TurnComplete` may be
+                    // among them. Run an immediate, precise reconcile of all
+                    // in-flight iterations so settlement stays timely without
+                    // waiting for the per-issue heartbeat cadence (§2.1).
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!(
+                            "[loop][watcher] lagged; dropped {n} events, running in-flight reconcile sweep"
+                        );
+                        engine.reconcile_all_inflight().await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
