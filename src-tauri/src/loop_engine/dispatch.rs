@@ -198,6 +198,11 @@ pub trait LoopAgentSpawner: Send + Sync {
     ) -> Result<(), AcpError>;
 
     async fn disconnect_loop_agent(&self, conn_id: &str);
+
+    /// Resolve the live connection backing a loop conversation, if any. Used to
+    /// reap a cancelled reviewer's agent process (conversation_id → connection),
+    /// so a voided reviewer can't keep writing to the shared worktree.
+    async fn find_loop_connection(&self, conversation_id: i32) -> Option<String>;
 }
 
 #[async_trait]
@@ -251,6 +256,10 @@ impl LoopAgentSpawner for ConnectionManager {
 
     async fn disconnect_loop_agent(&self, conn_id: &str) {
         let _ = self.disconnect(conn_id).await;
+    }
+
+    async fn find_loop_connection(&self, conversation_id: i32) -> Option<String> {
+        self.find_connection_by_conversation_id(conversation_id).await
     }
 }
 
@@ -779,6 +788,10 @@ mod tests {
 
         async fn disconnect_loop_agent(&self, conn_id: &str) {
             self.calls.lock().await.disconnects.push(conn_id.to_string());
+        }
+
+        async fn find_loop_connection(&self, _conversation_id: i32) -> Option<String> {
+            None
         }
     }
 

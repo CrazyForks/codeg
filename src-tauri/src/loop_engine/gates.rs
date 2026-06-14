@@ -1,7 +1,7 @@
 //! Write-pipeline stage gates (§4.5): implement → validate → review → finalize.
 //!
-//! M2.2 Task 2.1 lands **implement**, the first stage that changes code. It is
-//! unlike the read stages in two ways:
+//! **implement** is the first stage that changes code. It is unlike the read
+//! stages in two ways:
 //!
 //! - **No submission.** The implement agent edits files in the worktree and
 //!   calls no `loop_submit_*` tool (its briefing tool-contract says so). The
@@ -10,8 +10,8 @@
 //! - **Serial per issue.** The per-issue task gate (`active_task_artifact_id`)
 //!   lets only one task occupy the worktree at a time, so two tasks never race
 //!   on the same tree. The gate is acquired when a task starts implementing and
-//!   released only when it finishes review (M2.3) — so in M2.1+2.1 a task that
-//!   implements holds the gate through to its (not-yet-built) validation.
+//!   released only when it finishes review — so a task holds the gate across its
+//!   whole implement → validate → review arc.
 //!
 //! Idempotency across ticks keys on `iteration.attempt == task.attempt`: a
 //! settled implement iteration is only checkpointed once, because a no-progress
@@ -39,7 +39,8 @@ use crate::loop_engine::dispatch::{dispatch_iteration, DispatchInput, LoopAgentS
 use crate::loop_engine::driver::resolve_agent;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
-    cas_issue_status, cas_iteration_status, release_task_gate, try_acquire_task_gate,
+    cas_artifact_status, cas_issue_status, cas_iteration_status, release_task_gate,
+    try_acquire_task_gate,
 };
 use crate::loop_engine::validation::{self, ValidationOutcome};
 use crate::loop_engine::worktree;
@@ -281,7 +282,7 @@ async fn validate_after_implement(
 ) -> Result<ImplementOutcome, LoopError> {
     let commands = &config.validation_commands;
     if commands.is_empty() {
-        set_task_status(db, task.id, ArtifactStatus::InProgress).await?;
+        set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::InProgress).await?;
         return Ok(ImplementOutcome::Advanced);
     }
 
@@ -303,7 +304,7 @@ async fn validate_after_implement(
 
     match report.outcome {
         ValidationOutcome::Passed => {
-            set_task_status(db, task.id, ArtifactStatus::InProgress).await?;
+            set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::InProgress).await?;
             Ok(ImplementOutcome::Advanced)
         }
         ValidationOutcome::Failed => {
@@ -319,7 +320,8 @@ async fn validate_after_implement(
             }
         }
         ValidationOutcome::Unrunnable => {
-            set_task_status(db, task.id, ArtifactStatus::Blocked).await?;
+            set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::Blocked)
+                .await?;
             loop_service::inbox::upsert_inbox(
                 &db.conn,
                 issue.space_id,
@@ -389,6 +391,11 @@ async fn implement_iterations(
         .await?)
 }
 
+/// Blind status write. Used only by `mark_blocked`, which is reached from more
+/// than one predecessor status (`pending` after a failed validation / empty diff,
+/// `in_progress` after a rejected review), so a single-`from` CAS doesn't fit. The
+/// loop serializes task work (single per-issue driver + the serial task gate), so
+/// this write never races a concurrent transition.
 async fn set_task_status(
     db: &AppDatabase,
     task_id: i32,
@@ -401,6 +408,26 @@ async fn set_task_status(
         .exec(&db.conn)
         .await?;
     Ok(())
+}
+
+/// CAS a task artifact's status `from → to` — the artifact analogue of the
+/// `cas_*_status` discipline used for issues and iterations. Returns whether the
+/// transition applied. The loop serializes task work (single per-issue driver +
+/// the serial task gate), so a `false` here means the expected `from` was wrong —
+/// a logic bug — and is logged rather than silently swallowed.
+async fn set_task_status_cas(
+    db: &AppDatabase,
+    task_id: i32,
+    from: ArtifactStatus,
+    to: ArtifactStatus,
+) -> Result<bool, LoopError> {
+    let applied = cas_artifact_status(&db.conn, task_id, from, to).await?;
+    if !applied {
+        eprintln!(
+            "[loop][gates] task {task_id} status CAS {from:?} → {to:?} did not apply (unexpected current status)"
+        );
+    }
+    Ok(applied)
 }
 
 async fn bump_rework(db: &AppDatabase, task_id: i32, sig: &str) -> Result<(), LoopError> {
@@ -570,13 +597,14 @@ async fn drive_reviews(
 
     match aggregate(&config.review_pass_rule, reviewers, &decided) {
         ReviewDecision::Pass => {
-            cancel_active_reviews(db, &iters).await?;
-            set_task_status(db, task.id, ArtifactStatus::Done).await?;
+            cancel_active_reviews(db, spawner, &iters).await?;
+            set_task_status_cas(db, task.id, ArtifactStatus::InProgress, ArtifactStatus::Done)
+                .await?;
             release_task_gate(&db.conn, issue.id, task.id).await?;
             Ok(false)
         }
         ReviewDecision::Fail => {
-            cancel_active_reviews(db, &iters).await?;
+            cancel_active_reviews(db, spawner, &iters).await?;
             // Defensive: clear any reviewer side-effects before re-implementing.
             let folder = folder_service::get_folder_by_id(&db.conn, worktree_folder_id)
                 .await?
@@ -591,7 +619,15 @@ async fn drive_reviews(
             let sig = format!("review_rejected:{}", sig_hash(&findings.join("\n---\n")));
             match record_rework(db, issue, config, task, None, &sig).await? {
                 // Back to awaiting implement at the new attempt.
-                ReworkOutcome::Retry => set_task_status(db, task.id, ArtifactStatus::Pending).await?,
+                ReworkOutcome::Retry => {
+                    set_task_status_cas(
+                        db,
+                        task.id,
+                        ArtifactStatus::InProgress,
+                        ArtifactStatus::Pending,
+                    )
+                    .await?;
+                }
                 // Breaker tripped: `mark_blocked` already set the task + issue
                 // blocked; leave them as-is.
                 ReworkOutcome::Blocked => {}
@@ -689,11 +725,15 @@ async fn dispatch_review(
 }
 
 /// Invalidate any still-active reviewers (a decision was reached without them).
-/// CAS to `cancelled` voids the capability token — `ingest` rejects a submit
-/// from a non-running iteration — so a late verdict can't change the outcome.
-/// Killing the agent process is Task 2.6.
+/// CAS to `cancelled` voids the capability token — `ingest` rejects a submit from
+/// a non-running iteration — so a late verdict can't change the outcome. It then
+/// reaps the reviewer's agent *process*: voiding the token only blocks a late
+/// submit, but the process itself could keep mutating the shared worktree right up
+/// until it's disconnected (and the caller resets the tree immediately after).
+/// Best-effort kill — a reviewer whose connection already exited just isn't found.
 async fn cancel_active_reviews(
     db: &AppDatabase,
+    spawner: &dyn LoopAgentSpawner,
     iters: &[loop_iteration::Model],
 ) -> Result<(), LoopError> {
     for it in iters {
@@ -705,6 +745,11 @@ async fn cancel_active_reviews(
                 .filter(loop_iteration::Column::Id.eq(it.id))
                 .exec(&db.conn)
                 .await?;
+            if let Some(conv_id) = it.conversation_id {
+                if let Some(conn_id) = spawner.find_loop_connection(conv_id).await {
+                    spawner.disconnect_loop_agent(&conn_id).await;
+                }
+            }
         }
     }
     Ok(())
@@ -931,6 +976,9 @@ mod tests {
             Ok(())
         }
         async fn disconnect_loop_agent(&self, _conn_id: &str) {}
+        async fn find_loop_connection(&self, _conversation_id: i32) -> Option<String> {
+            None
+        }
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -1775,5 +1823,131 @@ mod tests {
             .await
             .unwrap();
         assert!(fins.is_empty(), "no finalize iteration on a dirty tree");
+    }
+
+    #[tokio::test]
+    async fn set_task_status_cas_rejects_wrong_from() {
+        let h = setup().await;
+        let task = add_task(&h, "T").await; // pending
+
+        // Wrong `from` (task is Pending, not InProgress) → no-op, returns false.
+        let applied =
+            set_task_status_cas(&h.db, task, ArtifactStatus::InProgress, ArtifactStatus::Done)
+                .await
+                .unwrap();
+        assert!(!applied, "CAS with the wrong from does not apply");
+        let row = loop_artifact::Entity::find_by_id(task)
+            .one(&h.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ArtifactStatus::Pending, "status unchanged");
+
+        // Correct `from` applies.
+        let applied =
+            set_task_status_cas(&h.db, task, ArtifactStatus::Pending, ArtifactStatus::InProgress)
+                .await
+                .unwrap();
+        assert!(applied, "CAS with the right from applies");
+    }
+
+    /// Records disconnects and maps conversation ids to connection ids, so the
+    /// reviewer-kill path is observable without a live connection manager.
+    struct RecordingSpawner {
+        conn_for: std::collections::HashMap<i32, String>,
+        disconnected: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LoopAgentSpawner for RecordingSpawner {
+        async fn spawn_loop_agent(
+            &self,
+            _db: &AppDatabase,
+            _data_dir: &Path,
+            _agent_type: AgentType,
+            _working_dir: String,
+            _emitter: EventEmitter,
+            _preferred_mode_id: Option<String>,
+            _preferred_config_values: std::collections::BTreeMap<String, String>,
+            _capability_token: String,
+        ) -> Result<String, AcpError> {
+            Ok("conn".to_string())
+        }
+        async fn send_loop_prompt(
+            &self,
+            _db: &AppDatabase,
+            _conn_id: &str,
+            _text: String,
+            _folder_id: i32,
+            _conversation_id: i32,
+        ) -> Result<(), AcpError> {
+            Ok(())
+        }
+        async fn disconnect_loop_agent(&self, conn_id: &str) {
+            self.disconnected.lock().unwrap().push(conn_id.to_string());
+        }
+        async fn find_loop_connection(&self, conversation_id: i32) -> Option<String> {
+            self.conn_for.get(&conversation_id).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_active_reviews_kills_live_reviewer_agent() {
+        use crate::loop_engine::transitions::{try_claim_iteration, IterationClaim};
+        let h = setup().await;
+        let task = add_task(&h, "T").await;
+
+        // A running reviewer iteration backed by conversation 7777.
+        let claimed = try_claim_iteration(
+            &h.db.conn,
+            IterationClaim {
+                space_id: h.space_id,
+                issue_id: h.issue_id,
+                stage: Stage::Review,
+                target_artifact_id: Some(task),
+                slot_no: Some(0),
+                capability_token: "tok-review".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("claimed review iteration");
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::Status,
+                Expr::value(IterationStatus::Running.to_value()),
+            )
+            .col_expr(loop_iteration::Column::ConversationId, Expr::value(7777))
+            .filter(loop_iteration::Column::Id.eq(claimed.id))
+            .exec(&h.db.conn)
+            .await
+            .unwrap();
+        let running = loop_iteration::Entity::find_by_id(claimed.id)
+            .one(&h.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let spawner = RecordingSpawner {
+            conn_for: std::collections::HashMap::from([(7777, "conn-7777".to_string())]),
+            disconnected: std::sync::Mutex::new(Vec::new()),
+        };
+        cancel_active_reviews(&h.db, &spawner, &[running])
+            .await
+            .unwrap();
+
+        // The reviewer iteration is voided AND its live agent process reaped.
+        let row = loop_iteration::Entity::find_by_id(claimed.id)
+            .one(&h.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, IterationStatus::Cancelled);
+        assert_eq!(
+            *spawner.disconnected.lock().unwrap(),
+            vec!["conn-7777".to_string()],
+            "the cancelled reviewer's live agent is disconnected"
+        );
     }
 }

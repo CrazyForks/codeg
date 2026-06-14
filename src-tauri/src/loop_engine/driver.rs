@@ -8,10 +8,11 @@
 //! concurrency authority; this loop is just the scheduler that turns DAG state
 //! into dispatch calls.
 //!
-//! M2.1 scope is the read pipeline only: triage → refine → design → plan. Once
-//! the plan stage has produced tasks (which land `pending`, awaiting implement)
-//! the frontier is empty and the driver idles — implement / review / finalize
-//! arrive in M2.2.
+//! The driver runs the full pipeline: the read stages (triage → refine → design
+//! → plan) compute their frontier here in [`ready_nodes`]; once the plan stage has
+//! produced `pending` tasks the read frontier empties and the write pipeline
+//! (implement → verify → review → finalize, in [`crate::loop_engine::gates`])
+//! takes over for each task. Both are dispatched from [`tick_once`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -126,7 +127,7 @@ fn node_attempt(dag: &LoopDagView, id: i32) -> i32 {
 /// its output kind is absent, and the driver waits (empty frontier) while a
 /// stage's outputs exist but aren't all `done`. Routes shorten the pipeline:
 /// `full` = refine→design→plan, `skip_design` = refine→plan, `direct` = plan.
-/// Once tasks exist the frontier is empty (M2.1 stops before implement).
+/// Once tasks exist the read frontier is empty — the write pipeline takes over.
 pub(crate) fn ready_nodes(dag: &LoopDagView, route: IssueRoute) -> Vec<FrontierItem> {
     let Some(root) = root_artifact_id(dag) else {
         return Vec::new();
@@ -179,7 +180,7 @@ pub(crate) fn ready_nodes(dag: &LoopDagView, route: IssueRoute) -> Vec<FrontierI
         return one(Stage::Plan, target);
     }
 
-    // 4. Tasks exist → M2.1 stops here (implement lands in M2.2).
+    // 4. Tasks exist → read frontier done; the write pipeline (gates) drives them.
     Vec::new()
 }
 
@@ -788,6 +789,9 @@ mod tests {
             Ok(())
         }
         async fn disconnect_loop_agent(&self, _conn_id: &str) {}
+        async fn find_loop_connection(&self, _conversation_id: i32) -> Option<String> {
+            None
+        }
     }
 
     /// Liveness oracle stub: every conversation reports the same fixed state, so
@@ -1481,7 +1485,7 @@ mod tests {
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::Full)[0].stage, Stage::Plan);
 
-        // Tasks exist → idle (M2.1 stops before implement).
+        // Tasks exist → read frontier empty (the write pipeline drives them).
         let dag = LoopDagView {
             artifacts: vec![
                 root.clone(),
