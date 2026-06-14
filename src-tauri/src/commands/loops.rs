@@ -522,6 +522,14 @@ pub async fn delete_loop_memory_core(
     Ok(())
 }
 
+/// §2.10b engine health: DB-authoritative live counts + this process's
+/// since-boot counters, for the workbench badge and ops.
+pub async fn get_loop_engine_health_core(
+    engine: &Arc<LoopEngine>,
+) -> Result<crate::loop_engine::health::LoopEngineHealth, AppCommandError> {
+    Ok(engine.engine_health().await?)
+}
+
 // ─── Tauri command wrappers (desktop) ──────────────────────────────────────
 
 #[cfg(feature = "tauri-runtime")]
@@ -649,6 +657,14 @@ pub async fn trigger_loop_issue(
     id: i32,
 ) -> Result<(), AppCommandError> {
     trigger_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_loop_engine_health(
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+) -> Result<crate::loop_engine::health::LoopEngineHealth, AppCommandError> {
+    get_loop_engine_health_core(engine.inner()).await
 }
 
 #[cfg(feature = "tauri-runtime")]

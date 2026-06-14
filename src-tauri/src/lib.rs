@@ -1057,6 +1057,7 @@ mod tauri_app {
                 loops_commands::approve_loop_design,
                 loops_commands::reject_loop_design,
                 loops_commands::get_loop_dag,
+                loops_commands::get_loop_engine_health,
                 loops_commands::list_loop_artifacts,
                 loops_commands::get_loop_artifact,
                 loops_commands::list_loop_iterations,

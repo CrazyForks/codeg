@@ -15,7 +15,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect};
 use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::task::AbortHandle;
 
@@ -34,7 +34,9 @@ pub mod dispatch;
 pub mod driver;
 pub mod error;
 pub mod gates;
+pub mod health;
 pub mod ingest;
+pub mod metrics;
 pub mod questions;
 pub mod recovery;
 pub mod transitions;
@@ -66,6 +68,8 @@ pub struct LoopEngine {
     /// branch ref and working tree). Keyed by repo path; entries are created on
     /// demand and never removed (bounded by the number of distinct repos).
     merge_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Process-since-boot counters surfaced by the health endpoint (§2.10b).
+    metrics: Arc<metrics::EngineMetrics>,
 }
 
 impl LoopEngine {
@@ -82,6 +86,7 @@ impl LoopEngine {
             emitter,
             drivers: Mutex::new(HashMap::new()),
             merge_locks: Mutex::new(HashMap::new()),
+            metrics: Arc::new(metrics::EngineMetrics::default()),
         })
     }
 
@@ -232,6 +237,7 @@ impl LoopEngine {
     /// promptly instead of waiting for the next per-issue heartbeat. Idempotent
     /// (settles are CAS).
     pub(crate) async fn reconcile_all_inflight(self: &Arc<Self>) {
+        metrics::EngineMetrics::inc(&self.metrics.lag_sweep_total);
         let issue_ids = match loop_iteration::Entity::find()
             .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
             .select_only()
@@ -255,6 +261,35 @@ impl LoopEngine {
                 tracing::warn!(issue_id, error = %e, "lag sweep: reconcile failed");
             }
         }
+    }
+
+    /// Live engine health (§2.10b): DB-authoritative issue/iteration counts, the
+    /// in-process driver-registry size, and this process's since-boot counters.
+    pub async fn engine_health(&self) -> Result<health::LoopEngineHealth, LoopError> {
+        let conn = &self.db.conn;
+        let running_issues = loop_issue::Entity::find()
+            .filter(loop_issue::Column::Status.eq(IssueStatus::Running))
+            .count(conn)
+            .await? as u64;
+        let in_flight_iterations = loop_iteration::Entity::find()
+            .filter(
+                loop_iteration::Column::Status
+                    .is_in([IterationStatus::Queued, IterationStatus::Running]),
+            )
+            .count(conn)
+            .await? as u64;
+        let pending_token_iterations = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::TokensPending.eq(true))
+            .count(conn)
+            .await? as u64;
+        let active_drivers = self.drivers.lock().await.len() as u64;
+        Ok(health::LoopEngineHealth {
+            running_issues,
+            in_flight_iterations,
+            pending_token_iterations,
+            active_drivers,
+            metrics: self.metrics.snapshot(),
+        })
     }
 
     /// Subscribe to the in-process event bus synchronously and return the
@@ -355,6 +390,7 @@ impl LoopEngine {
         if let Err(e) = self.settle_iteration(iter.id).await {
             tracing::warn!(iteration_id = iter.id, error = %e, "settle iteration failed");
         } else {
+            metrics::EngineMetrics::inc(&self.metrics.settle_events_total);
             tracing::debug!(
                 iteration_id = iter.id,
                 issue_id = iter.issue_id,
@@ -530,5 +566,53 @@ mod tests {
             !handle.abort.is_finished(),
             "finished handle replaced by a live driver"
         );
+    }
+
+    #[tokio::test]
+    async fn engine_health_reports_live_counts() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/loop-health").await;
+        let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &db.conn,
+            space.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        cas_issue_status(&db.conn, issue.row.id, IssueStatus::Pending, IssueStatus::Running)
+            .await
+            .unwrap();
+        // One queued iteration → in-flight count of 1.
+        crate::loop_engine::transitions::try_claim_iteration(
+            &db.conn,
+            crate::loop_engine::transitions::IterationClaim {
+                space_id: space.id,
+                issue_id: issue.row.id,
+                stage: crate::db::entities::loop_iteration::Stage::Triage,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "t".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let engine = LoopEngine::new(
+            db,
+            ConnectionManager::new(),
+            std::path::PathBuf::from("/tmp/loop-health-data"),
+            EventEmitter::Noop,
+        );
+        let health = engine.engine_health().await.unwrap();
+        assert_eq!(health.running_issues, 1);
+        assert_eq!(health.in_flight_iterations, 1);
+        assert_eq!(health.pending_token_iterations, 0);
+        // No driver was started in this test, so the registry is empty.
+        assert_eq!(health.active_drivers, 0);
     }
 }

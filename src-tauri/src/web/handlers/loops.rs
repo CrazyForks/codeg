@@ -35,6 +35,14 @@ pub async fn list_loop_spaces(
     Ok(Json(core::list_loop_spaces_core(&state.db.conn).await?))
 }
 
+pub async fn get_loop_engine_health(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<crate::loop_engine::health::LoopEngineHealth>, AppCommandError> {
+    Ok(Json(
+        core::get_loop_engine_health_core(&state.loop_engine).await?,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSpaceParams {

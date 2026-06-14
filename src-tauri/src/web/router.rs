@@ -88,6 +88,10 @@ pub fn build_router(
         .route("/reject_loop_design", post(handlers::loops::reject_loop_design))
         .route("/get_loop_dag", post(handlers::loops::get_loop_dag))
         .route(
+            "/get_loop_engine_health",
+            post(handlers::loops::get_loop_engine_health),
+        )
+        .route(
             "/list_loop_artifacts",
             post(handlers::loops::list_loop_artifacts),
         )
