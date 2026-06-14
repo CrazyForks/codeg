@@ -117,6 +117,17 @@ pub struct SettleOutcome {
     pub made_progress: bool,
 }
 
+/// How a settle resolves the iteration's terminal status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleResolution {
+    /// The agent turn completed normally (incl. an empty turn). → `Succeeded`.
+    Completed,
+    /// The backing connection died with no completed turn (reconcile `Missing`).
+    /// → `Failed` + a no-progress signature so redispatch stays bounded by
+    /// `max_attempts`. A do-nothing orphan must never be faked as success.
+    Abandoned,
+}
+
 /// Abstraction over the `ConnectionManager` calls dispatch makes, so the
 /// seven-step sequence is testable without spawning a real agent. Production
 /// wires this to [`ConnectionManager`]; tests use a stub. Runtime-env assembly
@@ -443,6 +454,19 @@ pub async fn settle_iteration(
     emitter: &EventEmitter,
     iteration_id: i32,
 ) -> Result<SettleOutcome, LoopError> {
+    settle_iteration_as(db, emitter, iteration_id, SettleResolution::Completed).await
+}
+
+/// Settle with an explicit terminal resolution. `Completed` succeeds the lease
+/// (the normal turn-complete path); `Abandoned` fails it (reconcile of a dead
+/// connection with no completed turn) and records a no-progress signature so
+/// redispatch stays bounded by `max_attempts`.
+pub async fn settle_iteration_as(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    iteration_id: i32,
+    resolution: SettleResolution,
+) -> Result<SettleOutcome, LoopError> {
     let conn = &db.conn;
     let iter = iteration::get_iteration(conn, iteration_id)
         .await?
@@ -486,24 +510,32 @@ pub async fn settle_iteration(
         .map(|a| a.id)
         .collect();
 
-    // The agent run completed → succeed the lease (idempotent CAS).
-    cas_iteration_status(
-        conn,
-        iteration_id,
-        IterationStatus::Running,
-        IterationStatus::Succeeded,
-    )
-    .await?;
+    // Settle the lease (idempotent CAS). A normal completion succeeds; an
+    // abandoned orphan (dead connection, no completed turn) fails — it must never
+    // be faked as success.
+    let terminal = match resolution {
+        SettleResolution::Completed => IterationStatus::Succeeded,
+        SettleResolution::Abandoned => IterationStatus::Failed,
+    };
+    cas_iteration_status(conn, iteration_id, IterationStatus::Running, terminal).await?;
 
     let made_progress = !produced_artifact_ids.is_empty();
-    // Implement measures progress by the worktree diff (the agent submits no
-    // artifact), so its rework counter is owned by the gates checkpoint, not by
-    // this artifact-count heuristic — skip the bump for it here.
-    if !made_progress && iter.stage != Stage::Implement {
+    let abandoned = resolution == SettleResolution::Abandoned;
+    // Bump the target node's rework counter + record a failure signature when the
+    // run made no progress, or was abandoned (dead connection) — so redispatch is
+    // bounded by the breaker. Implement measures progress by the worktree diff, so
+    // its counter is owned by the gates checkpoint, not this artifact-count
+    // heuristic — skip the no-progress bump for it, but still bump on abandon
+    // (no checkpoint runs on a dead connection, so nothing else would bound it).
+    if abandoned || (!made_progress && iter.stage != Stage::Implement) {
         if let Some(target) = iter.target_artifact_id {
             // No output → bump the node rework counter + record a failure
-            // signature for the no-progress breaker (enforced in M2.2).
-            let sig = format!("no_artifacts:{}", iter.stage.to_value());
+            // signature for the no-progress breaker.
+            let sig = if abandoned {
+                format!("abandoned:{}", iter.stage.to_value())
+            } else {
+                format!("no_artifacts:{}", iter.stage.to_value())
+            };
             loop_artifact::Entity::update_many()
                 .col_expr(
                     loop_artifact::Column::Attempt,

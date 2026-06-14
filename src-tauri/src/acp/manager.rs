@@ -146,6 +146,20 @@ async fn wait_for_session_started(
     (outcome, start.elapsed())
 }
 
+/// Liveness of the agent turn backing a loop iteration's conversation. Used by
+/// the driver's reconcile to settle finished-but-unsettled iterations without
+/// disturbing genuinely in-flight ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnLiveness {
+    /// No live connection bound to this conversation (process gone / never bound).
+    Missing,
+    /// Connection alive but no turn in flight — the turn finished (its settle
+    /// event may have been dropped) and the agent is idle.
+    Idle,
+    /// A turn is actively in flight (the agent is working).
+    InFlight,
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Per-(agent, working_dir, session_id) async mutex. Held across the
@@ -2087,6 +2101,26 @@ impl ConnectionManager {
             }
         }
         None
+    }
+
+    /// Three-state liveness of the connection bound to `conversation_id`. The
+    /// driver's reconcile uses this to settle a finished-but-unsettled iteration
+    /// (its `TurnComplete` event was dropped/raced) without disturbing one whose
+    /// turn is genuinely in flight. Mirrors `find_connection_by_conversation_id`'s
+    /// lookup; the `read().await` avoids the `try_read`-skip false negative.
+    pub async fn connection_turn_state(&self, conversation_id: i32) -> TurnLiveness {
+        let connections = self.connections.lock().await;
+        for (_id, conn) in connections.iter() {
+            let state = conn.state.read().await;
+            if state.conversation_id == Some(conversation_id) {
+                return if state.turn_in_flight {
+                    TurnLiveness::InFlight
+                } else {
+                    TurnLiveness::Idle
+                };
+            }
+        }
+        TurnLiveness::Missing
     }
 
     /// The in-flight user prompt for `conversation_id` and the instant its turn

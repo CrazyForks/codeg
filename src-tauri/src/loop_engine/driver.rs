@@ -16,11 +16,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
-use crate::acp::manager::ConnectionManager;
+use crate::acp::manager::{ConnectionManager, TurnLiveness};
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssueRoute, IssueStatus};
@@ -34,12 +35,28 @@ use crate::web::event_bridge::EventEmitter;
 
 use crate::loop_engine::config_resolver::effective_config;
 use crate::loop_engine::dispatch::{
-    dispatch_iteration, emit_changed, settle_iteration, DispatchInput, LoopAgentSpawner,
+    dispatch_iteration, emit_changed, settle_iteration, settle_iteration_as, DispatchInput,
+    LoopAgentSpawner, SettleResolution,
 };
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::gates;
 use crate::loop_engine::transitions::cas_issue_status;
 use crate::loop_engine::LoopEngine;
+
+/// Liveness oracle for the reconcile backstop — implemented by `ConnectionManager`
+/// in prod, stubbed in tests. Mirrors the `LoopAgentSpawner` seam so reconcile's
+/// three-state handling is unit-testable without live ACP connections.
+#[async_trait]
+pub(crate) trait IterationLiveness {
+    async fn turn_state(&self, conversation_id: i32) -> TurnLiveness;
+}
+
+#[async_trait]
+impl IterationLiveness for ConnectionManager {
+    async fn turn_state(&self, conversation_id: i32) -> TurnLiveness {
+        self.connection_turn_state(conversation_id).await
+    }
+}
 
 /// Result of a single tick.
 #[derive(Debug, PartialEq, Eq)]
@@ -249,16 +266,26 @@ async fn ensure_design_gate_card(
 }
 
 /// Liveness backstop (DB-authoritative): settle any of this issue's `running`
-/// iterations whose backing agent connection no longer exists. The completion
-/// watcher settles on `TurnComplete`, but that single in-process event can be
-/// missed or race the connection teardown — and the driver is event-driven with
-/// no other periodic settle — so without this an iteration (e.g. triage) can
-/// park at `running` forever. Idempotent: `settle_iteration` is a CAS, so a
-/// double settle (event + reconcile) is a no-op the second time.
-pub(crate) async fn reconcile_orphaned_iterations(
+/// iterations whose turn is no longer actually in flight. The completion watcher
+/// settles on `TurnComplete`, but that single in-process event can be dropped
+/// (broadcast lag) or race the connection teardown — and a finished loop
+/// connection stays *alive and idle* (it is never disconnected on turn complete),
+/// so a check keyed on connection *existence* alone would never settle it. We
+/// therefore inspect the turn's three-state liveness:
+///
+/// - `Missing`  (no live connection) → abandon: settle `Failed` (the run died
+///   with no completed turn; never faked as success). Bounded by `max_attempts`.
+/// - `Idle`     (connection alive, no turn in flight) → the turn finished but its
+///   settle event was missed → settle `Succeeded` (the normal completion result).
+/// - `InFlight` (a turn is genuinely running) → leave it; killing live work is
+///   the operator's call (surfaced via opt-in stall alerts), never a timer here.
+///
+/// Idempotent: `settle_iteration`/`settle_iteration_as` are CAS, so a double
+/// settle (event + reconcile) is a no-op the second time.
+pub(crate) async fn reconcile_orphaned_iterations<L: IterationLiveness>(
     db: &AppDatabase,
     emitter: &EventEmitter,
-    manager: &ConnectionManager,
+    liveness: &L,
     issue_id: i32,
 ) -> Result<(), LoopError> {
     let running = loop_iteration::Entity::find()
@@ -270,13 +297,27 @@ pub(crate) async fn reconcile_orphaned_iterations(
         let Some(cid) = it.conversation_id else {
             continue;
         };
-        if manager.find_connection_by_conversation_id(cid).await.is_none() {
-            eprintln!(
-                "[loop][reconcile] settling orphaned iteration {} (issue {issue_id}, conv {cid}): no live connection",
-                it.id
-            );
-            if let Err(e) = settle_iteration(db, emitter, it.id).await {
-                eprintln!("[loop][reconcile] settle {} failed: {e}", it.id);
+        match liveness.turn_state(cid).await {
+            TurnLiveness::InFlight => { /* genuinely working — do not disturb */ }
+            TurnLiveness::Idle => {
+                eprintln!(
+                    "[loop][reconcile] settling idle-but-unsettled iteration {} (issue {issue_id}, conv {cid}): turn finished, event missed",
+                    it.id
+                );
+                if let Err(e) = settle_iteration(db, emitter, it.id).await {
+                    eprintln!("[loop][reconcile] settle {} failed: {e}", it.id);
+                }
+            }
+            TurnLiveness::Missing => {
+                eprintln!(
+                    "[loop][reconcile] abandoning orphaned iteration {} (issue {issue_id}, conv {cid}): no live connection",
+                    it.id
+                );
+                if let Err(e) =
+                    settle_iteration_as(db, emitter, it.id, SettleResolution::Abandoned).await
+                {
+                    eprintln!("[loop][reconcile] abandon {} failed: {e}", it.id);
+                }
             }
         }
     }
@@ -665,6 +706,17 @@ mod tests {
         async fn disconnect_loop_agent(&self, _conn_id: &str) {}
     }
 
+    /// Liveness oracle stub: every conversation reports the same fixed state, so
+    /// reconcile's three branches are testable without live ACP connections.
+    struct StubLiveness(TurnLiveness);
+
+    #[async_trait]
+    impl IterationLiveness for StubLiveness {
+        async fn turn_state(&self, _conversation_id: i32) -> TurnLiveness {
+            self.0
+        }
+    }
+
     async fn setup() -> (AppDatabase, PathBuf, i32) {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/loop-driver").await;
@@ -710,13 +762,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reconcile_settles_running_iteration_without_live_connection() {
-        let (db, data_dir, issue_id) = setup().await;
+    /// Drive one tick to dispatch triage, returning its single running iteration.
+    async fn dispatch_one_running_triage(
+        db: &AppDatabase,
+        data_dir: &Path,
+        issue_id: i32,
+    ) -> loop_iteration::Model {
         let spawner = StubSpawner;
-        let mgr = ConnectionManager::new();
-        // One tick dispatches triage → a running iteration with a conversation_id.
-        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(db, data_dir, &spawner, &EventEmitter::Noop, issue_id)
             .await
             .unwrap();
         let running = loop_iteration::Entity::find()
@@ -726,16 +779,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(running.len(), 1, "triage dispatched and running");
-        // No live connection exists for it → reconcile settles the orphan.
-        reconcile_orphaned_iterations(&db, &EventEmitter::Noop, &mgr, issue_id)
-            .await
-            .unwrap();
-        let it = loop_iteration::Entity::find_by_id(running[0].id)
+        running.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_abandons_iteration_with_missing_connection() {
+        let (db, data_dir, issue_id) = setup().await;
+        let it = dispatch_one_running_triage(&db, &data_dir, issue_id).await;
+        // No live connection (empty manager / Missing) → abandon → Failed, never
+        // faked as Succeeded.
+        reconcile_orphaned_iterations(
+            &db,
+            &EventEmitter::Noop,
+            &StubLiveness(TurnLiveness::Missing),
+            issue_id,
+        )
+        .await
+        .unwrap();
+        let row = loop_iteration::Entity::find_by_id(it.id)
             .one(&db.conn)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(it.status, IterationStatus::Succeeded);
+        assert_eq!(row.status, IterationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_settles_idle_connection_as_succeeded() {
+        let (db, data_dir, issue_id) = setup().await;
+        let it = dispatch_one_running_triage(&db, &data_dir, issue_id).await;
+        // Connection alive but no turn in flight → the turn finished, its settle
+        // event was missed → reconcile completes it as Succeeded.
+        reconcile_orphaned_iterations(
+            &db,
+            &EventEmitter::Noop,
+            &StubLiveness(TurnLiveness::Idle),
+            issue_id,
+        )
+        .await
+        .unwrap();
+        let row = loop_iteration::Entity::find_by_id(it.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, IterationStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_inflight_iteration_running() {
+        let (db, data_dir, issue_id) = setup().await;
+        let it = dispatch_one_running_triage(&db, &data_dir, issue_id).await;
+        // A turn is genuinely in flight → reconcile must not disturb it.
+        reconcile_orphaned_iterations(
+            &db,
+            &EventEmitter::Noop,
+            &StubLiveness(TurnLiveness::InFlight),
+            issue_id,
+        )
+        .await
+        .unwrap();
+        let row = loop_iteration::Entity::find_by_id(it.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, IterationStatus::Running);
     }
 
     #[tokio::test]
