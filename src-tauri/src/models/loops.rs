@@ -20,11 +20,13 @@ fn config_version() -> u32 {
     1
 }
 
-/// One reviewer in a task's review round: which agent runs it, plus the same
-/// startup mode/config knobs the regular sub-agent settings expose. The number
-/// of configured reviewers is the number of concurrent reviews run per task.
+/// An agent plus the same startup mode/config knobs the regular sub-agent
+/// settings expose. Used both for each per-stage agent override (the values of
+/// [`IssueConfig::agents`]) and for each reviewer in a task's review round (the
+/// number of configured reviewers = concurrent reviews run per task).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReviewerSpec {
+#[serde(from = "AgentSpecWire")]
+pub struct AgentSpec {
     pub agent: AgentType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_id: Option<String>,
@@ -32,14 +34,58 @@ pub struct ReviewerSpec {
     pub config_values: BTreeMap<String, String>,
 }
 
+/// Backward-compatible wire form. An `agents` map value was historically a bare
+/// `AgentType` string; new values are full objects. Both parse (reviewers were
+/// always objects, so they take the `Full` arm). Deserialize-only — `AgentSpec`
+/// always serializes as an object (empty mode/config skipped), so the frontend
+/// only ever sees the object form; the bare arm exists solely to read old rows.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentSpecWire {
+    Bare(AgentType),
+    Full {
+        agent: AgentType,
+        #[serde(default)]
+        mode_id: Option<String>,
+        #[serde(default)]
+        config_values: BTreeMap<String, String>,
+    },
+}
+
+impl From<AgentSpecWire> for AgentSpec {
+    fn from(w: AgentSpecWire) -> Self {
+        match w {
+            AgentSpecWire::Bare(agent) => AgentSpec {
+                agent,
+                mode_id: None,
+                config_values: BTreeMap::new(),
+            },
+            AgentSpecWire::Full {
+                agent,
+                mode_id,
+                config_values,
+            } => AgentSpec {
+                agent,
+                mode_id,
+                config_values,
+            },
+        }
+    }
+}
+
+/// Historical name retained as an alias to avoid churn at reviewer call sites.
+pub type ReviewerSpec = AgentSpec;
+
 /// Per-issue Loop Contract knobs (stored JSON-encoded in `loop_issue.config`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueConfig {
     #[serde(default = "config_version")]
     pub v: u32,
-    /// Agent per stage; the `"default"` key is the fallback. Stage-specific keys
-    /// (e.g. `"review"`) override it.
-    pub agents: BTreeMap<String, AgentType>,
+    /// Agent (with optional startup mode/config) per stage; the `"default"` key
+    /// is the fallback. Stage-specific keys (e.g. `"implement"`) override it.
+    /// Legacy rows whose values are bare `AgentType` strings still parse (see
+    /// [`AgentSpec`]).
+    pub agents: BTreeMap<String, AgentSpec>,
     /// Deterministic verification commands, run in the worktree after implement.
     pub validation_commands: Vec<String>,
     /// Concurrent reviewer agents per task.
@@ -74,7 +120,14 @@ pub struct IssueConfig {
 impl Default for IssueConfig {
     fn default() -> Self {
         let mut agents = BTreeMap::new();
-        agents.insert("default".to_string(), AgentType::ClaudeCode);
+        agents.insert(
+            "default".to_string(),
+            AgentSpec {
+                agent: AgentType::ClaudeCode,
+                mode_id: None,
+                config_values: BTreeMap::new(),
+            },
+        );
         Self {
             v: 1,
             agents,
@@ -94,27 +147,26 @@ impl Default for IssueConfig {
 
 impl IssueConfig {
     /// The effective reviewer list: the explicit `reviewers` when non-empty,
-    /// else `reviewer_count` copies of the resolved review agent (a `"review"`
-    /// stage override, then `"default"`, then Claude Code) with no extra
-    /// mode/config. Keeps pre-`reviewers` issues working unchanged.
+    /// else `reviewer_count` copies of the resolved review agent spec (a
+    /// `"review"` stage override, then `"default"`, then Claude Code — carrying
+    /// that spec's own mode/config). Keeps pre-`reviewers` issues working
+    /// unchanged.
     pub fn effective_reviewers(&self) -> Vec<ReviewerSpec> {
         if !self.reviewers.is_empty() {
             return self.reviewers.clone();
         }
-        let agent = self
+        let fallback = self
             .agents
             .get("review")
             .or_else(|| self.agents.get("default"))
-            .copied()
-            .unwrap_or(AgentType::ClaudeCode);
-        let n = self.reviewer_count.max(1) as usize;
-        (0..n)
-            .map(|_| ReviewerSpec {
-                agent,
+            .cloned()
+            .unwrap_or(AgentSpec {
+                agent: AgentType::ClaudeCode,
                 mode_id: None,
                 config_values: BTreeMap::new(),
-            })
-            .collect()
+            });
+        let n = self.reviewer_count.max(1) as usize;
+        (0..n).map(|_| fallback.clone()).collect()
     }
 }
 
@@ -298,6 +350,15 @@ pub const LOOP_CHANGED_EVENT: &str = "loop://changed";
 mod tests {
     use super::*;
 
+    /// A per-stage agent spec with no mode/config override.
+    fn bare(agent: AgentType) -> AgentSpec {
+        AgentSpec {
+            agent,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn effective_reviewers_falls_back_to_count() {
         let cfg = IssueConfig {
@@ -315,7 +376,7 @@ mod tests {
     #[test]
     fn effective_reviewers_uses_review_stage_agent_for_fallback() {
         let mut agents = BTreeMap::new();
-        agents.insert("review".to_string(), AgentType::Codex);
+        agents.insert("review".to_string(), bare(AgentType::Codex));
         let cfg = IssueConfig {
             agents,
             reviewer_count: 1,
@@ -351,5 +412,40 @@ mod tests {
         let cfg: IssueConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.reviewers.is_empty());
         assert_eq!(cfg.effective_reviewers().len(), 3);
+    }
+
+    #[test]
+    fn agent_spec_parses_legacy_bare_string() {
+        // Pre-upgrade config: `agents` values are bare `AgentType` strings.
+        let json = r#"{"v":1,"agents":{"default":"codex","design":"claude_code"},
+            "validation_commands":[],"reviewer_count":1,"review_pass_rule":"unanimous",
+            "max_attempts":6,"auto_merge":false,"force_route":null,
+            "iteration_timeout_secs":null,"token_budget_per_turn":null}"#;
+        let cfg: IssueConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.agents["default"].agent, AgentType::Codex);
+        assert!(cfg.agents["default"].mode_id.is_none());
+        assert!(cfg.agents["default"].config_values.is_empty());
+        assert_eq!(cfg.agents["design"].agent, AgentType::ClaudeCode);
+    }
+
+    #[test]
+    fn agent_spec_parses_full_object_and_round_trips() {
+        let mut cv = BTreeMap::new();
+        cv.insert("reasoning".to_string(), "high".to_string());
+        let spec = AgentSpec {
+            agent: AgentType::Gemini,
+            mode_id: Some("plan".into()),
+            config_values: cv,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: AgentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+        // Empty extras serialize to the minimal object form.
+        let bare = AgentSpec {
+            agent: AgentType::Codex,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"agent":"codex"}"#);
     }
 }

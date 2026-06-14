@@ -36,7 +36,7 @@ use crate::models::loops::{IssueConfig, LoopArtifactRow, LoopDagView, ReviewerSp
 use crate::web::event_bridge::EventEmitter;
 
 use crate::loop_engine::dispatch::{dispatch_iteration, DispatchInput, LoopAgentSpawner};
-use crate::loop_engine::driver::resolve_agent;
+use crate::loop_engine::driver::resolve_agent_spec;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
     cas_artifact_status, cas_issue_status, cas_iteration_status, release_task_gate,
@@ -356,6 +356,7 @@ async fn dispatch_implement(
     task_id: i32,
     attempt: i32,
 ) -> Result<bool, LoopError> {
+    let spec = resolve_agent_spec(config, Stage::Implement);
     let handle = dispatch_iteration(
         db,
         data_dir,
@@ -368,9 +369,9 @@ async fn dispatch_implement(
             target_artifact_id: Some(task_id),
             slot_no: None,
             attempt,
-            agent_type: resolve_agent(config, Stage::Implement),
-            mode_id: None,
-            config_values: Default::default(),
+            agent_type: spec.agent,
+            mode_id: spec.mode_id,
+            config_values: spec.config_values,
             worktree_folder_id,
         },
     )
@@ -898,6 +899,7 @@ async fn dispatch_finalize(
     config: &IssueConfig,
     worktree_folder_id: i32,
 ) -> Result<bool, LoopError> {
+    let spec = resolve_agent_spec(config, Stage::Finalize);
     let handle = dispatch_iteration(
         db,
         data_dir,
@@ -910,9 +912,9 @@ async fn dispatch_finalize(
             target_artifact_id: None,
             slot_no: None,
             attempt: 0,
-            agent_type: resolve_agent(config, Stage::Finalize),
-            mode_id: None,
-            config_values: Default::default(),
+            agent_type: spec.agent,
+            mode_id: spec.mode_id,
+            config_values: spec.config_values,
             worktree_folder_id,
         },
     )

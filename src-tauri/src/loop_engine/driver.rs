@@ -32,7 +32,7 @@ use crate::db::entities::loop_link::LinkKind;
 use crate::db::service::loop_service::{artifact, inbox, link};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
-use crate::models::loops::{IssueConfig, LoopArtifactRow, LoopDagView};
+use crate::models::loops::{AgentSpec, IssueConfig, LoopArtifactRow, LoopDagView};
 use crate::web::event_bridge::EventEmitter;
 
 use crate::loop_engine::config_resolver::effective_config;
@@ -184,16 +184,28 @@ pub(crate) fn ready_nodes(dag: &LoopDagView, route: IssueRoute) -> Vec<FrontierI
     Vec::new()
 }
 
-/// Resolve the agent for a stage from the issue's Loop Contract: a stage-keyed
-/// override (e.g. `"review"`) falls back to `"default"`, then to Claude Code.
-pub(crate) fn resolve_agent(config: &IssueConfig, stage: Stage) -> AgentType {
+/// Resolve the full agent spec (agent + startup mode + config) for a stage from
+/// the issue's Loop Contract: a stage-keyed override (e.g. `"implement"`) falls
+/// back to `"default"`, then to Claude Code with no extra mode/config.
+pub(crate) fn resolve_agent_spec(config: &IssueConfig, stage: Stage) -> AgentSpec {
     let key = stage.to_value();
     config
         .agents
         .get(&key)
         .or_else(|| config.agents.get("default"))
-        .copied()
-        .unwrap_or(AgentType::ClaudeCode)
+        .cloned()
+        .unwrap_or(AgentSpec {
+            agent: AgentType::ClaudeCode,
+            mode_id: None,
+            config_values: Default::default(),
+        })
+}
+
+/// Just the agent type for a stage (e.g. to route a question to the right
+/// agent). For dispatch, prefer [`resolve_agent_spec`] so the per-stage mode/
+/// config overrides are carried through.
+pub(crate) fn resolve_agent(config: &IssueConfig, stage: Stage) -> AgentType {
+    resolve_agent_spec(config, stage).agent
 }
 
 /// Does this issue already have a triage iteration on record (in ANY state)?
@@ -424,6 +436,7 @@ pub(crate) async fn tick_once(
     // retry afterwards is owned by `recover_undecided_triage`, which bounds it by
     // `max_attempts`.
     if !has_any_triage(conn, issue_id).await? {
+        let spec = resolve_agent_spec(&config, Stage::Triage);
         let dispatched = dispatch_iteration(
             db,
             data_dir,
@@ -436,9 +449,9 @@ pub(crate) async fn tick_once(
                 target_artifact_id: None,
                 slot_no: None,
                 attempt: 0,
-                agent_type: resolve_agent(&config, Stage::Triage),
-                mode_id: None,
-                config_values: Default::default(),
+                agent_type: spec.agent,
+                mode_id: spec.mode_id,
+                config_values: spec.config_values,
                 worktree_folder_id,
             },
         )
@@ -484,6 +497,7 @@ pub(crate) async fn tick_once(
     if !frontier.is_empty() {
         let mut dispatched_any = false;
         for item in frontier {
+            let spec = resolve_agent_spec(&config, item.stage);
             let handle = dispatch_iteration(
                 db,
                 data_dir,
@@ -496,9 +510,9 @@ pub(crate) async fn tick_once(
                     target_artifact_id: item.target_artifact_id,
                     slot_no: None,
                     attempt: item.attempt,
-                    agent_type: resolve_agent(&config, item.stage),
-                    mode_id: None,
-                    config_values: Default::default(),
+                    agent_type: spec.agent,
+                    mode_id: spec.mode_id,
+                    config_values: spec.config_values,
                     worktree_folder_id,
                 },
             )
@@ -596,6 +610,7 @@ async fn recover_undecided_triage(
             "[loop][triage] issue {} undecided after {attempts} triage attempt(s); re-dispatching",
             issue.id
         );
+        let spec = resolve_agent_spec(config, Stage::Triage);
         let dispatched = dispatch_iteration(
             db,
             data_dir,
@@ -608,9 +623,9 @@ async fn recover_undecided_triage(
                 target_artifact_id: None,
                 slot_no: None,
                 attempt: attempts,
-                agent_type: resolve_agent(config, Stage::Triage),
-                mode_id: None,
-                config_values: Default::default(),
+                agent_type: spec.agent,
+                mode_id: spec.mode_id,
+                config_values: spec.config_values,
                 worktree_folder_id,
             },
         )
@@ -739,6 +754,29 @@ mod tests {
     use sea_orm::sea_query::Expr;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn resolve_agent_spec_uses_stage_override_with_mode_and_config() {
+        let mut cfg = IssueConfig::default();
+        let mut cv = std::collections::BTreeMap::new();
+        cv.insert("reasoning".to_string(), "high".to_string());
+        cfg.agents.insert(
+            "implement".to_string(),
+            AgentSpec {
+                agent: AgentType::Codex,
+                mode_id: Some("auto".into()),
+                config_values: cv.clone(),
+            },
+        );
+        let spec = resolve_agent_spec(&cfg, Stage::Implement);
+        assert_eq!(spec.agent, AgentType::Codex);
+        assert_eq!(spec.mode_id.as_deref(), Some("auto"));
+        assert_eq!(spec.config_values, cv);
+        // A stage with no override falls back to default (Claude Code, no extras).
+        let plan = resolve_agent_spec(&cfg, Stage::Plan);
+        assert_eq!(plan.agent, AgentType::ClaudeCode);
+        assert!(plan.mode_id.is_none() && plan.config_values.is_empty());
+    }
 
     /// Simulate a human approving the design gate (route=full), so the read
     /// pipeline can proceed past it. The gate's blocking behavior has its own test.
