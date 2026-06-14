@@ -3115,6 +3115,7 @@
       "iterationTimeout": "イテレーションのタイムアウト（秒）",
       "tokenBudgetPerTurn": "ターンごとのトークン予算",
       "tokenBudget": "トークン予算の合計",
+      "tokenBudgetHint": "この課題の累計上限。常に編集できます。",
       "unlimitedPlaceholder": "無制限",
       "stallAlertSecs": "停滞アラート（秒）",
       "stallAlertHint": "既定はオフ。イテレーションがこの秒数を超えて実行されると受信箱に通知するだけで、取り消しはしません。",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "エージェント",
-      "tabReview": "レビュー",
+      "subtabDefault": "デフォルト",
       "tabValidation": "検証",
       "tabLimits": "制限"
     },
@@ -3208,6 +3209,10 @@
       "description": "新しい課題は、カスタム設定を使用しない限りこれを継承します。",
       "save": "既定を保存",
       "resetToDefault": "エンジンの既定にリセット"
+    },
+    "agentConfig": {
+      "useDefault": "デフォルトのエージェントを使用",
+      "useDefaultHint": "このステージはデフォルトのエージェントで実行されます。"
     }
   }
 }

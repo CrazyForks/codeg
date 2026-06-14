@@ -3115,6 +3115,7 @@
       "iterationTimeout": "Iterations-Timeout (s)",
       "tokenBudgetPerTurn": "Token-Budget pro Zug",
       "tokenBudget": "Gesamtes Token-Budget",
+      "tokenBudgetHint": "Gesamtlimit für dieses Issue; immer bearbeitbar.",
       "unlimitedPlaceholder": "Unbegrenzt",
       "stallAlertSecs": "Stillstandswarnung (s)",
       "stallAlertHint": "Standardmäßig aus. Legt eine Posteingangskarte an, wenn eine Iteration so lange läuft – bricht sie aber nie ab.",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "Agenten",
-      "tabReview": "Prüfung",
+      "subtabDefault": "Standard",
       "tabValidation": "Validierung",
       "tabLimits": "Limits"
     },
@@ -3208,6 +3209,10 @@
       "description": "Neue Aufgaben erben sie, sofern sie keine benutzerdefinierte Konfiguration verwenden.",
       "save": "Standards speichern",
       "resetToDefault": "Auf Engine-Standard zurücksetzen"
+    },
+    "agentConfig": {
+      "useDefault": "Standard-Agent verwenden",
+      "useDefaultHint": "Diese Phase verwendet den Standard-Agenten."
     }
   }
 }

@@ -10,7 +10,7 @@ import type { IssueConfig } from "./types"
 export function defaultIssueConfig(): IssueConfig {
   return {
     v: 1,
-    agents: { default: "claude_code" },
+    agents: { default: { agent: "claude_code", config_values: {} } },
     validation_commands: [],
     reviewer_count: 1,
     review_pass_rule: "unanimous",

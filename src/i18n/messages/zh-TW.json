@@ -3115,6 +3115,7 @@
       "iterationTimeout": "單次疊代逾時（秒）",
       "tokenBudgetPerTurn": "每回合 Token 預算",
       "tokenBudget": "總 Token 預算",
+      "tokenBudgetHint": "本議題生命週期可用總量，始終可編輯。",
       "unlimitedPlaceholder": "不限",
       "stallAlertSecs": "停滯提醒（秒）",
       "stallAlertHint": "預設關閉。迭代執行超過此時長時僅在收件匣提醒，絕不取消。",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "智能體",
-      "tabReview": "評審",
+      "subtabDefault": "預設",
       "tabValidation": "驗證",
       "tabLimits": "限制"
     },
@@ -3208,6 +3209,10 @@
       "description": "新議題預設繼承此設定，除非使用自訂設定。",
       "save": "儲存預設",
       "resetToDefault": "重設為引擎預設"
+    },
+    "agentConfig": {
+      "useDefault": "使用預設智能體",
+      "useDefaultHint": "此階段使用預設智能體執行。"
     }
   }
 }

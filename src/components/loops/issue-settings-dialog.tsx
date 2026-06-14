@@ -151,20 +151,28 @@ export function IssueSettingsDialog({
             value={inherit ? inheritedForm : form}
             onChange={setForm}
             disabled={inherit}
+            limitsExtra={
+              // The per-issue total budget lives outside IssueConfig and is
+              // always editable (even when the config inherits the space
+              // default), so it's rendered here rather than gated by the form's
+              // `disabled`. Co-located with the per-turn budget under Limits.
+              <div className="space-y-1.5 border-t pt-3">
+                <Label htmlFor="total-budget">{t("tokenBudget")}</Label>
+                <Input
+                  id="total-budget"
+                  type="number"
+                  min={1}
+                  value={tokenBudget}
+                  onChange={(e) => setTokenBudget(e.target.value)}
+                  placeholder={t("unlimitedPlaceholder")}
+                  className="h-8"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("tokenBudgetHint")}
+                </p>
+              </div>
+            }
           />
-
-          <div className="space-y-1.5">
-            <Label htmlFor="total-budget">{t("tokenBudget")}</Label>
-            <Input
-              id="total-budget"
-              type="number"
-              min={1}
-              value={tokenBudget}
-              onChange={(e) => setTokenBudget(e.target.value)}
-              placeholder={t("unlimitedPlaceholder")}
-              className="h-8"
-            />
-          </div>
         </div>
 
         <DialogFooter>

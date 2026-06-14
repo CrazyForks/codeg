@@ -3115,6 +3115,7 @@
       "iterationTimeout": "Tiempo límite de iteración (s)",
       "tokenBudgetPerTurn": "Presupuesto de tokens por turno",
       "tokenBudget": "Presupuesto total de tokens",
+      "tokenBudgetHint": "Límite total para esta incidencia; siempre editable.",
       "unlimitedPlaceholder": "Sin límite",
       "stallAlertSecs": "Alerta de bloqueo (s)",
       "stallAlertHint": "Desactivado por defecto. Crea una tarjeta en la bandeja cuando una iteración dura este tiempo; nunca la cancela.",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "Agentes",
-      "tabReview": "Revisión",
+      "subtabDefault": "Predeterminado",
       "tabValidation": "Validación",
       "tabLimits": "Límites"
     },
@@ -3208,6 +3209,10 @@
       "description": "Los nuevos problemas la heredan salvo que usen una configuración personalizada.",
       "save": "Guardar valores",
       "resetToDefault": "Restablecer al valor del motor"
+    },
+    "agentConfig": {
+      "useDefault": "Usar agente predeterminado",
+      "useDefaultHint": "Esta etapa ejecuta el agente predeterminado."
     }
   }
 }

@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { Loader2, Plus, X } from "lucide-react"
 
@@ -9,6 +9,7 @@ import { toErrorMessage } from "@/lib/app-error"
 import {
   AGENT_LABELS,
   type AgentOptionsSnapshot,
+  type AgentSpec,
   type AgentType,
   type IssueConfig,
   type LoopIssueRoute,
@@ -41,34 +42,46 @@ export const AGENT_TYPES: AgentType[] = [
   "hermes",
 ]
 
-const STAGES: LoopStage[] = [
+// Stages that run a single agent (one sub-tab each). `review` is special — it
+// runs the configured reviewers list (its own sub-tab) instead of one agent.
+const SINGLE_STAGES: LoopStage[] = [
   "triage",
   "refine",
   "design",
   "plan",
   "implement",
-  "review",
   "finalize",
 ]
 
 // Select can't carry an empty value, so these sentinels stand in for "no value".
 const INHERIT = "__inherit__" // a stage with no per-stage agent override
 const ROUTE_AUTO = "__auto__" // force_route = null (triage decides)
-// Reviewer mode/config "use the agent's own default" (clears the override).
+// Mode/config "use the agent's own default" (clears the override).
 const DEFAULT_SENTINEL = "__codeg_default__"
+
+/** Form-state shape of an {@link AgentSpec}: agent + optional startup mode/config.
+ *  `mode_id` is normalized to `null` (never undefined) for controlled selects. */
+export interface AgentSpecForm {
+  agent: AgentType
+  mode_id: string | null
+  config_values: Record<string, string>
+}
 
 /**
  * Form-state mirror of `IssueConfig`. Numeric fields are kept as strings so a
  * field can be cleared / typed through intermediate values without snapping to
- * a parsed number; `formStateToConfig` serializes on save. Reviewers are kept
- * in their `ReviewerSpec` shape (already structured, no string mirror needed).
- * The per-issue total token budget is NOT here — it lives outside `IssueConfig`,
- * owned by the issue-settings host.
+ * a parsed number; `formStateToConfig` serializes on save. The per-stage agents
+ * (default + each single stage) carry full mode/config; the review stage uses
+ * the structured `reviewers` list. The per-issue total token budget is NOT here
+ * — it lives outside `IssueConfig`, owned by the issue-settings host (rendered
+ * into the Limits tab via `limitsExtra`).
  */
 export interface LoopConfigFormState {
   configVersion: number
-  defaultAgent: AgentType
-  stageAgents: Record<string, AgentType | typeof INHERIT>
+  defaultSpec: AgentSpecForm
+  /** Per single-stage override, or `INHERIT` to follow the default. Keyed by the
+   *  stages in {@link SINGLE_STAGES} (the review stage is not here). */
+  stageSpecs: Record<string, AgentSpecForm | typeof INHERIT>
   validationCommands: string[]
   reviewers: ReviewerSpec[]
   /** Preserved pass-through legacy fallback; used only when `reviewers` is empty. */
@@ -98,14 +111,37 @@ function parseCount(s: string, min: number, fallback: number): number {
   return Number.isFinite(n) ? Math.max(min, Math.floor(n)) : fallback
 }
 
+/** Wire `AgentSpec` → controlled form shape (mode_id normalized to null). */
+function toSpecForm(s: AgentSpec): AgentSpecForm {
+  return {
+    agent: s.agent,
+    mode_id: s.mode_id ?? null,
+    config_values: { ...s.config_values },
+  }
+}
+
+/** Form shape → wire `AgentSpec` (omit mode_id when unset, like the backend). */
+function specFromForm(s: AgentSpecForm): AgentSpec {
+  return {
+    agent: s.agent,
+    ...(s.mode_id ? { mode_id: s.mode_id } : {}),
+    config_values: s.config_values,
+  }
+}
+
 export function configToFormState(c: IssueConfig): LoopConfigFormState {
-  const stageAgents: Record<string, AgentType | typeof INHERIT> = {}
-  for (const s of STAGES) stageAgents[s] = c.agents[s] ?? INHERIT
+  const stageSpecs: Record<string, AgentSpecForm | typeof INHERIT> = {}
+  for (const s of SINGLE_STAGES) {
+    const spec = c.agents[s]
+    stageSpecs[s] = spec ? toSpecForm(spec) : INHERIT
+  }
   const route = c.force_route
   return {
     configVersion: c.v ?? 1,
-    defaultAgent: c.agents.default ?? "claude_code",
-    stageAgents,
+    defaultSpec: toSpecForm(
+      c.agents.default ?? { agent: "claude_code", config_values: {} }
+    ),
+    stageSpecs,
     validationCommands: [...c.validation_commands],
     reviewers: (c.reviewers ?? []).map((r) => ({
       agent: r.agent,
@@ -124,10 +160,12 @@ export function configToFormState(c: IssueConfig): LoopConfigFormState {
 }
 
 export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
-  const agents: Record<string, AgentType> = { default: form.defaultAgent }
-  for (const s of STAGES) {
-    const v = form.stageAgents[s]
-    if (v !== INHERIT) agents[s] = v
+  const agents: Record<string, AgentSpec> = {
+    default: specFromForm(form.defaultSpec),
+  }
+  for (const s of SINGLE_STAGES) {
+    const v = form.stageSpecs[s]
+    if (v !== INHERIT) agents[s] = specFromForm(v)
   }
   const reviewers: ReviewerSpec[] = form.reviewers.map((r) => ({
     agent: r.agent,
@@ -160,19 +198,24 @@ export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
 }
 
 /**
- * Tabbed editor for an `IssueConfig` (per-stage agents, reviewers, validation
- * commands, breakers, merge mode, route override, budgets). Controlled — the
- * host owns the `LoopConfigFormState` and re-seeds it (e.g. on dialog open).
- * Shared by the per-issue settings dialog and the space-defaults dialog.
+ * Tabbed editor for an `IssueConfig`. The "Agents" tab nests sub-tabs for the
+ * default agent, each single-agent stage (with full mode/config, or "use
+ * default"), and the review stage (reviewers list + pass rule). Validation and
+ * Limits follow. Controlled — the host owns the `LoopConfigFormState` and
+ * re-seeds it (e.g. on dialog open). `limitsExtra` lets a host append a field to
+ * the Limits tab (the issue dialog uses it for the per-issue total budget, which
+ * the space-defaults dialog has no concept of). Shared by both dialogs.
  */
 export function LoopConfigForm({
   value,
   onChange,
   disabled,
+  limitsExtra,
 }: {
   value: LoopConfigFormState
   onChange: (next: LoopConfigFormState) => void
   disabled?: boolean
+  limitsExtra?: ReactNode
 }) {
   const t = useTranslations("Loops.issueSettings")
   const tStage = useTranslations("Loops.stage")
@@ -194,108 +237,97 @@ export function LoopConfigForm({
       validationCommands: value.validationCommands.filter((_, j) => j !== i),
     })
 
-  const agentSelect = (
-    val: string,
-    onChangeVal: (v: string) => void,
-    withInherit: boolean
-  ) => (
-    <Select value={val} onValueChange={onChangeVal} disabled={disabled}>
-      <SelectTrigger className="h-8">
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {withInherit && <SelectItem value={INHERIT}>{t("inherit")}</SelectItem>}
-        {AGENT_TYPES.map((a) => (
-          <SelectItem key={a} value={a}>
-            {AGENT_LABELS[a]}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  )
-
   return (
     <Tabs defaultValue="agents" className="flex flex-col">
       <TabsList className="self-start">
         <TabsTrigger value="agents">{tCfg("tabAgents")}</TabsTrigger>
-        <TabsTrigger value="review">{tCfg("tabReview")}</TabsTrigger>
         <TabsTrigger value="validation">{tCfg("tabValidation")}</TabsTrigger>
         <TabsTrigger value="limits">{tCfg("tabLimits")}</TabsTrigger>
       </TabsList>
 
       <div className="mt-3 max-h-[52vh] overflow-y-auto pr-1">
-        {/* Agents */}
-        <TabsContent
-          value="agents"
-          className="space-y-3 data-[state=inactive]:hidden"
-        >
-          <div className="space-y-2">
-            <Label htmlFor="default-agent">{t("defaultAgent")}</Label>
-            <div id="default-agent">
-              {agentSelect(
-                value.defaultAgent,
-                (v) => patch({ defaultAgent: v as AgentType }),
-                false
-              )}
-            </div>
-          </div>
-          <div className="space-y-2">
-            <p className="text-xs font-medium text-muted-foreground">
-              {t("stageAgents")}
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              {STAGES.map((s) => (
-                <div key={s} className="space-y-1">
-                  <span className="text-xs text-muted-foreground">
-                    {tStage(s)}
-                  </span>
-                  {agentSelect(
-                    value.stageAgents[s],
-                    (v) =>
-                      patch({
-                        stageAgents: {
-                          ...value.stageAgents,
-                          [s]: v as AgentType | typeof INHERIT,
-                        },
-                      }),
-                    true
-                  )}
-                </div>
+        {/* Agents — nested sub-tabs: default + single stages + review */}
+        <TabsContent value="agents" className="data-[state=inactive]:hidden">
+          <Tabs defaultValue="default" className="flex flex-col">
+            <TabsList className="h-auto flex-wrap self-start">
+              <TabsTrigger value="default">{tCfg("subtabDefault")}</TabsTrigger>
+              {SINGLE_STAGES.map((s) => (
+                <TabsTrigger key={s} value={s}>
+                  {tStage(s)}
+                </TabsTrigger>
               ))}
-            </div>
-          </div>
-        </TabsContent>
+              <TabsTrigger value="review">{tStage("review")}</TabsTrigger>
+            </TabsList>
 
-        {/* Review */}
-        <TabsContent
-          value="review"
-          className="space-y-4 data-[state=inactive]:hidden"
-        >
-          <ReviewersEditor
-            value={value.reviewers}
-            onChange={(reviewers) => patch({ reviewers })}
-            disabled={disabled}
-          />
-          <div className="space-y-1.5">
-            <Label htmlFor="pass-rule">{t("reviewPassRule")}</Label>
-            <div id="pass-rule">
-              <Select
-                value={value.reviewPassRule}
-                onValueChange={(v) => patch({ reviewPassRule: v })}
-                disabled={disabled}
+            <div className="mt-3">
+              <TabsContent
+                value="default"
+                className="space-y-2 data-[state=inactive]:hidden"
               >
-                <SelectTrigger className="h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="unanimous">
-                    {t("ruleUnanimous")}
-                  </SelectItem>
-                  <SelectItem value="majority">{t("ruleMajority")}</SelectItem>
-                </SelectContent>
-              </Select>
+                <Label>{t("defaultAgent")}</Label>
+                <StageAgentEditor
+                  spec={value.defaultSpec}
+                  allowInherit={false}
+                  onChange={(next) => {
+                    if (next !== INHERIT) patch({ defaultSpec: next })
+                  }}
+                  disabled={disabled}
+                />
+              </TabsContent>
+
+              {SINGLE_STAGES.map((s) => (
+                <TabsContent
+                  key={s}
+                  value={s}
+                  className="space-y-2 data-[state=inactive]:hidden"
+                >
+                  <StageAgentEditor
+                    spec={value.stageSpecs[s]}
+                    allowInherit
+                    onChange={(next) =>
+                      patch({
+                        stageSpecs: { ...value.stageSpecs, [s]: next },
+                      })
+                    }
+                    disabled={disabled}
+                  />
+                </TabsContent>
+              ))}
+
+              <TabsContent
+                value="review"
+                className="space-y-4 data-[state=inactive]:hidden"
+              >
+                <ReviewersEditor
+                  value={value.reviewers}
+                  onChange={(reviewers) => patch({ reviewers })}
+                  disabled={disabled}
+                />
+                <div className="space-y-1.5">
+                  <Label htmlFor="pass-rule">{t("reviewPassRule")}</Label>
+                  <div id="pass-rule">
+                    <Select
+                      value={value.reviewPassRule}
+                      onValueChange={(v) => patch({ reviewPassRule: v })}
+                      disabled={disabled}
+                    >
+                      <SelectTrigger className="h-8">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="unanimous">
+                          {t("ruleUnanimous")}
+                        </SelectItem>
+                        <SelectItem value="majority">
+                          {t("ruleMajority")}
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </TabsContent>
             </div>
-          </div>
+          </Tabs>
         </TabsContent>
 
         {/* Validation */}
@@ -448,13 +480,82 @@ export function LoopConfigForm({
               {t("stallAlertHint")}
             </p>
           </div>
+
+          {limitsExtra}
         </TabsContent>
       </div>
     </Tabs>
   )
 }
 
-// ─── Reviewers editor ────────────────────────────────────────────────────────
+// ─── Per-stage agent editor ──────────────────────────────────────────────────
+
+/** One single-agent stage (or the default): an agent picker plus its live
+ *  mode/config. When `allowInherit`, the picker offers "use default" (`INHERIT`)
+ *  and selecting it hides the config — the stage follows the default agent. */
+function StageAgentEditor({
+  spec,
+  onChange,
+  allowInherit,
+  disabled,
+}: {
+  spec: AgentSpecForm | typeof INHERIT
+  onChange: (next: AgentSpecForm | typeof INHERIT) => void
+  allowInherit: boolean
+  disabled?: boolean
+}) {
+  const t = useTranslations("Loops.agentConfig")
+  const isInherit = spec === INHERIT
+
+  return (
+    <div className="space-y-3">
+      <Select
+        value={isInherit ? INHERIT : spec.agent}
+        onValueChange={(v) => {
+          if (v === INHERIT) onChange(INHERIT)
+          // Switching agent drops any prior mode/config (probed for the old one).
+          else
+            onChange({
+              agent: v as AgentType,
+              mode_id: null,
+              config_values: {},
+            })
+        }}
+        disabled={disabled}
+      >
+        <SelectTrigger className="h-8">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {allowInherit && (
+            <SelectItem value={INHERIT}>{t("useDefault")}</SelectItem>
+          )}
+          {AGENT_TYPES.map((a) => (
+            <SelectItem key={a} value={a}>
+              {AGENT_LABELS[a]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      {isInherit ? (
+        <p className="text-xs text-muted-foreground">{t("useDefaultHint")}</p>
+      ) : (
+        <AgentConfigBody
+          agent={spec.agent}
+          modeId={spec.mode_id}
+          configValues={spec.config_values}
+          onChange={({ mode_id, config_values }) =>
+            onChange({ agent: spec.agent, mode_id, config_values })
+          }
+          disabled={disabled}
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── Shared agent config body (probe + mode + options) ───────────────────────
 
 interface CachedSnapshot {
   snapshot: AgentOptionsSnapshot
@@ -474,8 +575,8 @@ function readCache(agent: AgentType): AgentOptionsSnapshot | null {
 }
 
 /** Live probe of an agent's modes/config options (30s module-scope cache),
- *  mirroring the delegation-settings panel so the reviewer config the user
- *  picks matches what the engine will pass when it spawns the reviewer. */
+ *  mirroring the delegation-settings panel so the config the user picks matches
+ *  what the engine will pass when it spawns the agent. */
 function useAgentOptions(agent: AgentType): {
   snapshot: AgentOptionsSnapshot | null
   loading: boolean
@@ -519,6 +620,86 @@ function useAgentOptions(agent: AgentType): {
 
   return { snapshot, loading, error }
 }
+
+/** Probes `agent` and renders its mode row (when standalone) + config option
+ *  rows. Reused by each per-stage agent editor and by each reviewer row. */
+function AgentConfigBody({
+  agent,
+  modeId,
+  configValues,
+  onChange,
+  disabled,
+}: {
+  agent: AgentType
+  modeId: string | null
+  configValues: Record<string, string>
+  onChange: (next: {
+    mode_id: string | null
+    config_values: Record<string, string>
+  }) => void
+  disabled?: boolean
+}) {
+  const t = useTranslations("Loops.reviewers")
+  const { snapshot, loading, error } = useAgentOptions(agent)
+
+  const setMode = (modeId: string | null) =>
+    onChange({ mode_id: modeId, config_values: configValues })
+  const setConfigValue = (optionId: string, valueId: string | null) => {
+    const next = { ...configValues }
+    if (valueId === null) delete next[optionId]
+    else next[optionId] = valueId
+    onChange({ mode_id: modeId, config_values: next })
+  }
+
+  const hasModes =
+    !!snapshot?.modes && snapshot.modes.available_modes.length > 0
+  const hasOptions = !!snapshot && snapshot.config_options.length > 0
+  // Mirror the chat input / delegation panel: when an agent exposes both modes
+  // and config options, the mode is already one of the options — hide the
+  // standalone mode row to avoid a duplicate.
+  const showStandaloneMode = hasModes && !hasOptions
+
+  return (
+    <>
+      {loading && (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+          {t("probing")}
+        </div>
+      )}
+      {error && !loading && (
+        <p className="text-xs text-muted-foreground">{t("probeFailed")}</p>
+      )}
+      {!loading && !error && snapshot && (
+        <div className="space-y-2">
+          {showStandaloneMode && snapshot.modes && (
+            <AgentModeRow
+              modes={snapshot.modes.available_modes}
+              agentDefaultModeId={snapshot.modes.current_mode_id}
+              overrideModeId={modeId}
+              onChange={setMode}
+              disabled={disabled}
+            />
+          )}
+          {snapshot.config_options.map((option) => (
+            <AgentConfigRow
+              key={option.id}
+              option={option}
+              overrideValue={configValues[option.id] ?? null}
+              onChange={(valueId) => setConfigValue(option.id, valueId)}
+              disabled={disabled}
+            />
+          ))}
+          {!showStandaloneMode && !hasOptions && (
+            <p className="text-xs text-muted-foreground">{t("noConfig")}</p>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
+// ─── Reviewers editor ────────────────────────────────────────────────────────
 
 function ReviewersEditor({
   value,
@@ -587,24 +768,6 @@ function ReviewerRow({
   disabled?: boolean
 }) {
   const t = useTranslations("Loops.reviewers")
-  const { snapshot, loading, error } = useAgentOptions(spec.agent)
-
-  const setMode = (modeId: string | null) =>
-    onChange({ ...spec, mode_id: modeId })
-  const setConfigValue = (optionId: string, valueId: string | null) => {
-    const config_values = { ...spec.config_values }
-    if (valueId === null) delete config_values[optionId]
-    else config_values[optionId] = valueId
-    onChange({ ...spec, config_values })
-  }
-
-  const hasModes =
-    !!snapshot?.modes && snapshot.modes.available_modes.length > 0
-  const hasOptions = !!snapshot && snapshot.config_options.length > 0
-  // Mirror the chat input / delegation panel: when an agent exposes both modes
-  // and config options, the mode is already one of the options — hide the
-  // standalone mode row to avoid a duplicate.
-  const showStandaloneMode = hasModes && !hasOptions
 
   return (
     <div className="space-y-2 rounded-md border bg-card/50 p-2.5">
@@ -651,45 +814,20 @@ function ReviewerRow({
         </Button>
       </div>
 
-      {loading && (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <Loader2 className="size-3.5 animate-spin" aria-hidden />
-          {t("probing")}
-        </div>
-      )}
-      {error && !loading && (
-        <p className="text-xs text-muted-foreground">{t("probeFailed")}</p>
-      )}
-      {!loading && !error && snapshot && (
-        <div className="space-y-2">
-          {showStandaloneMode && snapshot.modes && (
-            <ReviewerModeRow
-              modes={snapshot.modes.available_modes}
-              agentDefaultModeId={snapshot.modes.current_mode_id}
-              overrideModeId={spec.mode_id ?? null}
-              onChange={setMode}
-              disabled={disabled}
-            />
-          )}
-          {snapshot.config_options.map((option) => (
-            <ReviewerConfigRow
-              key={option.id}
-              option={option}
-              overrideValue={spec.config_values[option.id] ?? null}
-              onChange={(valueId) => setConfigValue(option.id, valueId)}
-              disabled={disabled}
-            />
-          ))}
-          {!showStandaloneMode && !hasOptions && (
-            <p className="text-xs text-muted-foreground">{t("noConfig")}</p>
-          )}
-        </div>
-      )}
+      <AgentConfigBody
+        agent={spec.agent}
+        modeId={spec.mode_id ?? null}
+        configValues={spec.config_values}
+        onChange={({ mode_id, config_values }) =>
+          onChange({ ...spec, mode_id, config_values })
+        }
+        disabled={disabled}
+      />
     </div>
   )
 }
 
-function ReviewerModeRow({
+function AgentModeRow({
   modes,
   agentDefaultModeId,
   overrideModeId,
@@ -732,7 +870,7 @@ function ReviewerModeRow({
   )
 }
 
-function ReviewerConfigRow({
+function AgentConfigRow({
   option,
   overrideValue,
   onChange,

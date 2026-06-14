@@ -3115,6 +3115,7 @@
       "iterationTimeout": "Iteration timeout (s)",
       "tokenBudgetPerTurn": "Token budget per turn",
       "tokenBudget": "Total token budget",
+      "tokenBudgetHint": "Lifetime cap for this issue; always editable.",
       "unlimitedPlaceholder": "Unlimited",
       "stallAlertSecs": "Stall alert (s)",
       "stallAlertHint": "Off by default. Files an inbox card when an iteration runs this long — never cancels it.",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "Agents",
-      "tabReview": "Review",
+      "subtabDefault": "Default",
       "tabValidation": "Validation",
       "tabLimits": "Limits"
     },
@@ -3208,6 +3209,10 @@
       "description": "New issues inherit this unless they use a custom config.",
       "save": "Save defaults",
       "resetToDefault": "Reset to engine default"
+    },
+    "agentConfig": {
+      "useDefault": "Use default agent",
+      "useDefaultHint": "This stage runs the default agent."
     }
   }
 }

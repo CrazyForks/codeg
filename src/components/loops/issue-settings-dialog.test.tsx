@@ -21,8 +21,16 @@ vi.mock("./loop-config-form", async (orig) => {
   const real = await orig<typeof import("./loop-config-form")>()
   return {
     ...real,
-    LoopConfigForm: ({ disabled }: { disabled?: boolean }) => (
-      <div data-testid="config-form" data-disabled={String(!!disabled)} />
+    LoopConfigForm: ({
+      disabled,
+      limitsExtra,
+    }: {
+      disabled?: boolean
+      limitsExtra?: React.ReactNode
+    }) => (
+      <div data-testid="config-form" data-disabled={String(!!disabled)}>
+        {limitsExtra}
+      </div>
     ),
   }
 })
@@ -50,7 +58,10 @@ vi.mock("@/components/ui/dialog", () => ({
 function fullConfig(): IssueConfig {
   return {
     v: 1,
-    agents: { default: "claude_code", review: "codex" },
+    agents: {
+      default: { agent: "claude_code", config_values: {} },
+      implement: { agent: "codex", config_values: {} },
+    },
     validation_commands: ["pnpm test"],
     reviewer_count: 2,
     review_pass_rule: "majority",

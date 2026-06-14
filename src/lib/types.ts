@@ -464,17 +464,23 @@ export type LoopMemoryKind =
   | "pitfall"
 export type LoopMemoryStatus = "active" | "archived"
 
-/** One reviewer in a task's review round: which agent runs it plus the same
- *  startup mode/config knobs the regular sub-agent settings expose. */
-export interface ReviewerSpec {
+/** An agent plus the same startup mode/config knobs the regular sub-agent
+ *  settings expose. Used both for each per-stage agent override (the values of
+ *  {@link IssueConfig.agents}) and for each reviewer in a task's review round. */
+export interface AgentSpec {
   agent: AgentType
   mode_id?: string | null
   config_values: Record<string, string>
 }
 
+/** Historical name retained as an alias to avoid churn at reviewer call sites. */
+export type ReviewerSpec = AgentSpec
+
 export interface IssueConfig {
   v: number
-  agents: Record<string, AgentType>
+  /** Agent (with optional startup mode/config) per stage; `default` is the
+   *  fallback, stage keys (e.g. `implement`) override it. */
+  agents: Record<string, AgentSpec>
   validation_commands: string[]
   reviewer_count: number
   review_pass_rule: string

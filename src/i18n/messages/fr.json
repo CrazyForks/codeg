@@ -3115,6 +3115,7 @@
       "iterationTimeout": "Délai d'itération (s)",
       "tokenBudgetPerTurn": "Budget de jetons par tour",
       "tokenBudget": "Budget total de jetons",
+      "tokenBudgetHint": "Plafond total pour ce ticket ; toujours modifiable.",
       "unlimitedPlaceholder": "Illimité",
       "stallAlertSecs": "Alerte de blocage (s)",
       "stallAlertHint": "Désactivé par défaut. Crée une carte dans la boîte de réception lorsqu'une itération dure aussi longtemps, sans jamais l'annuler.",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "Agents",
-      "tabReview": "Relecture",
+      "subtabDefault": "Par défaut",
       "tabValidation": "Validation",
       "tabLimits": "Limites"
     },
@@ -3208,6 +3209,10 @@
       "description": "Les nouveaux problèmes en héritent sauf s'ils utilisent une configuration personnalisée.",
       "save": "Enregistrer les valeurs",
       "resetToDefault": "Réinitialiser au défaut du moteur"
+    },
+    "agentConfig": {
+      "useDefault": "Utiliser l'agent par défaut",
+      "useDefaultHint": "Cette étape utilise l'agent par défaut."
     }
   }
 }

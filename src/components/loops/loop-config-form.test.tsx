@@ -20,7 +20,9 @@ vi.mock("@/lib/api", () => ({
   describeAgentOptions: (...a: unknown[]) => describeAgentOptions(...a),
 }))
 
-// Render every tab's content (the real Tabs only mounts the active one).
+// Render every tab's content (the real Tabs only mounts the active one). The
+// same mock flattens the nested agent sub-tabs too, so all sub-tab bodies (the
+// default agent, each single stage, the review editor) render at once.
 vi.mock("@/components/ui/tabs", () => ({
   Tabs: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   TabsList: ({ children }: { children: React.ReactNode }) => (
@@ -88,6 +90,9 @@ vi.mock("@/components/ui/switch", () => ({
   ),
 }))
 
+// Most agents expose no extra config, so probes stay quiet by default and the
+// only "High"/"Reasoning" option in the DOM is the one we explicitly opt into.
+const emptySnapshot: AgentOptionsSnapshot = { modes: null, config_options: [] }
 const snapshot: AgentOptionsSnapshot = {
   modes: null,
   config_options: [
@@ -115,6 +120,7 @@ function Harness({ initial }: { initial: LoopConfigFormState }) {
     <>
       <LoopConfigForm value={v} onChange={setV} />
       <div data-testid="reviewers">{JSON.stringify(v.reviewers)}</div>
+      <div data-testid="defaultAgent">{v.defaultSpec.agent}</div>
       <div data-testid="maxAttempts">{v.maxAttempts}</div>
     </>
   )
@@ -122,14 +128,17 @@ function Harness({ initial }: { initial: LoopConfigFormState }) {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  describeAgentOptions.mockResolvedValue(snapshot)
+  describeAgentOptions.mockResolvedValue(emptySnapshot)
 })
 
 describe("loop-config-form helpers", () => {
   it("round-trips a config through form state", () => {
     const cfg: IssueConfig = {
       v: 1,
-      agents: { default: "codex", design: "claude_code" },
+      agents: {
+        default: { agent: "codex", config_values: {} },
+        design: { agent: "claude_code", config_values: {} },
+      },
       validation_commands: ["pnpm test"],
       reviewer_count: 2,
       review_pass_rule: "majority",
@@ -150,13 +159,47 @@ describe("loop-config-form helpers", () => {
     }
     expect(formStateToConfig(configToFormState(cfg))).toEqual(cfg)
   })
+
+  it("writes a concrete per-stage spec and omits inherited stages", () => {
+    const form = configToFormState({
+      v: 1,
+      agents: { default: { agent: "claude_code", config_values: {} } },
+      validation_commands: [],
+      reviewer_count: 1,
+      review_pass_rule: "unanimous",
+      max_attempts: 6,
+      auto_merge: false,
+      force_route: null,
+      iteration_timeout_secs: null,
+      token_budget_per_turn: null,
+      stall_alert_secs: null,
+      reviewers: [],
+    })
+    form.stageSpecs.implement = {
+      agent: "codex",
+      mode_id: "auto",
+      config_values: { reasoning: "high" },
+    }
+    const cfg = formStateToConfig(form)
+    expect(cfg.agents.implement).toEqual({
+      agent: "codex",
+      mode_id: "auto",
+      config_values: { reasoning: "high" },
+    })
+    // A stage left as "use default" is not written into agents.
+    expect(cfg.agents.plan).toBeUndefined()
+    expect(cfg.agents.default).toEqual({
+      agent: "claude_code",
+      config_values: {},
+    })
+  })
 })
 
 describe("LoopConfigForm", () => {
   const base = (): LoopConfigFormState =>
     configToFormState({
       v: 1,
-      agents: { default: "claude_code" },
+      agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
       reviewer_count: 1,
       review_pass_rule: "unanimous",
@@ -177,6 +220,18 @@ describe("LoopConfigForm", () => {
     expect(screen.getByTestId("maxAttempts").textContent).toBe("9")
   })
 
+  it("changes the default agent", () => {
+    render(<Harness initial={base()} />)
+    // The default-agent picker is the only select currently set to claude_code
+    // (single stages are "use default", pass-rule/route carry other sentinels).
+    // Switch to gemini (not codex) so the module-scope probe cache the reviewer
+    // test relies on for codex stays untouched.
+    const selects = screen.getAllByRole("combobox") as HTMLSelectElement[]
+    const def = selects.find((s) => s.value === "claude_code")!
+    fireEvent.change(def, { target: { value: "gemini" } })
+    expect(screen.getByTestId("defaultAgent").textContent).toBe("gemini")
+  })
+
   it("adds and removes reviewer rows", async () => {
     render(<Harness initial={base()} />)
     expect(screen.getByTestId("reviewers").textContent).toBe("[]")
@@ -191,9 +246,14 @@ describe("LoopConfigForm", () => {
   })
 
   it("writes a reviewer's probed config value", async () => {
+    // Only codex exposes the reasoning option, so "High" is unambiguous even
+    // with every flattened sub-tab rendering at once.
+    describeAgentOptions.mockImplementation((a: string) =>
+      Promise.resolve(a === "codex" ? snapshot : emptySnapshot)
+    )
     const initial = configToFormState({
       v: 1,
-      agents: { default: "claude_code" },
+      agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
       reviewer_count: 1,
       review_pass_rule: "unanimous",

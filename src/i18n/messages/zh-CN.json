@@ -3115,6 +3115,7 @@
       "iterationTimeout": "单次迭代超时（秒）",
       "tokenBudgetPerTurn": "每回合 Token 预算",
       "tokenBudget": "总 Token 预算",
+      "tokenBudgetHint": "本议题生命周期可用总量，始终可编辑。",
       "unlimitedPlaceholder": "不限",
       "stallAlertSecs": "挂起提醒（秒）",
       "stallAlertHint": "默认关闭。迭代运行超过该时长时只在收件箱提醒，绝不取消。",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "智能体",
-      "tabReview": "评审",
+      "subtabDefault": "默认",
       "tabValidation": "验证",
       "tabLimits": "限制"
     },
@@ -3208,6 +3209,10 @@
       "description": "新建议题默认继承此配置，除非使用自定义配置。",
       "save": "保存默认配置",
       "resetToDefault": "重置为引擎默认"
+    },
+    "agentConfig": {
+      "useDefault": "使用默认智能体",
+      "useDefaultHint": "该阶段使用默认智能体运行。"
     }
   }
 }

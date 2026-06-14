@@ -3115,6 +3115,7 @@
       "iterationTimeout": "이터레이션 제한 시간(초)",
       "tokenBudgetPerTurn": "턴당 토큰 예산",
       "tokenBudget": "총 토큰 예산",
+      "tokenBudgetHint": "이 이슈의 총 사용량 상한이며 항상 편집할 수 있습니다.",
       "unlimitedPlaceholder": "무제한",
       "stallAlertSecs": "정체 알림(초)",
       "stallAlertHint": "기본값은 꺼짐. 반복이 이 시간을 초과하면 받은 편지함 카드만 생성하며 절대 취소하지 않습니다.",
@@ -3185,7 +3186,7 @@
     },
     "config": {
       "tabAgents": "에이전트",
-      "tabReview": "검토",
+      "subtabDefault": "기본",
       "tabValidation": "검증",
       "tabLimits": "제한"
     },
@@ -3208,6 +3209,10 @@
       "description": "새 이슈는 사용자 지정 설정을 사용하지 않는 한 이를 상속합니다.",
       "save": "기본값 저장",
       "resetToDefault": "엔진 기본값으로 재설정"
+    },
+    "agentConfig": {
+      "useDefault": "기본 에이전트 사용",
+      "useDefaultHint": "이 단계는 기본 에이전트로 실행됩니다."
     }
   }
 }
