@@ -109,6 +109,15 @@ pub enum ConnectionCommand {
 /// by the outer `.map_err(...)` in `run_connection`.
 const INIT_TIMEOUT_SENTINEL: &str = "__codeg_init_timeout__";
 
+/// Sentinel string embedded in a `sacp::Error` when the session/new (or the
+/// session/load → new fallback) handshake times out. Converted back to
+/// `AcpError::SessionStartTimeout` by the outer `.map_err(...)`. Like
+/// `initialize`, the session handshake is bounded so a stuck agent fails the
+/// connection (and the loop reconcile then settles the iteration) rather than
+/// parking it `Running` forever with no output. This bounds connection
+/// *establishment*, not the agent's working turn — no cap on real work.
+const SESSION_TIMEOUT_SENTINEL: &str = "__codeg_session_timeout__";
+
 /// RAII guard that removes the `AgentConnection` entry from the manager
 /// map when dropped. Runs on both normal task exit AND task panic, so a
 /// panic inside `run_connection` can't leak a stale map entry.
@@ -1591,7 +1600,21 @@ async fn run_connection(
                     &cwd,
                     mcp_servers.clone(),
                 );
-                let load_result = cx.send_request_to(Agent, load_req).block_task().await;
+                let load_result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    cx.send_request_to(Agent, load_req).block_task(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        eprintln!(
+                            "[ACP] session/load TIMED OUT after 60s — treating as a load \
+                             failure and falling back to a new session."
+                        );
+                        Err(sacp::util::internal_error("session/load timed out"))
+                    }
+                };
 
                 match load_result {
                     Ok(load_resp) => {
@@ -1780,8 +1803,9 @@ async fn run_connection(
                             )
                             .await;
                         }
-                        let new_resp = cx
-                            .send_request_to(
+                        let new_resp = match tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            cx.send_request_to(
                                 Agent,
                                 build_new_session_request(
                                     agent_type,
@@ -1789,8 +1813,21 @@ async fn run_connection(
                                     mcp_servers.clone(),
                                 ),
                             )
-                            .block_task()
-                            .await?;
+                            .block_task(),
+                        )
+                        .await
+                        {
+                            Ok(r) => r?,
+                            Err(_) => {
+                                eprintln!(
+                                    "[ACP] session/new (resume fallback) TIMED OUT after \
+                                     60s — the agent never answered the session handshake."
+                                );
+                                return Err(sacp::util::internal_error(
+                                    SESSION_TIMEOUT_SENTINEL,
+                                ));
+                            }
+                        };
                         let fallback_sid = new_resp.session_id.0.to_string();
                         let initial_config_options = new_resp.config_options.clone();
                         let mut session = cx.attach_session(new_resp, Default::default())?;
@@ -1858,13 +1895,25 @@ async fn run_connection(
                 }
             } else {
                 // Create new session
-                let new_resp = cx
-                    .send_request_to(
+                let new_resp = match tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    cx.send_request_to(
                         Agent,
                         build_new_session_request(agent_type, &cwd, mcp_servers.clone()),
                     )
-                    .block_task()
-                    .await?;
+                    .block_task(),
+                )
+                .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        eprintln!(
+                            "[ACP] session/new TIMED OUT after 60s — the agent never \
+                             answered the session handshake."
+                        );
+                        return Err(sacp::util::internal_error(SESSION_TIMEOUT_SENTINEL));
+                    }
+                };
                 let sid = new_resp.session_id.0.to_string();
                 let initial_config_options = new_resp.config_options.clone();
                 let mut session = cx.attach_session(new_resp, Default::default())?;
@@ -1933,6 +1982,8 @@ async fn run_connection(
             let raw = e.to_string();
             if raw.contains(INIT_TIMEOUT_SENTINEL) {
                 AcpError::InitializeTimeout
+            } else if raw.contains(SESSION_TIMEOUT_SENTINEL) {
+                AcpError::SessionStartTimeout
             } else {
                 AcpError::protocol(raw)
             }

@@ -44,6 +44,8 @@ pub enum AcpError {
     SdkNotInstalled(String),
     #[error("Agent did not respond to Initialize within 60 seconds. The cached binary may be outdated or incompatible. Try upgrading it from Agent Settings.")]
     InitializeTimeout,
+    #[error("Agent did not answer the session handshake (session/new or session/load) within 60 seconds. The agent may be stuck starting up, awaiting auth, or not ACP-compliant — try again or check the agent binary.")]
+    SessionStartTimeout,
     #[error("Agent did not publish its configurable options within 60 seconds. The probe was aborted; the agent may be slow, idle, or not ACP-compliant — try again or check the agent binary.")]
     ProbeTimedOut,
 }
@@ -74,6 +76,7 @@ impl AcpError {
             Self::SdkNotInstalled(_) => Some("sdk_not_installed"),
             Self::PlatformNotSupported(_) => Some("platform_not_supported"),
             Self::InitializeTimeout => Some("initialize_timeout"),
+            Self::SessionStartTimeout => Some("session_start_timeout"),
             Self::ProbeTimedOut => Some("probe_timed_out"),
             Self::ProcessExited => Some("process_exited"),
             Self::TurnInProgress => Some("turn_in_progress"),
