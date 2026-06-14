@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { render, screen, fireEvent, waitFor } from "@testing-library/react"
 
 import { LoopsWorkbench } from "./loops-workbench"
+import { defaultIssueConfig } from "@/lib/loop-config"
 import type { LoopSpaceSummary } from "@/lib/types"
 
 // Stable `t` — the workbench's `refresh` callback depends on `t`, so an
@@ -43,7 +44,7 @@ function makeSpace(over: Partial<LoopSpaceSummary> = {}): LoopSpaceSummary {
     running_count: 1,
     last_activity_at: null,
     created_at: "2026-06-13T00:00:00Z",
-    default_config: null,
+    default_config: defaultIssueConfig(),
     ...over,
   }
 }

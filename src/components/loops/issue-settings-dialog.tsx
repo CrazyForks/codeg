@@ -61,9 +61,12 @@ export function IssueSettingsDialog({
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const [inherit, setInherit] = useState(issue.config_inherits)
+  // `config == null` ⇒ the issue inherits the space default.
+  const [inherit, setInherit] = useState(issue.config == null)
   const [form, setForm] = useState<LoopConfigFormState>(() =>
-    configToFormState(issue.config)
+    configToFormState(
+      issue.config ?? spaceDefaultConfig ?? defaultIssueConfig()
+    )
   )
   const [tokenBudget, setTokenBudget] = useState(() =>
     budgetField(issue.token_budget)
@@ -74,11 +77,15 @@ export function IssueSettingsDialog({
   // edits and a config change elsewhere is reflected.
   useEffect(() => {
     if (open) {
-      setInherit(issue.config_inherits)
-      setForm(configToFormState(issue.config))
+      setInherit(issue.config == null)
+      setForm(
+        configToFormState(
+          issue.config ?? spaceDefaultConfig ?? defaultIssueConfig()
+        )
+      )
       setTokenBudget(budgetField(issue.token_budget))
     }
-  }, [open, issue])
+  }, [open, issue, spaceDefaultConfig])
 
   // Read-only preview of what an inheriting issue resolves to: the space
   // default, or the engine default when the space has none.
@@ -89,13 +96,12 @@ export function IssueSettingsDialog({
   const onSave = async () => {
     setSaving(true)
     try {
-      // On inherit the backend keeps the stored config as the last custom value
-      // (it ignores this arg for the config column); on custom it writes it.
+      // `null` config = inherit the space default (stored as NULL); otherwise
+      // the issue's own config. The total token budget is independent.
       await updateLoopIssueConfig(
         issue.id,
-        formStateToConfig(form),
-        parsePositiveOrNull(tokenBudget),
-        inherit
+        inherit ? null : formStateToConfig(form),
+        parsePositiveOrNull(tokenBudget)
       )
       toast.success(tToasts("configSaved"))
       onOpenChange(false)

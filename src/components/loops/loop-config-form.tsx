@@ -16,6 +16,7 @@ import {
   type LoopStage,
   type ReviewerEntry,
   type SessionConfigOptionInfo,
+  type StageAgents,
 } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -99,15 +100,14 @@ const isInheritReviewer = (r: ReviewerForm): r is { inherit: true } =>
  * into the Limits tab via `limitsExtra`).
  */
 export interface LoopConfigFormState {
-  configVersion: number
   defaultSpec: AgentSpecForm
   /** Per single-stage override, or `INHERIT` to follow the default. Keyed by the
    *  stages in {@link SINGLE_STAGES} (the review stage is not here). */
   stageSpecs: Record<string, AgentSpecForm | typeof INHERIT>
   validationCommands: string[]
   reviewers: ReviewerForm[]
-  /** Preserved pass-through legacy fallback; used only when `reviewers` is empty. */
-  reviewerCount: number
+  /** Form-state string (kept loose for the select); narrowed to the
+   *  `ReviewPassRule` union in {@link formStateToConfig}. */
   reviewPassRule: string
   maxAttempts: string
   autoMerge: boolean
@@ -154,15 +154,12 @@ function specFromForm(s: AgentSpecForm): AgentSpec {
 export function configToFormState(c: IssueConfig): LoopConfigFormState {
   const stageSpecs: Record<string, AgentSpecForm | typeof INHERIT> = {}
   for (const s of SINGLE_STAGES) {
-    const spec = c.agents[s]
+    const spec = c.agents[s as keyof StageAgents]
     stageSpecs[s] = spec ? toSpecForm(spec) : INHERIT
   }
   const route = c.force_route
   return {
-    configVersion: c.v ?? 1,
-    defaultSpec: toSpecForm(
-      c.agents.default ?? { agent: "claude_code", config_values: {} }
-    ),
+    defaultSpec: toSpecForm(c.agents.default),
     stageSpecs,
     validationCommands: [...c.validation_commands],
     reviewers: (c.reviewers ?? []).map<ReviewerForm>((r) =>
@@ -174,7 +171,6 @@ export function configToFormState(c: IssueConfig): LoopConfigFormState {
             config_values: { ...r.config_values },
           }
     ),
-    reviewerCount: c.reviewer_count ?? 1,
     reviewPassRule: c.review_pass_rule || "unanimous",
     maxAttempts: String(c.max_attempts ?? 0),
     autoMerge: !!c.auto_merge,
@@ -186,13 +182,16 @@ export function configToFormState(c: IssueConfig): LoopConfigFormState {
 }
 
 export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
-  const agents: Record<string, AgentSpec> = {
+  // Build as a record (keyed by stage), then narrow to StageAgents — `default`
+  // is always set and every other key is a valid optional stage field.
+  const agentsRecord: Record<string, AgentSpec> = {
     default: specFromForm(form.defaultSpec),
   }
   for (const s of SINGLE_STAGES) {
     const v = form.stageSpecs[s]
-    if (v !== INHERIT) agents[s] = specFromForm(v)
+    if (v !== INHERIT) agentsRecord[s] = specFromForm(v)
   }
+  const agents = agentsRecord as unknown as StageAgents
   const reviewers: ReviewerEntry[] = form.reviewers.map((r) =>
     isInheritReviewer(r)
       ? { inherit: true }
@@ -203,15 +202,13 @@ export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
         }
   )
   return {
-    v: form.configVersion,
     agents,
     validation_commands: form.validationCommands
       .map((s) => s.trim())
       .filter(Boolean),
-    // The explicit reviewer list is authoritative when present; otherwise keep
-    // the legacy count so pre-`reviewers` issues round-trip unchanged.
-    reviewer_count:
-      reviewers.length > 0 ? reviewers.length : form.reviewerCount,
+    // At least one reviewer — the backend rejects an empty list. Fall back to a
+    // single inherit-the-default reviewer if the user cleared them all.
+    reviewers: reviewers.length > 0 ? reviewers : [{ inherit: true }],
     review_pass_rule:
       form.reviewPassRule === "majority" ? "majority" : "unanimous",
     max_attempts: parseCount(form.maxAttempts, 0, 0),
@@ -222,7 +219,6 @@ export function formStateToConfig(form: LoopConfigFormState): IssueConfig {
         : (form.forceRoute as LoopIssueRoute),
     iteration_timeout_secs: parsePositiveOrNull(form.iterationTimeoutSecs),
     token_budget_per_turn: parsePositiveOrNull(form.tokenBudgetPerTurn),
-    reviewers,
     stall_alert_secs: parsePositiveOrNull(form.stallAlertSecs),
   }
 }

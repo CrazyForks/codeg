@@ -38,12 +38,10 @@ export function updateLoopSpace(id: number, name: string) {
   })
 }
 
-/** Set (or clear with `null`) the space's default issue config. Inheriting
- *  issues resolve their config from this. */
-export function setLoopSpaceDefaultConfig(
-  id: number,
-  config: IssueConfig | null
-) {
+/** Set the space's default issue config (always concrete). Inheriting issues
+ *  resolve their config from this. "Reset to engine default" = pass
+ *  `defaultIssueConfig()`. */
+export function setLoopSpaceDefaultConfig(id: number, config: IssueConfig) {
   return getTransport().call<void>("set_loop_space_default_config", {
     id,
     config,
@@ -87,17 +85,16 @@ export function deleteLoopIssue(id: number) {
   return getTransport().call<void>("delete_loop_issue", { id })
 }
 
+/** Set an issue's config. `null` = inherit the space default. */
 export function updateLoopIssueConfig(
   id: number,
-  config: IssueConfig,
-  tokenBudget: number | null,
-  configInherits = false
+  config: IssueConfig | null,
+  tokenBudget: number | null
 ) {
   return getTransport().call<void>("update_loop_issue_config", {
     id,
     config,
     tokenBudget,
-    configInherits,
   })
 }
 

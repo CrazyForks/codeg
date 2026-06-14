@@ -9,17 +9,16 @@ import type { IssueConfig } from "./types"
  */
 export function defaultIssueConfig(): IssueConfig {
   return {
-    v: 1,
     agents: { default: { agent: "claude_code", config_values: {} } },
     validation_commands: [],
-    reviewer_count: 1,
+    // One reviewer that inherits the default agent.
+    reviewers: [{ inherit: true }],
     review_pass_rule: "unanimous",
     max_attempts: 6,
     auto_merge: false,
     force_route: null,
     iteration_timeout_secs: null,
     token_budget_per_turn: null,
-    reviewers: [],
     stall_alert_secs: null,
   }
 }

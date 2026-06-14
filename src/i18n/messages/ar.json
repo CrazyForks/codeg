@@ -3102,7 +3102,6 @@
       "validationHint": "تُنفّذ في شجرة العمل بعد كل تنفيذ.",
       "addCommand": "إضافة أمر",
       "commandPlaceholder": "مثل pnpm test",
-      "reviewerCount": "عدد المراجعين لكل مهمة",
       "reviewPassRule": "قاعدة اجتياز المراجعة",
       "ruleUnanimous": "بالإجماع",
       "ruleMajority": "الأغلبية",

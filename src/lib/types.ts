@@ -465,8 +465,8 @@ export type LoopMemoryKind =
 export type LoopMemoryStatus = "active" | "archived"
 
 /** An agent plus the same startup mode/config knobs the regular sub-agent
- *  settings expose. Used both for each per-stage agent override (the values of
- *  {@link IssueConfig.agents}) and for each reviewer in a task's review round. */
+ *  settings expose. Used both for each per-stage agent override (a field of
+ *  {@link StageAgents}) and for each reviewer in a task's review round. */
 export interface AgentSpec {
   agent: AgentType
   mode_id?: string | null
@@ -476,8 +476,8 @@ export interface AgentSpec {
 /** Historical name retained as an alias to avoid churn at reviewer call sites. */
 export type ReviewerSpec = AgentSpec
 
-/** A reviewer that defers to the issue's default review agent, resolved at
- *  dispatch. Serialized as `{ "inherit": true }`. */
+/** A reviewer that defers to the issue's default agent, resolved at dispatch.
+ *  Serialized as `{ "inherit": true }`. */
 export interface ReviewerInherit {
   inherit: true
 }
@@ -486,23 +486,36 @@ export interface ReviewerInherit {
  *  inherit marker. */
 export type ReviewerEntry = AgentSpec | ReviewerInherit
 
+/** How a task's review round aggregates its reviewer verdicts. */
+export type ReviewPassRule = "unanimous" | "majority"
+
+/** Per-stage agent overrides. `default` is required and is used for any stage
+ *  without an explicit override. No `review` — reviewers are configured via
+ *  {@link IssueConfig.reviewers}. */
+export interface StageAgents {
+  default: AgentSpec
+  triage?: AgentSpec
+  refine?: AgentSpec
+  design?: AgentSpec
+  plan?: AgentSpec
+  implement?: AgentSpec
+  finalize?: AgentSpec
+}
+
 export interface IssueConfig {
-  v: number
-  /** Agent (with optional startup mode/config) per stage; `default` is the
-   *  fallback, stage keys (e.g. `implement`) override it. */
-  agents: Record<string, AgentSpec>
+  /** Per-stage agents (`default` + optional single-stage overrides). */
+  agents: StageAgents
   validation_commands: string[]
-  reviewer_count: number
-  review_pass_rule: string
+  /** Reviewers to run per task (one review each); count = `reviewers.length`.
+   *  Each is a concrete agent spec or `{ inherit: true }` (use the default
+   *  agent). Required non-empty. */
+  reviewers: ReviewerEntry[]
+  review_pass_rule: ReviewPassRule
   max_attempts: number
   auto_merge: boolean
   force_route: LoopIssueRoute | null
   iteration_timeout_secs: number | null
   token_budget_per_turn: number | null
-  /** Reviewers to run per task (one review each). Each is a concrete agent spec
-   *  or `{ inherit: true }` (use the default review agent). Empty = fall back to
-   *  `reviewer_count` copies of the resolved review agent. */
-  reviewers: ReviewerEntry[]
   /** Opt-in watchdog: file a `stalled` inbox card when an iteration has been in
    *  flight this many seconds. null = off (never alerts, never kills). */
   stall_alert_secs: number | null
@@ -518,10 +531,10 @@ export interface LoopSpaceSummary {
   running_count: number
   last_activity_at: string | null
   created_at: string
-  /** The space's default issue config, inherited by issues with
-   *  `config_inherits`. `null` when unset (inheritors fall back to the engine
-   *  default). Set via `setLoopSpaceDefaultConfig`. */
-  default_config: IssueConfig | null
+  /** The space's default issue config (always present — every space stores a
+   *  concrete config that inheriting issues resolve against). Set via
+   *  `setLoopSpaceDefaultConfig`. */
+  default_config: IssueConfig
 }
 
 export interface LoopIssueRow {
@@ -542,11 +555,9 @@ export interface LoopIssueRow {
 /** Rust flattens `row` into the detail, so the row fields appear inline. */
 export interface LoopIssueDetail extends LoopIssueRow {
   description: string
-  config: IssueConfig
-  /** When true, the engine resolves this issue's effective config from the
-   *  space default (at read time); `config` is kept as the last custom value
-   *  for when the user switches back to a custom config. */
-  config_inherits: boolean
+  /** The issue's own config, or `null` to inherit the space default (resolved
+   *  at read time). */
+  config: IssueConfig | null
   worktree_folder_id: number | null
   base_branch: string | null
   base_commit: string | null

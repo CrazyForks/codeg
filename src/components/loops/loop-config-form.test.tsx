@@ -134,13 +134,11 @@ beforeEach(() => {
 describe("loop-config-form helpers", () => {
   it("round-trips a config through form state", () => {
     const cfg: IssueConfig = {
-      v: 1,
       agents: {
         default: { agent: "codex", config_values: {} },
         design: { agent: "claude_code", config_values: {} },
       },
       validation_commands: ["pnpm test"],
-      reviewer_count: 2,
       review_pass_rule: "majority",
       max_attempts: 6,
       auto_merge: true,
@@ -162,10 +160,8 @@ describe("loop-config-form helpers", () => {
 
   it("writes a concrete per-stage spec and omits inherited stages", () => {
     const form = configToFormState({
-      v: 1,
       agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
-      reviewer_count: 1,
       review_pass_rule: "unanimous",
       max_attempts: 6,
       auto_merge: false,
@@ -198,10 +194,8 @@ describe("loop-config-form helpers", () => {
 describe("LoopConfigForm", () => {
   const base = (): LoopConfigFormState =>
     configToFormState({
-      v: 1,
       agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
-      reviewer_count: 1,
       review_pass_rule: "unanimous",
       max_attempts: 6,
       auto_merge: false,
@@ -247,10 +241,8 @@ describe("LoopConfigForm", () => {
 
   it("switches a reviewer to use the default agent", () => {
     const initial = configToFormState({
-      v: 1,
       agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
-      reviewer_count: 1,
       review_pass_rule: "unanimous",
       max_attempts: 6,
       auto_merge: false,
@@ -280,10 +272,8 @@ describe("LoopConfigForm", () => {
       Promise.resolve(a === "codex" ? snapshot : emptySnapshot)
     )
     const initial = configToFormState({
-      v: 1,
       agents: { default: { agent: "claude_code", config_values: {} } },
       validation_commands: [],
-      reviewer_count: 1,
       review_pass_rule: "unanimous",
       max_attempts: 6,
       auto_merge: false,

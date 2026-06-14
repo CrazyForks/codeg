@@ -3102,7 +3102,6 @@
       "validationHint": "各実装後にワークツリーで実行します。",
       "addCommand": "コマンドを追加",
       "commandPlaceholder": "例: pnpm test",
-      "reviewerCount": "タスクごとのレビュー数",
       "reviewPassRule": "レビュー合格ルール",
       "ruleUnanimous": "全員一致",
       "ruleMajority": "過半数",

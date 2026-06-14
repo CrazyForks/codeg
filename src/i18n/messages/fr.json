@@ -3102,7 +3102,6 @@
       "validationHint": "Exécutées dans l'arbre de travail après chaque implémentation.",
       "addCommand": "Ajouter une commande",
       "commandPlaceholder": "ex. pnpm test",
-      "reviewerCount": "Relecteurs par tâche",
       "reviewPassRule": "Règle de validation de relecture",
       "ruleUnanimous": "Unanime",
       "ruleMajority": "Majorité",

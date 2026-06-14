@@ -65,7 +65,7 @@ describe("SpaceDefaultsDialog", () => {
     )
   })
 
-  it("clears the default (null) on reset", async () => {
+  it("writes the engine default on reset", async () => {
     render(
       <SpaceDefaultsDialog
         spaceId={7}
@@ -76,7 +76,10 @@ describe("SpaceDefaultsDialog", () => {
     )
     fireEvent.click(screen.getByText("resetToDefault"))
     await waitFor(() =>
-      expect(setLoopSpaceDefaultConfig).toHaveBeenCalledWith(7, null)
+      expect(setLoopSpaceDefaultConfig).toHaveBeenCalledWith(
+        7,
+        defaultIssueConfig()
+      )
     )
   })
 })

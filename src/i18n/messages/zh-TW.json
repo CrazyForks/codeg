@@ -3102,7 +3102,6 @@
       "validationHint": "每次實作後在工作樹中執行。",
       "addCommand": "新增命令",
       "commandPlaceholder": "例如 pnpm test",
-      "reviewerCount": "每個任務的評審數",
       "reviewPassRule": "評審通過規則",
       "ruleUnanimous": "全體一致",
       "ruleMajority": "多數通過",

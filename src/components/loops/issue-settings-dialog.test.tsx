@@ -57,20 +57,18 @@ vi.mock("@/components/ui/dialog", () => ({
 
 function fullConfig(): IssueConfig {
   return {
-    v: 1,
     agents: {
       default: { agent: "claude_code", config_values: {} },
       implement: { agent: "codex", config_values: {} },
     },
     validation_commands: ["pnpm test"],
-    reviewer_count: 2,
+    reviewers: [{ inherit: true }],
     review_pass_rule: "majority",
     max_attempts: 6,
     auto_merge: true,
     force_route: "full",
     iteration_timeout_secs: 120,
     token_budget_per_turn: 1000,
-    reviewers: [],
     stall_alert_secs: null,
   }
 }
@@ -91,7 +89,6 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
     updated_at: "2026-06-14T00:00:00Z",
     description: "",
     config: fullConfig(),
-    config_inherits: false,
     worktree_folder_id: null,
     base_branch: null,
     base_commit: null,
@@ -103,18 +100,13 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
 beforeEach(() => vi.clearAllMocks())
 
 describe("IssueSettingsDialog", () => {
-  it("saves a custom config with config_inherits=false", async () => {
+  it("saves a custom config", async () => {
     render(
       <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
     )
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig).toHaveBeenCalledWith(
-        5,
-        fullConfig(),
-        50000,
-        false
-      )
+      expect(updateLoopIssueConfig).toHaveBeenCalledWith(5, fullConfig(), 50000)
     )
   })
 
@@ -127,21 +119,16 @@ describe("IssueSettingsDialog", () => {
     })
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig).toHaveBeenCalledWith(
-        5,
-        fullConfig(),
-        null,
-        false
-      )
+      expect(updateLoopIssueConfig).toHaveBeenCalledWith(5, fullConfig(), null)
     )
   })
 
-  it("saves with config_inherits=true and a disabled form when inheriting", async () => {
+  it("saves a null config and disables the form when inheriting", async () => {
     render(
       <IssueSettingsDialog
         open
         onOpenChange={() => {}}
-        issue={makeIssue({ config_inherits: true })}
+        issue={makeIssue({ config: null })}
       />
     )
     expect(screen.getByTestId("config-form").dataset.disabled).toBe("true")
@@ -149,35 +136,35 @@ describe("IssueSettingsDialog", () => {
     await waitFor(() => {
       const call = updateLoopIssueConfig.mock.calls[0]
       expect(call[0]).toBe(5)
+      expect(call[1]).toBeNull()
       expect(call[2]).toBe(50000)
-      expect(call[3]).toBe(true)
     })
   })
 
-  it("switches an inheriting issue to custom and saves false", async () => {
+  it("switches an inheriting issue to custom and saves a config", async () => {
     render(
       <IssueSettingsDialog
         open
         onOpenChange={() => {}}
-        issue={makeIssue({ config_inherits: true })}
+        issue={makeIssue({ config: null })}
       />
     )
     fireEvent.click(screen.getByText("custom"))
     expect(screen.getByTestId("config-form").dataset.disabled).toBe("false")
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig.mock.calls[0][3]).toBe(false)
+      expect(updateLoopIssueConfig.mock.calls[0][1]).not.toBeNull()
     )
   })
 
-  it("switches a custom issue to space default and saves true", async () => {
+  it("switches a custom issue to space default and saves null", async () => {
     render(
       <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
     )
     fireEvent.click(screen.getByText("useSpaceDefault"))
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
-      expect(updateLoopIssueConfig.mock.calls[0][3]).toBe(true)
+      expect(updateLoopIssueConfig.mock.calls[0][1]).toBeNull()
     )
   })
 

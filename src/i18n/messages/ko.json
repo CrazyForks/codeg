@@ -3102,7 +3102,6 @@
       "validationHint": "각 구현 후 워크트리에서 실행됩니다.",
       "addCommand": "명령 추가",
       "commandPlaceholder": "예: pnpm test",
-      "reviewerCount": "작업당 검토자 수",
       "reviewPassRule": "검토 통과 규칙",
       "ruleUnanimous": "만장일치",
       "ruleMajority": "다수결",

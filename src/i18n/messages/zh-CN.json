@@ -3102,7 +3102,6 @@
       "validationHint": "每次实现后在工作树中运行。",
       "addCommand": "添加命令",
       "commandPlaceholder": "例如 pnpm test",
-      "reviewerCount": "每个任务的评审数",
       "reviewPassRule": "评审通过规则",
       "ruleUnanimous": "全体一致",
       "ruleMajority": "多数通过",

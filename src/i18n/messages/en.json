@@ -3102,7 +3102,6 @@
       "validationHint": "Run in the worktree after each implement.",
       "addCommand": "Add command",
       "commandPlaceholder": "e.g. pnpm test",
-      "reviewerCount": "Reviewers per task",
       "reviewPassRule": "Review pass rule",
       "ruleUnanimous": "Unanimous",
       "ruleMajority": "Majority",

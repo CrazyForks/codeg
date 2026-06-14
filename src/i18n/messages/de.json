@@ -3102,7 +3102,6 @@
       "validationHint": "Werden nach jeder Implementierung im Worktree ausgeführt.",
       "addCommand": "Befehl hinzufügen",
       "commandPlaceholder": "z. B. pnpm test",
-      "reviewerCount": "Prüfer pro Aufgabe",
       "reviewPassRule": "Prüfungs-Bestehensregel",
       "ruleUnanimous": "Einstimmig",
       "ruleMajority": "Mehrheit",

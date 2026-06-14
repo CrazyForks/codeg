@@ -31,8 +31,8 @@ import {
  * propagates live to every inheriting issue. Reuses the shared tabbed
  * {@link LoopConfigForm} without the per-issue inherit toggle or total budget.
  * Saving persists via `set_loop_space_default_config` (emits `loop://changed`);
- * "reset" clears the default (`null`) so inheritors fall back to the engine
- * default.
+ * "reset" writes the engine default config back, so inheritors fall back to the
+ * baseline.
  */
 export function SpaceDefaultsDialog({
   spaceId,
@@ -61,7 +61,7 @@ export function SpaceDefaultsDialog({
   }, [open, current])
 
   const persist = async (
-    config: IssueConfig | null,
+    config: IssueConfig,
     setBusy: (v: boolean) => void
   ) => {
     setBusy(true)
@@ -93,7 +93,7 @@ export function SpaceDefaultsDialog({
             type="button"
             variant="ghost"
             className="text-muted-foreground"
-            onClick={() => persist(null, setResetting)}
+            onClick={() => persist(defaultIssueConfig(), setResetting)}
             disabled={busy}
           >
             {resetting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}

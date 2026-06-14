@@ -3102,7 +3102,6 @@
       "validationHint": "Se ejecutan en el árbol de trabajo tras cada implementación.",
       "addCommand": "Añadir comando",
       "commandPlaceholder": "p. ej. pnpm test",
-      "reviewerCount": "Revisores por tarea",
       "reviewPassRule": "Regla de aprobación de revisión",
       "ruleUnanimous": "Unánime",
       "ruleMajority": "Mayoría",
