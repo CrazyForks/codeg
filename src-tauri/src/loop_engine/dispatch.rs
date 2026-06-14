@@ -458,27 +458,10 @@ async fn fail_iteration(
     iter: &loop_iteration::Model,
     err: &LoopError,
 ) {
-    // The lease may be in `queued` (spawn never ran) or `running` (post-spawn
-    // failure); fail it from whichever it holds.
-    let _ = cas_iteration_status(
-        conn,
-        iter.id,
-        IterationStatus::Queued,
-        IterationStatus::Failed,
-    )
-    .await;
-    let _ = cas_iteration_status(
-        conn,
-        iter.id,
-        IterationStatus::Running,
-        IterationStatus::Failed,
-    )
-    .await;
-    let _ = loop_iteration::Entity::update_many()
-        .col_expr(loop_iteration::Column::EndedAt, Expr::value(Utc::now()))
-        .filter(loop_iteration::Column::Id.eq(iter.id))
-        .exec(conn)
-        .await;
+    // Atomic fail from whichever active state the lease holds (§2.6) — one
+    // multi-from UPDATE that also stamps `ended_at`, so the row can't wedge in
+    // `running` if the process dies between two separate CAS calls.
+    let _ = crate::loop_engine::transitions::fail_iteration_active(conn, iter.id).await;
     let _ = inbox::upsert_inbox(
         conn,
         input.space_id,

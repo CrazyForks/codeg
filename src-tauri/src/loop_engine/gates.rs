@@ -392,25 +392,6 @@ async fn implement_iterations(
         .await?)
 }
 
-/// Blind status write. Used only by `mark_blocked`, which is reached from more
-/// than one predecessor status (`pending` after a failed validation / empty diff,
-/// `in_progress` after a rejected review), so a single-`from` CAS doesn't fit. The
-/// loop serializes task work (single per-issue driver + the serial task gate), so
-/// this write never races a concurrent transition.
-async fn set_task_status(
-    db: &AppDatabase,
-    task_id: i32,
-    status: ArtifactStatus,
-) -> Result<(), LoopError> {
-    loop_artifact::Entity::update_many()
-        .col_expr(loop_artifact::Column::Status, Expr::value(status.to_value()))
-        .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
-        .filter(loop_artifact::Column::Id.eq(task_id))
-        .exec(&db.conn)
-        .await?;
-    Ok(())
-}
-
 /// CAS a task artifact's status `from → to` — the artifact analogue of the
 /// `cas_*_status` discipline used for issues and iterations. Returns whether the
 /// transition applied. The loop serializes task work (single per-issue driver +
@@ -515,7 +496,13 @@ async fn mark_blocked(
     sig: &str,
     attempt: i32,
 ) -> Result<(), LoopError> {
-    set_task_status(db, task_id, ArtifactStatus::Blocked).await?;
+    crate::loop_engine::transitions::cas_artifact_status_from(
+        &db.conn,
+        task_id,
+        &[ArtifactStatus::Pending, ArtifactStatus::InProgress],
+        ArtifactStatus::Blocked,
+    )
+    .await?;
     cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
     loop_service::inbox::upsert_inbox(
         &db.conn,

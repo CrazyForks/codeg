@@ -132,6 +132,30 @@ pub async fn cas_artifact_status(
     Ok(res.rows_affected == 1)
 }
 
+/// CAS an artifact's status from any of several legal predecessors to `to`
+/// (§2.4). Each `(from, to)` pair must be legal ([`is_legal_artifact`]), else
+/// [`LoopError::IllegalTransition`]. Used where a node is reached from more than
+/// one state (e.g. blocking a task that may be `pending` or `in_progress`),
+/// making the previously-blind write an explicit bounded CAS.
+pub async fn cas_artifact_status_from(
+    conn: &DatabaseConnection,
+    id: i32,
+    from: &[ArtifactStatus],
+    to: ArtifactStatus,
+) -> Result<bool, LoopError> {
+    if from.iter().any(|f| !is_legal_artifact(*f, to)) {
+        return Err(LoopError::IllegalTransition);
+    }
+    let res = loop_artifact::Entity::update_many()
+        .col_expr(loop_artifact::Column::Status, Expr::value(to.to_value()))
+        .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_artifact::Column::Id.eq(id))
+        .filter(loop_artifact::Column::Status.is_in(from.iter().copied()))
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
 /// Inputs for a dispatch claim. `conversation_id` is intentionally absent — the
 /// lease row is inserted first (conversation attached afterwards by the winner).
 pub struct IterationClaim {
@@ -193,6 +217,27 @@ pub async fn cas_iteration_status(
         .col_expr(loop_iteration::Column::Status, Expr::value(new.to_value()))
         .filter(loop_iteration::Column::Id.eq(id))
         .filter(loop_iteration::Column::Status.eq(expected))
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
+/// Fail an iteration from whichever active state it holds in a single UPDATE:
+/// `status IN ('queued','running') → 'failed'`, stamping `ended_at`. Atomic
+/// (§2.6) — replaces the old two sequential CAS that could wedge a row in
+/// `running` if the process died between them. Returns whether a row changed.
+pub async fn fail_iteration_active(conn: &DatabaseConnection, id: i32) -> Result<bool, LoopError> {
+    let res = loop_iteration::Entity::update_many()
+        .col_expr(
+            loop_iteration::Column::Status,
+            Expr::value(IterationStatus::Failed.to_value()),
+        )
+        .col_expr(loop_iteration::Column::EndedAt, Expr::value(Utc::now()))
+        .filter(loop_iteration::Column::Id.eq(id))
+        .filter(
+            loop_iteration::Column::Status
+                .is_in([IterationStatus::Queued, IterationStatus::Running]),
+        )
         .exec(conn)
         .await?;
     Ok(res.rows_affected == 1)
@@ -369,5 +414,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LoopError::IllegalTransition));
+    }
+
+    #[tokio::test]
+    async fn fail_iteration_active_covers_queued_and_running_in_one_update() {
+        let (db, space_id, issue_id) = seed().await;
+        // queued lease
+        let q = try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Triage, None, None, "q"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fail_iteration_active(&db.conn, q.id).await.unwrap());
+        // running lease
+        let r = try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Refine, Some(1), None, "r"))
+            .await
+            .unwrap()
+            .unwrap();
+        cas_iteration_status(&db.conn, r.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        assert!(fail_iteration_active(&db.conn, r.id).await.unwrap());
+        // already-terminal → no-op (false)
+        assert!(!fail_iteration_active(&db.conn, r.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cas_artifact_status_from_blocks_pending_or_in_progress() {
+        let (db, space_id, issue_id) = seed().await;
+        let t = artifact::create_artifact(&db.conn, space_id, issue_id, ArtifactKind::Task, "T", ArtifactStatus::Pending, ActorKind::Agent, None)
+            .await
+            .unwrap();
+        // pending → blocked via the multi-from set
+        assert!(cas_artifact_status_from(&db.conn, t.id, &[ArtifactStatus::Pending, ArtifactStatus::InProgress], ArtifactStatus::Blocked)
+            .await
+            .unwrap());
+        // already blocked → no-op
+        assert!(!cas_artifact_status_from(&db.conn, t.id, &[ArtifactStatus::Pending, ArtifactStatus::InProgress], ArtifactStatus::Blocked)
+            .await
+            .unwrap());
     }
 }
