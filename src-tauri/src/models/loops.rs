@@ -76,6 +76,27 @@ impl From<AgentSpecWire> for AgentSpec {
 /// Historical name retained as an alias to avoid churn at reviewer call sites.
 pub type ReviewerSpec = AgentSpec;
 
+/// The `{"inherit": true}` reviewer form. The bool is always `true`; its
+/// presence is what distinguishes inherit from a concrete [`AgentSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewerInherit {
+    pub inherit: bool,
+}
+
+/// One reviewer in [`IssueConfig::reviewers`]: a concrete [`AgentSpec`], or an
+/// inherit marker that defers to the resolved default review agent at dispatch.
+/// Untagged so existing rows — bare `AgentType` strings and full objects — still
+/// parse as `Spec` (the `Inherit` arm requires an `inherit` key, which an
+/// `AgentSpec` object never has). Serializes back to the same two shapes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ReviewerEntry {
+    /// `{"inherit": true}` — use the issue's default review agent.
+    Inherit(ReviewerInherit),
+    /// A concrete agent + its startup mode/config.
+    Spec(AgentSpec),
+}
+
 /// Per-issue Loop Contract knobs (stored JSON-encoded in `loop_issue.config`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueConfig {
@@ -102,11 +123,13 @@ pub struct IssueConfig {
     pub iteration_timeout_secs: Option<u64>,
     /// Optional per-turn token soft cap (none = unlimited).
     pub token_budget_per_turn: Option<i64>,
-    /// Reviewers to run per task (one review iteration each). When empty, falls
-    /// back to `reviewer_count` copies of the resolved review agent (see
-    /// [`IssueConfig::effective_reviewers`]) so pre-existing issues are unchanged.
+    /// Reviewers to run per task (one review iteration each). Each entry is a
+    /// concrete [`AgentSpec`] or an inherit marker (defers to the default review
+    /// agent). When empty, falls back to `reviewer_count` copies of the resolved
+    /// review agent (see [`IssueConfig::effective_reviewers`]) so pre-existing
+    /// issues are unchanged.
     #[serde(default)]
-    pub reviewers: Vec<ReviewerSpec>,
+    pub reviewers: Vec<ReviewerEntry>,
     /// Optional watchdog: file a `stalled` inbox card when an iteration has been
     /// in flight (turn running, not yet settled) for at least this many seconds.
     /// `tokens_used` only lands at settle, so there is no mid-turn progress
@@ -152,11 +175,26 @@ impl IssueConfig {
     /// that spec's own mode/config). Keeps pre-`reviewers` issues working
     /// unchanged.
     pub fn effective_reviewers(&self) -> Vec<ReviewerSpec> {
+        let fallback = self.review_fallback_spec();
         if !self.reviewers.is_empty() {
-            return self.reviewers.clone();
+            return self
+                .reviewers
+                .iter()
+                .map(|e| match e {
+                    ReviewerEntry::Spec(s) => s.clone(),
+                    ReviewerEntry::Inherit(_) => fallback.clone(),
+                })
+                .collect();
         }
-        let fallback = self
-            .agents
+        let n = self.reviewer_count.max(1) as usize;
+        (0..n).map(|_| fallback.clone()).collect()
+    }
+
+    /// The agent a reviewer falls back to when it inherits (or when the explicit
+    /// list is empty): a `"review"` stage override, then `"default"`, then Claude
+    /// Code — carrying that spec's own mode/config.
+    fn review_fallback_spec(&self) -> ReviewerSpec {
+        self.agents
             .get("review")
             .or_else(|| self.agents.get("default"))
             .cloned()
@@ -164,9 +202,7 @@ impl IssueConfig {
                 agent: AgentType::ClaudeCode,
                 mode_id: None,
                 config_values: BTreeMap::new(),
-            });
-        let n = self.reviewer_count.max(1) as usize;
-        (0..n).map(|_| fallback.clone()).collect()
+            })
     }
 }
 
@@ -391,17 +427,65 @@ mod tests {
     fn effective_reviewers_prefers_explicit_list() {
         let cfg = IssueConfig {
             reviewer_count: 5, // ignored when `reviewers` is non-empty
-            reviewers: vec![ReviewerSpec {
+            reviewers: vec![ReviewerEntry::Spec(ReviewerSpec {
                 agent: AgentType::Gemini,
                 mode_id: Some("auto".to_string()),
                 config_values: BTreeMap::new(),
-            }],
+            })],
             ..IssueConfig::default()
         };
         let r = cfg.effective_reviewers();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].agent, AgentType::Gemini);
         assert_eq!(r[0].mode_id.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn effective_reviewers_resolves_inherit_to_default() {
+        // An inherit entry resolves to the default review agent (here `default`,
+        // carrying its mode/config); concrete entries pass through unchanged.
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "default".to_string(),
+            AgentSpec {
+                agent: AgentType::Codex,
+                mode_id: Some("auto".to_string()),
+                config_values: BTreeMap::new(),
+            },
+        );
+        let cfg = IssueConfig {
+            agents,
+            reviewers: vec![
+                ReviewerEntry::Inherit(ReviewerInherit { inherit: true }),
+                ReviewerEntry::Spec(bare(AgentType::Gemini)),
+            ],
+            ..IssueConfig::default()
+        };
+        let r = cfg.effective_reviewers();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].agent, AgentType::Codex); // inherit → default
+        assert_eq!(r[0].mode_id.as_deref(), Some("auto"));
+        assert_eq!(r[1].agent, AgentType::Gemini); // concrete passthrough
+    }
+
+    #[test]
+    fn reviewer_entry_parses_legacy_and_inherit_forms() {
+        // A bare string, a full object, and the new inherit marker all parse;
+        // the inherit marker round-trips as `{"inherit":true}`.
+        let json = r#"["codex",{"agent":"gemini","mode_id":"auto"},{"inherit":true}]"#;
+        let entries: Vec<ReviewerEntry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0], ReviewerEntry::Spec(s) if s.agent == AgentType::Codex));
+        assert!(matches!(
+            &entries[1],
+            ReviewerEntry::Spec(s)
+                if s.agent == AgentType::Gemini && s.mode_id.as_deref() == Some("auto")
+        ));
+        assert!(matches!(&entries[2], ReviewerEntry::Inherit(_)));
+        assert_eq!(
+            serde_json::to_string(&entries[2]).unwrap(),
+            r#"{"inherit":true}"#
+        );
     }
 
     #[test]

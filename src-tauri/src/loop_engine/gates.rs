@@ -937,6 +937,7 @@ async fn finalize_iterations(
 mod tests {
     use super::*;
     use crate::acp::error::AcpError;
+    use crate::models::loops::ReviewerEntry;
     use crate::db::entities::loop_artifact_revision::ActorKind;
     use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
     use crate::db::entities::loop_link::LinkKind;
@@ -1473,16 +1474,16 @@ mod tests {
         // Two heterogeneous reviewers → two slots, each with its own agent.
         let cfg = IssueConfig {
             reviewers: vec![
-                ReviewerSpec {
+                ReviewerEntry::Spec(ReviewerSpec {
                     agent: AgentType::ClaudeCode,
                     mode_id: None,
                     config_values: Default::default(),
-                },
-                ReviewerSpec {
+                }),
+                ReviewerEntry::Spec(ReviewerSpec {
                     agent: AgentType::Codex,
                     mode_id: None,
                     config_values: Default::default(),
-                },
+                }),
             ],
             ..IssueConfig::default()
         };
