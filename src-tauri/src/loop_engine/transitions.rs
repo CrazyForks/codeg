@@ -25,6 +25,69 @@ fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
     matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
 }
 
+/// Single source of truth for legal status edges across the three loop state
+/// machines (§2.8). Defense-in-depth: the `cas_*_status` helpers assert the
+/// (expected → new) pair is a legal *edge* before issuing the conditional
+/// UPDATE, so a stray CAS with a nonsense pair surfaces as
+/// [`LoopError::IllegalTransition`] instead of silently corrupting the pipeline.
+/// This is a *static* check on the pair, independent of the row's live value
+/// (that race is the CAS miss → [`LoopError::Conflict`]). Bulk recovery
+/// transitions (`recovery.rs` interrupting many rows at once) intentionally
+/// bypass this — they are a documented mass `update_many`, not a per-row CAS.
+pub(crate) fn is_legal_issue(from: IssueStatus, to: IssueStatus) -> bool {
+    use IssueStatus::*;
+    matches!(
+        (from, to),
+        (Pending, Running)
+            | (Running, Paused)
+            | (Paused, Running)
+            | (Running, Blocked)
+            | (Blocked, Running)
+            | (Running, Done)
+            | (Pending, Cancelled)
+            | (Running, Cancelled)
+            | (Paused, Cancelled)
+            | (Blocked, Cancelled)
+    )
+}
+
+pub(crate) fn is_legal_iteration(from: IterationStatus, to: IterationStatus) -> bool {
+    use IterationStatus::*;
+    matches!(
+        (from, to),
+        (Queued, Running)
+            | (Running, Succeeded)
+            | (Running, Failed)
+            | (Queued, Failed)
+            | (Queued, Interrupted)
+            | (Running, Interrupted)
+            | (Queued, Cancelled)
+            | (Running, Cancelled)
+    )
+}
+
+pub(crate) fn is_legal_artifact(from: ArtifactStatus, to: ArtifactStatus) -> bool {
+    use ArtifactStatus::*;
+    matches!(
+        (from, to),
+        (Pending, InProgress)
+            | (InProgress, Done)
+            | (AwaitingApproval, Done)
+            | (Pending, Blocked)
+            | (InProgress, Blocked)
+            // Review-rejected retry sends an in-progress task back to pending so
+            // it can be re-implemented at the next attempt (gates.rs).
+            | (InProgress, Pending)
+            | (AwaitingApproval, Superseded)
+            | (AwaitingApproval, Cancelled)
+            | (Done, Superseded)
+            | (Blocked, InProgress)
+            | (Blocked, Pending)
+            | (Pending, Cancelled)
+            | (InProgress, Cancelled)
+    )
+}
+
 /// CAS an issue's status: write `new` only if it currently equals `expected`.
 /// Returns `true` on success, `false` on a miss (the caller maps that to
 /// [`LoopError::Conflict`]).
@@ -34,6 +97,11 @@ pub async fn cas_issue_status(
     expected: IssueStatus,
     new: IssueStatus,
 ) -> Result<bool, LoopError> {
+    // `IssueStatus` is `Clone` (not `Copy`, unlike its sibling enums), so clone
+    // for the legality probe and keep the originals for the filter/update below.
+    if !is_legal_issue(expected.clone(), new.clone()) {
+        return Err(LoopError::IllegalTransition);
+    }
     let res = loop_issue::Entity::update_many()
         .col_expr(loop_issue::Column::Status, Expr::value(new.to_value()))
         .col_expr(loop_issue::Column::UpdatedAt, Expr::value(Utc::now()))
@@ -51,6 +119,9 @@ pub async fn cas_artifact_status(
     expected: ArtifactStatus,
     new: ArtifactStatus,
 ) -> Result<bool, LoopError> {
+    if !is_legal_artifact(expected, new) {
+        return Err(LoopError::IllegalTransition);
+    }
     let res = loop_artifact::Entity::update_many()
         .col_expr(loop_artifact::Column::Status, Expr::value(new.to_value()))
         .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
@@ -115,6 +186,9 @@ pub async fn cas_iteration_status(
     expected: IterationStatus,
     new: IterationStatus,
 ) -> Result<bool, LoopError> {
+    if !is_legal_iteration(expected, new) {
+        return Err(LoopError::IllegalTransition);
+    }
     let res = loop_iteration::Entity::update_many()
         .col_expr(loop_iteration::Column::Status, Expr::value(new.to_value()))
         .filter(loop_iteration::Column::Id.eq(id))
@@ -264,5 +338,36 @@ mod tests {
         // → classified as a lost race (Ok(None)), not an Err.
         let again = try_claim_iteration(&db.conn, c("dup")).await.unwrap();
         assert!(again.is_none(), "duplicate token is a typed unique violation → Ok(None)");
+    }
+
+    #[test]
+    fn is_legal_covers_known_edges_and_rejects_nonsense() {
+        use crate::db::entities::loop_artifact::ArtifactStatus as A;
+        use crate::db::entities::loop_issue::IssueStatus as I;
+        use crate::db::entities::loop_iteration::IterationStatus as It;
+        // Representative legal edges.
+        assert!(is_legal_issue(I::Pending, I::Running));
+        assert!(is_legal_issue(I::Running, I::Done));
+        assert!(is_legal_iteration(It::Queued, It::Running));
+        assert!(is_legal_iteration(It::Running, It::Succeeded));
+        assert!(is_legal_artifact(A::Pending, A::InProgress));
+        assert!(is_legal_artifact(A::InProgress, A::Done));
+        // Nonsense edges are illegal.
+        assert!(!is_legal_issue(I::Done, I::Running));
+        assert!(!is_legal_iteration(It::Succeeded, It::Running));
+        assert!(!is_legal_artifact(A::Done, A::InProgress));
+        // Identity is never a "transition".
+        assert!(!is_legal_issue(I::Running, I::Running));
+    }
+
+    #[tokio::test]
+    async fn cas_rejects_illegal_pair_before_touching_db() {
+        let (db, _space, issue_id) = seed().await;
+        // Done is terminal; Done→Running is not a legal edge → IllegalTransition,
+        // independent of the row's current status.
+        let err = cas_issue_status(&db.conn, issue_id, IssueStatus::Done, IssueStatus::Running)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoopError::IllegalTransition));
     }
 }
