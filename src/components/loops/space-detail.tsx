@@ -27,10 +27,11 @@ import { SpaceDefaultsDialog } from "@/components/loops/space-defaults-dialog"
 type SpaceTab = "issues" | "iterations" | "artifacts" | "inbox" | "memory"
 
 /** The iteration session a `question` inbox card points at, parsed from its
- *  payload (written by the engine's question router). */
+ *  payload (written by the engine's question router). The dialog self-discovers
+ *  the live connection by `conversationId`; the card's `agent_type` is kept only
+ *  as a fast-path hint shown while the conversation summary loads. */
 interface OpenIteration {
   conversationId: number
-  connectionId: string | null
   agentType: AgentType | null
 }
 
@@ -44,7 +45,6 @@ function openIterationFromCard(item: LoopInboxItemRow): OpenIteration | null {
   if (conversationId <= 0) return null
   return {
     conversationId,
-    connectionId: typeof p.connection_id === "string" ? p.connection_id : null,
     agentType:
       typeof p.agent_type === "string" ? (p.agent_type as AgentType) : null,
   }
@@ -191,7 +191,6 @@ export function SpaceDetail({
             if (!o) setOpenIteration(null)
           }}
           conversationId={openIteration.conversationId}
-          connectionId={openIteration.connectionId}
           agentType={openIteration.agentType}
         />
       )}

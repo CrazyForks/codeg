@@ -1,21 +1,29 @@
 "use client"
 
 /**
- * Viewer for a single loop iteration's agent session, opened from a `question`
- * inbox card so a person can answer the iteration's `ask_user_question` (and
- * watch it stream live).
+ * Viewer for a single loop iteration's agent session. Opened from the iteration
+ * list (any iteration) or a `question` inbox card (one awaiting an answer), it
+ * shows the iteration's transcript and — while the iteration is still running —
+ * its live stream, plus the live `AskQuestionCard` so a person can answer the
+ * iteration's `ask_user_question`.
  *
- * Mirrors `SubAgentSessionDialog`: it attaches read-only to a connection the
- * loop engine owns (via `connectAsViewer`, torn down with `disconnect` which
- * only detaches a viewer — it never kills the engine's agent) and bridges the
- * live stream into the runtime session with the shared `child-session-hooks`.
- * Unlike the sub-agent viewer it also surfaces the live `AskQuestionCard`, since
- * answering the question is the whole point of opening it. The answer flows
- * through the normal `answerQuestion` route on the iteration's connection; the
+ * Live attach is self-discovered: on open the dialog asks the backend whether a
+ * LIVE engine-owned connection is bound to this `conversationId` (the engine
+ * binds it when it sends the iteration's briefing prompt, so a running iteration
+ * is discoverable). If one exists it attaches read-only via `connectAsViewer`
+ * (torn down with `disconnect`, which only detaches a viewer — it never kills the
+ * engine's agent) and bridges the live stream in with the shared
+ * `child-session-hooks`. If none exists (a settled iteration, or one opened
+ * before its connection bound) it falls back to the persisted transcript. The
+ * answer flows through `answerQuestion` on the discovered connection; the
  * backend's `QuestionResolved` then clears the inbox card.
+ *
+ * The agent type is the conversation's own (authoritative, from its summary);
+ * the optional `agentType` prop is a fast-path hint shown while the summary
+ * loads — e.g. a question card carries it in its payload.
  */
 
-import { useCallback, useEffect } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 
 import { AgentIcon } from "@/components/agent-icon"
@@ -35,21 +43,25 @@ import {
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import { useConversationRuntime } from "@/contexts/conversation-runtime-context"
 import { useAcpActions } from "@/contexts/acp-connections-context"
+import { acpFindConnectionForConversation } from "@/lib/api"
 import { AGENT_LABELS, type AgentType, type QuestionAnswer } from "@/lib/types"
 
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
   conversationId: number
-  connectionId: string | null
-  agentType: AgentType | null
+  /**
+   * Optional agent-type hint (e.g. from a question card payload) shown while the
+   * conversation summary — the authoritative source — loads. Omit it and the
+   * dialog derives the agent type from the conversation itself.
+   */
+  agentType?: AgentType | null
 }
 
 export function IterationDialog({
   open,
   onOpenChange,
   conversationId,
-  connectionId,
   agentType,
 }: Props) {
   const t = useTranslations("Loops.iteration")
@@ -67,8 +79,7 @@ export function IterationDialog({
         {open && conversationId > 0 ? (
           <IterationSessionBody
             conversationId={conversationId}
-            connectionId={connectionId}
-            agentType={agentType}
+            agentTypeHint={agentType ?? null}
           />
         ) : null}
       </DialogContent>
@@ -78,60 +89,85 @@ export function IterationDialog({
 
 function IterationSessionBody({
   conversationId,
-  connectionId,
-  agentType,
+  agentTypeHint,
 }: {
   conversationId: number
-  connectionId: string | null
-  agentType: AgentType | null
+  agentTypeHint: AgentType | null
 }) {
   const t = useTranslations("Loops.iteration")
   const { connectAsViewer, disconnect, answerQuestion, respondPermission } =
     useAcpActions()
-
-  // Attach read-only to the engine-owned iteration connection for this dialog's
-  // lifetime; detach (not disconnect-the-agent) on close. The body only mounts
-  // while the dialog is open, so connectionId is stable across this effect.
-  useEffect(() => {
-    if (!connectionId) return
-    void connectAsViewer(
-      connectionId,
-      connectionId,
-      agentType ?? "claude_code",
-      null
-    )
-    return () => {
-      void disconnect(connectionId)
-    }
-  }, [connectionId, agentType, connectAsViewer, disconnect])
-
-  const conn = useChildConnectionState(connectionId)
-  const connStatus = conn?.status ?? null
-  const isStreaming = connStatus === "prompting"
-
   const { refetchDetail, setLiveOwnsActiveTurn } = useConversationRuntime()
 
-  // Viewer mode for this conversation: while a live connection is attached, strip
-  // the persisted copy of the active reply so the stream never duplicates. With no
-  // connection (a settled iteration opened from the list), there is no live reply
-  // to own the turn — keep the persisted transcript whole. No kickoff text either:
-  // the iteration's user turn (its briefing) is persisted.
-  useEffect(() => {
-    setLiveOwnsActiveTurn(conversationId, connectionId != null, null)
-  }, [conversationId, connectionId, setLiveOwnsActiveTurn])
-
-  // Single persisted-detail fetch on mount, `preserveLive: true` so the bridged
+  // Single persisted-detail fetch on mount, `preserveLive: true` so a bridged
   // reply is never wiped (the projection dedups against the persisted copy).
   useEffect(() => {
     refetchDetail(conversationId, { preserveLive: true })
   }, [conversationId, refetchDetail])
 
-  const { loading, error, acpLoadError } = useConversationDetail(
+  const { loading, error, acpLoadError, detail } = useConversationDetail(
     conversationId,
-    {
-      enabled: false,
-    }
+    { enabled: false }
   )
+
+  // Authoritative agent type is the conversation's own; the caller's hint covers
+  // the brief window before the summary loads.
+  const agentType: AgentType | null =
+    detail?.summary.agent_type ?? agentTypeHint
+
+  // Discover the engine-owned LIVE connection bound to this conversation. The
+  // engine binds conversation_id when it sends the iteration's briefing prompt,
+  // so a running iteration is discoverable here; a settled one resolves to null
+  // and we read the persisted transcript instead. The primary lookup is by
+  // conversation_id — agentType only seeds the unused session_id fallback — so we
+  // run discovery immediately without waiting for the summary.
+  const [liveConnId, setLiveConnId] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void acpFindConnectionForConversation(
+      conversationId,
+      undefined,
+      agentTypeHint ?? "claude_code"
+    )
+      .then((info) => {
+        if (!cancelled) setLiveConnId(info?.connection_id ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setLiveConnId(null)
+      })
+    return () => {
+      cancelled = true
+    }
+    // Discovery is keyed on the conversation only; agentTypeHint is not part of
+    // the primary lookup and changing it must not re-run discovery.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId])
+
+  // Attach read-only once we have BOTH a live connection and a resolved agent
+  // type, so the viewer parses/renders events with the right agent (avoids a
+  // wrong-agent attach + re-attach flicker). Detach — never disconnect the
+  // engine's agent — on close.
+  useEffect(() => {
+    if (!liveConnId || !agentType) return
+    void connectAsViewer(liveConnId, liveConnId, agentType, null)
+    return () => {
+      void disconnect(liveConnId)
+    }
+  }, [liveConnId, agentType, connectAsViewer, disconnect])
+
+  const conn = useChildConnectionState(liveConnId)
+  const connStatus = conn?.status ?? null
+  const isStreaming = connStatus === "prompting"
+
+  // Viewer mode for this conversation: while a live connection is attached, strip
+  // the persisted copy of the active reply so the stream never duplicates. With
+  // no live connection (a settled iteration), keep the persisted transcript
+  // whole. No kickoff text either: the iteration's user turn (its briefing) is
+  // persisted.
+  useEffect(() => {
+    setLiveOwnsActiveTurn(conversationId, liveConnId != null, null)
+  }, [conversationId, liveConnId, setLiveOwnsActiveTurn])
+
   const detailLoading = isStreaming ? false : loading
 
   useChildLiveBridge(conversationId, conn)
@@ -141,18 +177,18 @@ function IterationSessionBody({
 
   const onRespondPermission = useCallback(
     (requestId: string, optionId: string) => {
-      if (!connectionId) return
-      void respondPermission(connectionId, requestId, optionId)
+      if (!liveConnId) return
+      void respondPermission(liveConnId, requestId, optionId)
     },
-    [connectionId, respondPermission]
+    [liveConnId, respondPermission]
   )
 
   const onAnswerAsk = useCallback(
     (questionId: string, answer: QuestionAnswer) => {
-      if (!connectionId) return
-      return answerQuestion(connectionId, questionId, answer)
+      if (!liveConnId) return
+      return answerQuestion(liveConnId, questionId, answer)
     },
-    [connectionId, answerQuestion]
+    [liveConnId, answerQuestion]
   )
 
   return (
@@ -191,7 +227,7 @@ function IterationSessionBody({
               onRespond={onRespondPermission}
             />
           )}
-          {pendingAsk && pendingAsk.questions.length > 0 && connectionId && (
+          {pendingAsk && pendingAsk.questions.length > 0 && liveConnId && (
             <AskQuestionCard question={pendingAsk} onAnswer={onAnswerAsk} />
           )}
         </div>

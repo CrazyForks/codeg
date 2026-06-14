@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { IterationDialog } from "./iteration-dialog"
 import type { ConnectionState } from "@/contexts/acp-connections-context"
-import type { PendingQuestionState } from "@/lib/types"
+import type {
+  AgentType,
+  ConversationDetail,
+  PendingQuestionState,
+} from "@/lib/types"
 
 // next-intl: return a STABLE `t` (per project mock guidance) so effects that
 // depend on the translator identity don't re-run every render.
@@ -38,13 +42,23 @@ vi.mock("@/contexts/conversation-runtime-context", () => ({
   useConversationRuntime: () => ({ refetchDetail, setLiveOwnsActiveTurn }),
 }))
 
+// The conversation summary is the authoritative agent-type source; controllable.
+let mockDetail: ConversationDetail | null = null
 vi.mock("@/hooks/use-conversation-detail", () => ({
   useConversationDetail: () => ({
-    detail: null,
+    detail: mockDetail,
     loading: false,
     error: null,
     acpLoadError: null,
   }),
+}))
+
+// Connection discovery — the heart of the live-attach behavior. The dialog asks
+// "is there a live engine-owned connection for this conversation?" on open.
+const acpFindConnectionForConversation = vi.fn()
+vi.mock("@/lib/api", () => ({
+  acpFindConnectionForConversation: (...a: unknown[]) =>
+    acpFindConnectionForConversation(...a),
 }))
 
 vi.mock("@/components/message/message-list-view", () => ({
@@ -52,6 +66,7 @@ vi.mock("@/components/message/message-list-view", () => ({
     <div
       data-testid="message-list-view"
       data-conversation-id={String(props.conversationId)}
+      data-agent-type={String(props.agentType)}
     />
   ),
 }))
@@ -112,21 +127,44 @@ function askState(): PendingQuestionState {
   }
 }
 
+/** Minimal conversation detail carrying just the agent type the dialog reads. */
+function detailWithAgent(agent_type: AgentType): ConversationDetail {
+  return {
+    summary: { agent_type },
+    turns: [],
+  } as unknown as ConversationDetail
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   mockConn = { status: "prompting" }
+  mockDetail = null
+  // Default: no live connection — settled iteration / read persisted transcript.
+  acpFindConnectionForConversation.mockResolvedValue(null)
 })
 
 describe("IterationDialog", () => {
-  it("attaches as a viewer on open with the iteration's connection", async () => {
+  it("discovers and attaches as a viewer on open", async () => {
+    acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "iter-conn",
+      event_seq: 0,
+    })
     render(
       <IterationDialog
         open
         onOpenChange={() => {}}
         conversationId={42}
-        connectionId="iter-conn"
         agentType="claude_code"
       />
+    )
+    // Discovery is keyed on the conversation id; agentType is irrelevant to the
+    // primary (conversation_id) lookup so any value is fine here.
+    await waitFor(() =>
+      expect(acpFindConnectionForConversation).toHaveBeenCalledWith(
+        42,
+        undefined,
+        "claude_code"
+      )
     )
     await waitFor(() =>
       expect(connectAsViewer).toHaveBeenCalledWith(
@@ -136,20 +174,61 @@ describe("IterationDialog", () => {
         null
       )
     )
+    // Live connection present → tell the runtime the live stream owns the turn.
+    await waitFor(() =>
+      expect(setLiveOwnsActiveTurn).toHaveBeenCalledWith(42, true, null)
+    )
     expect(screen.getByTestId("message-list-view")).toHaveAttribute(
       "data-conversation-id",
       "42"
     )
   })
 
-  it("answers the live question through the iteration connection", async () => {
+  it("falls back to the persisted transcript when no live connection", async () => {
+    acpFindConnectionForConversation.mockResolvedValue(null)
+    render(
+      <IterationDialog
+        open
+        onOpenChange={() => {}}
+        conversationId={42}
+        agentType="claude_code"
+      />
+    )
+    // Persisted detail is always fetched (preserveLive) regardless of liveness.
+    await waitFor(() =>
+      expect(refetchDetail).toHaveBeenCalledWith(42, { preserveLive: true })
+    )
+    await waitFor(() =>
+      expect(acpFindConnectionForConversation).toHaveBeenCalledTimes(1)
+    )
+    // No live connection → never attach a viewer; the persisted transcript shows.
+    expect(connectAsViewer).not.toHaveBeenCalled()
+    expect(setLiveOwnsActiveTurn).toHaveBeenCalledWith(42, false, null)
+  })
+
+  it("sources the agent type from the conversation summary when no hint", async () => {
+    acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "c1",
+      event_seq: 0,
+    })
+    mockDetail = detailWithAgent("codex")
+    render(<IterationDialog open onOpenChange={() => {}} conversationId={7} />)
+    await waitFor(() =>
+      expect(connectAsViewer).toHaveBeenCalledWith("c1", "c1", "codex", null)
+    )
+  })
+
+  it("answers the live question through the discovered connection", async () => {
+    acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "iter-conn",
+      event_seq: 0,
+    })
     mockConn = { status: "prompting", pendingAskQuestion: askState() }
     render(
       <IterationDialog
         open
         onOpenChange={() => {}}
         conversationId={42}
-        connectionId="iter-conn"
         agentType="claude_code"
       />
     )
@@ -161,12 +240,15 @@ describe("IterationDialog", () => {
   })
 
   it("detaches (not disconnect-the-agent) when closed", async () => {
+    acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "iter-conn",
+      event_seq: 0,
+    })
     const { rerender } = render(
       <IterationDialog
         open
         onOpenChange={() => {}}
         conversationId={42}
-        connectionId="iter-conn"
         agentType="claude_code"
       />
     )
@@ -177,24 +259,27 @@ describe("IterationDialog", () => {
         open={false}
         onOpenChange={() => {}}
         conversationId={42}
-        connectionId="iter-conn"
         agentType="claude_code"
       />
     )
     await waitFor(() => expect(disconnect).toHaveBeenCalledWith("iter-conn"))
   })
 
-  it("does not render the question band when nothing is pending", () => {
+  it("does not render the question band when nothing is pending", async () => {
+    acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "iter-conn",
+      event_seq: 0,
+    })
     mockConn = { status: "connected" }
     render(
       <IterationDialog
         open
         onOpenChange={() => {}}
         conversationId={42}
-        connectionId="iter-conn"
         agentType="claude_code"
       />
     )
+    await waitFor(() => expect(connectAsViewer).toHaveBeenCalled())
     expect(screen.queryByTestId("ask-question")).not.toBeInTheDocument()
     expect(screen.queryByTestId("permission")).not.toBeInTheDocument()
   })

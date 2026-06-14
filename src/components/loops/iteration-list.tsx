@@ -234,8 +234,6 @@ export function IterationList({
           if (!o) setOpenConversationId(null)
         }}
         conversationId={openConversationId ?? 0}
-        connectionId={null}
-        agentType={null}
       />
     </>
   )
