@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tokio::sync::Notify;
 use tokio::time::{interval, Duration, MissedTickBehavior};
@@ -187,6 +188,87 @@ pub(crate) fn ready_nodes(dag: &LoopDagView, route: IssueRoute) -> Vec<FrontierI
 
     // 4. Tasks exist → read frontier done; the write pipeline (gates) drives them.
     Vec::new()
+}
+
+/// True if the task DAG ever has ≥2 tasks simultaneously ready — i.e. real
+/// concurrency. Frontier simulation; correct for FAN-OUT (A→{B,C}, which has
+/// edges==n-1 yet is parallel — the naive edge-count heuristic was WRONG here)
+/// and multiple roots. (v1 deps are a forest, but this stays general.) Cycles
+/// are rejected at submit, so the simulation always terminates.
+fn dag_has_parallelism(dag: &LoopDagView) -> bool {
+    let tasks: Vec<i32> = dag
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::Task)
+        .map(|a| a.id)
+        .collect();
+    if tasks.len() < 2 {
+        return false;
+    }
+    let preds = |t: i32| -> Vec<i32> {
+        dag.links
+            .iter()
+            .filter(|l| l.kind == LinkKind::DependsOn && l.from_artifact_id == t)
+            .map(|l| l.to_artifact_id)
+            .collect()
+    };
+    let mut done: std::collections::HashSet<i32> = Default::default();
+    loop {
+        let ready: Vec<i32> = tasks
+            .iter()
+            .copied()
+            .filter(|t| !done.contains(t) && preds(*t).iter().all(|p| done.contains(p)))
+            .collect();
+        if ready.len() >= 2 {
+            return true; // ≥2 concurrently ready ⇒ parallel
+        }
+        if ready.is_empty() {
+            return false; // all settled (or only dead-pred tasks left) ⇒ serial
+        }
+        done.insert(ready[0]);
+    }
+}
+
+/// Decide and persist the issue's `execution_mode` exactly once — the first tick
+/// at which its task DAG exists. Returns the resolved mode (`Some` once decided,
+/// `None` while there are still no tasks).
+///
+/// Timing safety: a plan submission is atomic (all tasks + their `depends_on`
+/// edges land in a single `submit_artifacts` call), so the moment any task is
+/// present the whole task set is too — there is no half-built-DAG window. A
+/// write-once conditional UPDATE (`WHERE execution_mode IS NULL`) then guarantees
+/// a re-read or a racing tick can never relatch a different mode.
+async fn ensure_execution_mode(
+    conn: &sea_orm::DatabaseConnection,
+    issue: &loop_issue::Model,
+    dag: &LoopDagView,
+) -> Result<Option<String>, LoopError> {
+    // Already decided → keep it (in-memory guard before any write).
+    if let Some(mode) = &issue.execution_mode {
+        return Ok(Some(mode.clone()));
+    }
+    // No tasks yet (read stages still in flight) → nothing to decide.
+    if !dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Task) {
+        return Ok(None);
+    }
+    let mode = if dag_has_parallelism(dag) {
+        "parallel"
+    } else {
+        "serial"
+    };
+    // Write-once CAS: only the first writer sets it; a racing tick no-ops.
+    loop_issue::Entity::update_many()
+        .col_expr(loop_issue::Column::ExecutionMode, Expr::value(mode))
+        .filter(loop_issue::Column::Id.eq(issue.id))
+        .filter(loop_issue::Column::ExecutionMode.is_null())
+        .exec(conn)
+        .await?;
+    // Read back the authoritative value (in case another writer won the CAS).
+    let resolved = loop_issue::Entity::find_by_id(issue.id)
+        .one(conn)
+        .await?
+        .and_then(|i| i.execution_mode);
+    Ok(resolved)
 }
 
 /// Resolve the full agent spec (agent + startup mode + config) for a stage from
@@ -526,6 +608,12 @@ pub(crate) async fn tick_once(
         });
     }
 
+    // Decide the issue's execution mode once the task DAG exists (write-once;
+    // no-op while read stages are still in flight). Recorded for the parallel
+    // pipeline (phases 1–2) and the DAG view; the serial wiring below is
+    // unaffected by it in phase 0.
+    ensure_execution_mode(conn, &issue, &dag).await?;
+
     // Read pipeline complete (tasks exist) → drive the write pipeline. A no-op
     // when there are no tasks yet (read stages still in flight), so it is safe
     // to call on every "frontier empty" tick.
@@ -830,6 +918,104 @@ mod tests {
     use sea_orm::sea_query::Expr;
     use serde_json::json;
     use std::path::PathBuf;
+
+    use crate::db::entities::loop_artifact_revision::ActorKind;
+    use crate::models::loops::LoopLinkRow;
+
+    /// Minimal `Task` artifact row for the pure `dag_has_parallelism` tests.
+    fn task_row(id: i32) -> LoopArtifactRow {
+        LoopArtifactRow {
+            id,
+            issue_id: 1,
+            issue_seq: 1,
+            kind: ArtifactKind::Task,
+            title: format!("T{id}"),
+            status: ArtifactStatus::Pending,
+            origin: ActorKind::Agent,
+            produced_by_iteration_id: None,
+            verdict: None,
+            attempt: 0,
+            sort: id,
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Build a task-only DAG. `edges` are `(successor, predecessor)` pairs — the
+    /// `DependsOn` direction (from = successor, to = predecessor).
+    fn dag_of(task_ids: &[i32], edges: &[(i32, i32)]) -> LoopDagView {
+        LoopDagView {
+            artifacts: task_ids.iter().map(|&id| task_row(id)).collect(),
+            links: edges
+                .iter()
+                .enumerate()
+                .map(|(i, &(succ, pred))| LoopLinkRow {
+                    id: i as i32 + 1,
+                    from_artifact_id: succ,
+                    to_artifact_id: pred,
+                    kind: LinkKind::DependsOn,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn execution_mode_chain_is_serial() {
+        // A→B→C: never ≥2 ready at once.
+        assert!(!dag_has_parallelism(&dag_of(&[1, 2, 3], &[(2, 1), (3, 2)])));
+    }
+
+    #[test]
+    fn execution_mode_independent_roots_is_parallel() {
+        // Two tasks, no edges: both ready immediately.
+        assert!(dag_has_parallelism(&dag_of(&[1, 2], &[])));
+    }
+
+    #[test]
+    fn execution_mode_fanout_is_parallel() {
+        // A→{B,C}: 2 edges over 3 tasks (edges == n-1) yet B and C are ready
+        // together once A is done. Regression for the naive edge-count heuristic.
+        assert!(dag_has_parallelism(&dag_of(&[1, 2, 3], &[(2, 1), (3, 1)])));
+    }
+
+    #[test]
+    fn execution_mode_single_task_is_serial() {
+        assert!(!dag_has_parallelism(&dag_of(&[1], &[])));
+    }
+
+    #[tokio::test]
+    async fn execution_mode_write_once() {
+        let (db, _data_dir, issue_id) = setup().await;
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(issue.execution_mode.is_none());
+
+        // First decision: a parallel DAG (two independent tasks) → "parallel".
+        let m1 = ensure_execution_mode(&db.conn, &issue, &dag_of(&[1, 2], &[]))
+            .await
+            .unwrap();
+        assert_eq!(m1.as_deref(), Some("parallel"));
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.execution_mode.as_deref(), Some("parallel"));
+
+        // A later tick with a (hypothetically) serial DAG must NOT relatch it.
+        let m2 = ensure_execution_mode(&db.conn, &issue, &dag_of(&[1], &[]))
+            .await
+            .unwrap();
+        assert_eq!(m2.as_deref(), Some("parallel"), "write-once: never recomputed");
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.execution_mode.as_deref(), Some("parallel"));
+    }
 
     #[test]
     fn resolve_agent_spec_uses_stage_override_with_mode_and_config() {
