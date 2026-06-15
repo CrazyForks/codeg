@@ -101,8 +101,12 @@ export function LoopConfigForm({
       <div className="mt-3 max-h-[52vh] overflow-y-auto pr-1">
         {/* Agents — nested sub-tabs: default + single stages + review */}
         <TabsContent value="agents" className="data-[state=inactive]:hidden">
-          <Tabs defaultValue="default" className="flex flex-col">
-            <TabsList className="h-auto flex-wrap self-start">
+          <Tabs
+            defaultValue="default"
+            orientation="vertical"
+            className="flex gap-3"
+          >
+            <TabsList className="h-auto shrink-0 flex-col items-stretch">
               <TabsTrigger value="default">{tCfg("subtabDefault")}</TabsTrigger>
               {STAGE_SUBTABS.map((s) => (
                 <TabsTrigger key={s} value={s}>
@@ -111,7 +115,7 @@ export function LoopConfigForm({
               ))}
             </TabsList>
 
-            <div className="mt-3">
+            <div className="min-w-0 flex-1">
               <TabsContent
                 value="default"
                 className="space-y-2 data-[state=inactive]:hidden"

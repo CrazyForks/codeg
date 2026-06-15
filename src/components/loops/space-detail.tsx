@@ -16,6 +16,11 @@ import { useLoopNav } from "@/hooks/use-loop-nav"
 import type { LoopTab } from "@/lib/loop-nav"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+} from "@/components/ui/resizable"
 import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
 import { IssueList } from "@/components/loops/issue-list"
 import { IssueDetail } from "@/components/loops/issue-detail"
@@ -114,21 +119,31 @@ export function SpaceDetail({
           value="issues"
           className="min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden"
         >
-          <div className="flex h-full min-h-0">
-            <div className="flex w-80 shrink-0 flex-col border-r">
+          <ResizablePanelGroup
+            direction="horizontal"
+            autoSaveId="loop:space:issues"
+            className="h-full min-h-0"
+          >
+            <ResizablePanel
+              defaultSize={26}
+              minSize={16}
+              maxSize={50}
+              className="flex flex-col border-r"
+            >
               <IssueList
                 spaceId={space.id}
                 selectedIssueId={selectedIssueId}
                 onSelectIssue={selectIssue}
               />
-            </div>
-            <div className="min-w-0 flex-1">
+            </ResizablePanel>
+            <ResizableHandle />
+            <ResizablePanel defaultSize={74} minSize={40} className="min-w-0">
               <IssueDetail
                 issueId={selectedIssueId}
                 spaceDefaultConfig={space.default_config}
               />
-            </div>
-          </div>
+            </ResizablePanel>
+          </ResizablePanelGroup>
         </TabsContent>
 
         <TabsContent

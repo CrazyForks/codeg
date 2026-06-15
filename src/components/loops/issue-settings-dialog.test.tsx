@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { IssueSettingsDialog } from "./issue-settings-dialog"
+import { IssueSettingsPanel } from "./issue-settings-dialog"
 import type { IssueConfig, LoopIssueDetail } from "@/lib/types"
 
 const stableT = (key: string) => key
@@ -34,26 +34,6 @@ vi.mock("./loop-config-form", async (orig) => {
     ),
   }
 })
-
-vi.mock("@/components/ui/dialog", () => ({
-  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
-    open ? <div>{children}</div> : null,
-  DialogContent: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  DialogHeader: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  DialogFooter: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  DialogTitle: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-  DialogDescription: ({ children }: { children: React.ReactNode }) => (
-    <div>{children}</div>
-  ),
-}))
 
 function fullConfig(): IssueConfig {
   return {
@@ -99,11 +79,9 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
 
 beforeEach(() => vi.clearAllMocks())
 
-describe("IssueSettingsDialog", () => {
+describe("IssueSettingsPanel", () => {
   it("saves a custom config", async () => {
-    render(
-      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
-    )
+    render(<IssueSettingsPanel onClose={() => {}} issue={makeIssue()} />)
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
       expect(updateLoopIssueConfig).toHaveBeenCalledWith(5, fullConfig(), 50000)
@@ -111,9 +89,7 @@ describe("IssueSettingsDialog", () => {
   })
 
   it("clears the total budget to unlimited (null)", async () => {
-    render(
-      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
-    )
+    render(<IssueSettingsPanel onClose={() => {}} issue={makeIssue()} />)
     fireEvent.change(screen.getByLabelText("tokenBudget"), {
       target: { value: "" },
     })
@@ -125,9 +101,8 @@ describe("IssueSettingsDialog", () => {
 
   it("saves a null config and disables the form when inheriting", async () => {
     render(
-      <IssueSettingsDialog
-        open
-        onOpenChange={() => {}}
+      <IssueSettingsPanel
+        onClose={() => {}}
         issue={makeIssue({ config: null })}
       />
     )
@@ -143,9 +118,8 @@ describe("IssueSettingsDialog", () => {
 
   it("switches an inheriting issue to custom and saves a config", async () => {
     render(
-      <IssueSettingsDialog
-        open
-        onOpenChange={() => {}}
+      <IssueSettingsPanel
+        onClose={() => {}}
         issue={makeIssue({ config: null })}
       />
     )
@@ -158,9 +132,7 @@ describe("IssueSettingsDialog", () => {
   })
 
   it("switches a custom issue to space default and saves null", async () => {
-    render(
-      <IssueSettingsDialog open onOpenChange={() => {}} issue={makeIssue()} />
-    )
+    render(<IssueSettingsPanel onClose={() => {}} issue={makeIssue()} />)
     fireEvent.click(screen.getByText("useSpaceDefault"))
     fireEvent.click(screen.getByText("save"))
     await waitFor(() =>
@@ -170,18 +142,16 @@ describe("IssueSettingsDialog", () => {
 
   it("shows the running hint only while the issue is running", () => {
     const { rerender } = render(
-      <IssueSettingsDialog
-        open
-        onOpenChange={() => {}}
+      <IssueSettingsPanel
+        onClose={() => {}}
         issue={makeIssue({ status: "running" })}
       />
     )
     expect(screen.getByText("runningHint")).toBeInTheDocument()
 
     rerender(
-      <IssueSettingsDialog
-        open
-        onOpenChange={() => {}}
+      <IssueSettingsPanel
+        onClose={() => {}}
         issue={makeIssue({ status: "pending" })}
       />
     )

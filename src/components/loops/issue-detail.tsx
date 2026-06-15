@@ -26,8 +26,13 @@ import { useLoopResource } from "@/hooks/use-loop-resource"
 import { useLoopNav } from "@/hooks/use-loop-nav"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+} from "@/components/ui/resizable"
 import { DagGraph } from "@/components/loops/dag-graph"
-import { IssueSettingsDialog } from "@/components/loops/issue-settings-dialog"
+import { IssueSettingsPanel } from "@/components/loops/issue-settings-dialog"
 import { BoardView } from "@/components/loops/board-view"
 import { IterationList } from "@/components/loops/iteration-list"
 import { ArtifactList } from "@/components/loops/artifact-list"
@@ -75,10 +80,10 @@ export function IssueDetail({
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const { openArtifact } = useLoopNav()
+  const { nav, openArtifact, openSettings, closeSettings } = useLoopNav()
+  const settingsOpen = nav.settings
   const [actionBusy, setActionBusy] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
-  const [settingsOpen, setSettingsOpen] = useState(false)
 
   // Issue detail + DAG + this issue's iterations, kept live by the realtime
   // provider. Scope is the STABLE `issueId` prop — never derived from the async
@@ -169,7 +174,7 @@ export function IssueDetail({
       : issue.token_used.toLocaleString()
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden">
       {/* Row ① — title + token usage + actions */}
       <div className="flex shrink-0 items-start justify-between gap-3 px-5 pt-4 pb-3">
         <div className="min-w-0">
@@ -254,7 +259,7 @@ export function IssueDetail({
             size="icon"
             variant="ghost"
             className="h-8 w-8"
-            onClick={() => setSettingsOpen(true)}
+            onClick={() => openSettings()}
           >
             <Settings2 className="h-4 w-4" />
             <span className="sr-only">{t("settings")}</span>
@@ -262,68 +267,75 @@ export function IssueDetail({
         </div>
       </div>
 
-      {/* Row ② — graph / board */}
-      <div className="min-h-0 flex-1 border-t">
-        <Tabs defaultValue="graph" className="flex h-full min-h-0 flex-col">
-          <TabsList className="mx-auto mt-2 self-center">
-            <TabsTrigger value="graph">{t("subtabGraph")}</TabsTrigger>
-            <TabsTrigger value="board">{t("subtabBoard")}</TabsTrigger>
-          </TabsList>
-          <TabsContent
-            value="graph"
-            className="min-h-0 flex-1 overflow-auto p-5 data-[state=inactive]:hidden"
+      {/* Rows ② + ③ — resizable: graph/board over iterations/artifacts */}
+      <ResizablePanelGroup
+        direction="vertical"
+        autoSaveId="loop:issue:rows"
+        className="min-h-0 flex-1 border-t"
+      >
+        <ResizablePanel defaultSize={68} minSize={30} className="min-h-0">
+          <Tabs defaultValue="graph" className="flex h-full min-h-0 flex-col">
+            <TabsList className="mx-auto mt-2 self-center">
+              <TabsTrigger value="graph">{t("subtabGraph")}</TabsTrigger>
+              <TabsTrigger value="board">{t("subtabBoard")}</TabsTrigger>
+            </TabsList>
+            <TabsContent
+              value="graph"
+              className="min-h-0 flex-1 overflow-auto p-5 data-[state=inactive]:hidden"
+            >
+              <DagGraph
+                artifacts={artifacts}
+                links={links}
+                executingIds={executingIds}
+                onSelect={openArtifact}
+              />
+              {artifacts.length <= 1 && (
+                <p className="mt-4 text-center text-xs text-muted-foreground">
+                  {t("graphPlaceholder")}
+                </p>
+              )}
+            </TabsContent>
+            <TabsContent
+              value="board"
+              className="min-h-0 flex-1 overflow-auto p-5 data-[state=inactive]:hidden"
+            >
+              <BoardView artifacts={artifacts} onSelect={openArtifact} />
+            </TabsContent>
+          </Tabs>
+        </ResizablePanel>
+        <ResizableHandle />
+        <ResizablePanel defaultSize={32} minSize={12} className="min-h-0">
+          <Tabs
+            defaultValue="iterations"
+            className="flex h-full min-h-0 flex-col"
           >
-            <DagGraph
-              artifacts={artifacts}
-              links={links}
-              executingIds={executingIds}
-              onSelect={openArtifact}
-            />
-            {artifacts.length <= 1 && (
-              <p className="mt-4 text-center text-xs text-muted-foreground">
-                {t("graphPlaceholder")}
-              </p>
-            )}
-          </TabsContent>
-          <TabsContent
-            value="board"
-            className="min-h-0 flex-1 overflow-auto p-5 data-[state=inactive]:hidden"
-          >
-            <BoardView artifacts={artifacts} onSelect={openArtifact} />
-          </TabsContent>
-        </Tabs>
-      </div>
-
-      {/* Row ③ — this issue's iterations / artifacts */}
-      <div className="h-48 shrink-0 border-t">
-        <Tabs
-          defaultValue="iterations"
-          className="flex h-full min-h-0 flex-col"
-        >
-          <TabsList className="mx-5 mt-2 self-start">
-            <TabsTrigger value="iterations">
-              {t("subtabIterations")}
-            </TabsTrigger>
-            <TabsTrigger value="artifacts">{t("subtabArtifacts")}</TabsTrigger>
-          </TabsList>
-          <TabsContent
-            value="iterations"
-            className="min-h-0 flex-1 overflow-y-auto px-5 py-2 data-[state=inactive]:hidden"
-          >
-            <IterationList spaceId={issue.space_id} issueId={issue.id} />
-          </TabsContent>
-          <TabsContent
-            value="artifacts"
-            className="min-h-0 flex-1 overflow-y-auto px-5 py-2 data-[state=inactive]:hidden"
-          >
-            <ArtifactList
-              artifacts={artifacts}
-              onSelect={openArtifact}
-              showIssue={false}
-            />
-          </TabsContent>
-        </Tabs>
-      </div>
+            <TabsList className="mx-5 mt-2 self-start">
+              <TabsTrigger value="iterations">
+                {t("subtabIterations")}
+              </TabsTrigger>
+              <TabsTrigger value="artifacts">
+                {t("subtabArtifacts")}
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent
+              value="iterations"
+              className="min-h-0 flex-1 overflow-y-auto px-5 py-2 data-[state=inactive]:hidden"
+            >
+              <IterationList spaceId={issue.space_id} issueId={issue.id} />
+            </TabsContent>
+            <TabsContent
+              value="artifacts"
+              className="min-h-0 flex-1 overflow-y-auto px-5 py-2 data-[state=inactive]:hidden"
+            >
+              <ArtifactList
+                artifacts={artifacts}
+                onSelect={openArtifact}
+                showIssue={false}
+              />
+            </TabsContent>
+          </Tabs>
+        </ResizablePanel>
+      </ResizablePanelGroup>
 
       <AlertDialog
         open={cancelOpen}
@@ -358,12 +370,13 @@ export function IssueDetail({
         </AlertDialogContent>
       </AlertDialog>
 
-      <IssueSettingsDialog
-        open={settingsOpen}
-        onOpenChange={setSettingsOpen}
-        issue={issue}
-        spaceDefaultConfig={spaceDefaultConfig}
-      />
+      {settingsOpen && (
+        <IssueSettingsPanel
+          issue={issue}
+          spaceDefaultConfig={spaceDefaultConfig}
+          onClose={closeSettings}
+        />
+      )}
     </div>
   )
 }
