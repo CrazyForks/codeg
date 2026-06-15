@@ -90,10 +90,14 @@ fn stage_instruction(stage: Stage) -> &'static str {
              scope; do not invent new requirements."
         }
         Stage::Plan => {
-            "Break the work into a sequence of small, self-contained implementation \
+            "Break the work into a set of small, self-contained implementation \
              tasks. Each task must be doable and verifiable on its own and carry \
              enough detail (files, approach, acceptance criteria) for an implementer \
-             with no other context to execute it."
+             with no other context to execute it. Tasks that touch disjoint files \
+             can run in parallel, so prefer non-overlapping file domains; when two \
+             tasks must be ordered (one builds on another's output, or they would \
+             edit the same files), make the later one declare the earlier as its \
+             dependency. A task may declare at most one predecessor."
         }
         Stage::Implement => {
             "Implement the task in the provided worktree. Make the change, keep it \
@@ -133,8 +137,13 @@ fn tool_contract(stage: Stage) -> &'static str {
         }
         Stage::Plan => {
             "Call `loop_submit_artifacts` exactly once with the task breakdown (the \
-             kind is inferred as `task`). Put per-task acceptance criteria in each \
-             artifact's `criteria`."
+             kind is inferred as `task`). List tasks in dependency order and put \
+             per-task acceptance criteria in each artifact's `criteria`. To make a \
+             task depend on an earlier one, set its `depends_on` to a one-element \
+             array holding that earlier task's 0-based index in this same \
+             submission (e.g. a task waiting on the first → `\"depends_on\": [0]`). \
+             A reference may only point to an earlier task, and a task may declare \
+             at most one."
         }
         Stage::Implement => {
             "Do not call a submit tool — the engine detects and commits your \
