@@ -184,6 +184,44 @@ pub async fn cas_task_done_with_freeze(
     Ok(res.rows_affected == 1)
 }
 
+/// Claim the parallel fan-in **session lock** by writing the manifest exactly
+/// once: `UPDATE loop_issue SET fan_in_manifest=? WHERE id=? AND fan_in_manifest
+/// IS NULL`. Returns whether this caller won (rows==1). A versioned, write-once
+/// session token — distinct from the `uniq_active_finalize` agent lease (one
+/// guards the integration *session*, the other a single in-flight agent).
+pub async fn try_claim_fan_in(
+    conn: &DatabaseConnection,
+    issue_id: i32,
+    manifest_json: &str,
+) -> Result<bool, LoopError> {
+    let res = loop_issue::Entity::update_many()
+        .col_expr(
+            loop_issue::Column::FanInManifest,
+            Expr::value(manifest_json.to_string()),
+        )
+        .col_expr(loop_issue::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_issue::Column::Id.eq(issue_id))
+        .filter(loop_issue::Column::FanInManifest.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
+/// Clear the fan-in session lock (`fan_in_manifest → NULL`) once the session has
+/// landed or been abandoned, so a future re-trigger can claim a fresh one.
+pub async fn clear_fan_in(conn: &DatabaseConnection, issue_id: i32) -> Result<(), LoopError> {
+    loop_issue::Entity::update_many()
+        .col_expr(
+            loop_issue::Column::FanInManifest,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(loop_issue::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_issue::Column::Id.eq(issue_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
 /// Inputs for a dispatch claim. `conversation_id` is intentionally absent — the
 /// lease row is inserted first (conversation attached afterwards by the winner).
 pub struct IterationClaim {

@@ -301,44 +301,115 @@ pub async fn ensure_task_worktree(
     let base_ref = task_base_ref(conn, issue.space_id, issue.seq_no, task_id).await?;
     let base_oid = resolve_oid(&repo_path, &base_ref).await?;
 
+    attach_or_rebuild_worktree(
+        conn,
+        &repo_path,
+        space.folder_id,
+        &branch,
+        &worktree_path,
+        &base_oid,
+        issue.base_branch.clone().unwrap_or_default(),
+    )
+    .await
+}
+
+/// Create (or re-attach) the issue's temp **integrate** worktree + branch, where
+/// the parallel result-stage fan-in merges the frozen task commits before the
+/// atomic CAS landing onto the issue branch (spec §4.4).
+///
+/// Branch `loop/{space}/issue-{seq}-integrate`; path a sibling of the issue + task
+/// worktrees, cut from `base_oid` (the manifest's `issue_base_oid`). Attach-first
+/// reuse is crucial here: a partially-merged integration — or one mid-conflict
+/// (`MERGE_HEAD` set) — must be preserved across ticks and crashes so the fan-in
+/// resumes from it rather than restarting.
+pub async fn ensure_integrate_worktree(
+    conn: &DatabaseConnection,
+    data_dir: &Path,
+    issue_id: i32,
+    base_oid: &str,
+) -> Result<WorktreeContext, LoopError> {
+    let issue = loop_service::issue::get_issue(conn, issue_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("issue {issue_id}")))?;
+    let space = loop_service::space::get_space(conn, issue.space_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("space {}", issue.space_id)))?;
+    let repo = folder_service::get_folder_by_id(conn, space.folder_id)
+        .await?
+        .ok_or(LoopError::Detached)?;
+    let repo_path = PathBuf::from(&repo.path);
+    ensure_git_repo(&repo_path).await?;
+
+    let branch = format!("loop/{}/issue-{}-integrate", issue.space_id, issue.seq_no);
+    let worktree_path = data_dir
+        .join("loop-worktrees")
+        .join(issue.space_id.to_string())
+        .join(format!("issue-{}-integrate", issue.seq_no));
+
+    attach_or_rebuild_worktree(
+        conn,
+        &repo_path,
+        space.folder_id,
+        &branch,
+        &worktree_path,
+        base_oid,
+        issue.base_branch.clone().unwrap_or_default(),
+    )
+    .await
+}
+
+/// Attach-or-rebuild a worktree at `worktree_path` on `branch`, cut from
+/// `base_oid`. Reused as-is iff it exists on `branch` with `base_oid` an ancestor
+/// of its HEAD (so committed work / an in-progress merge survive); otherwise
+/// pruned, force-removed, and recreated `-B` from `base_oid`. Upserts the hidden
+/// `loop_worktree` folder (parented to `repo_folder_id`) — task / integrate
+/// worktrees have no issue column, so they re-attach by their deterministic path.
+async fn attach_or_rebuild_worktree(
+    conn: &DatabaseConnection,
+    repo_path: &Path,
+    repo_folder_id: i32,
+    branch: &str,
+    worktree_path: &Path,
+    base_oid: &str,
+    base_branch: String,
+) -> Result<WorktreeContext, LoopError> {
     let ctx = |folder_id: i32| WorktreeContext {
-        worktree_path: worktree_path.clone(),
+        worktree_path: worktree_path.to_path_buf(),
         worktree_folder_id: folder_id,
-        branch: branch.clone(),
-        base_branch: issue.base_branch.clone().unwrap_or_default(),
-        base_commit: base_oid.clone(),
+        branch: branch.to_string(),
+        base_branch: base_branch.clone(),
+        base_commit: base_oid.to_string(),
     };
 
-    // Attach-first: reuse an identity-matching task worktree (same branch, HEAD
-    // descends from the expected base) without disturbing committed work.
     if worktree_path.exists() {
-        if let Ok(cur) = current_branch(&worktree_path).await {
-            if cur == branch && is_ancestor_of_head(&worktree_path, &base_oid).await? {
-                let folder =
-                    folder_service::add_loop_worktree_folder(conn, &path_str(&worktree_path), space.folder_id)
-                        .await?;
+        if let Ok(cur) = current_branch(worktree_path).await {
+            if cur == branch && is_ancestor_of_head(worktree_path, base_oid).await? {
+                let folder = folder_service::add_loop_worktree_folder(
+                    conn,
+                    &path_str(worktree_path),
+                    repo_folder_id,
+                )
+                .await?;
                 return Ok(ctx(folder.id));
             }
         }
     }
 
-    // Rebuild: prune stale admin entries, force-remove anything at the path, then
-    // `-B` (create-or-reset) the task branch from its base OID.
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| LoopError::Git(format!("create task worktree parent dir: {e}")))?;
+            .map_err(|e| LoopError::Git(format!("create worktree parent dir: {e}")))?;
     }
-    let wt = path_str(&worktree_path);
-    let _ = run_git(&repo_path, &["worktree", "prune"]).await;
+    let wt = path_str(worktree_path);
+    let _ = run_git(repo_path, &["worktree", "prune"]).await;
     if worktree_path.exists() {
-        let _ = run_git(&repo_path, &["worktree", "remove", "--force", &wt]).await;
-        let _ = std::fs::remove_dir_all(&worktree_path);
+        let _ = run_git(repo_path, &["worktree", "remove", "--force", &wt]).await;
+        let _ = std::fs::remove_dir_all(worktree_path);
     }
-    let out = run_git(&repo_path, &["worktree", "add", "-B", &branch, &wt, &base_oid]).await?;
+    let out = run_git(repo_path, &["worktree", "add", "-B", branch, &wt, base_oid]).await?;
     if !out.status.success() {
-        return Err(LoopError::Git(format!("task worktree add: {}", stderr_of(&out))));
+        return Err(LoopError::Git(format!("worktree add: {}", stderr_of(&out))));
     }
-    let folder = folder_service::add_loop_worktree_folder(conn, &wt, space.folder_id).await?;
+    let folder = folder_service::add_loop_worktree_folder(conn, &wt, repo_folder_id).await?;
     Ok(ctx(folder.id))
 }
 

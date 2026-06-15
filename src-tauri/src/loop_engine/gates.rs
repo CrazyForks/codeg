@@ -1066,6 +1066,18 @@ pub(crate) async fn run_finalize(
         return Ok(StepOutcome::Idle);
     }
 
+    // Parallel issues integrate their per-task branches via the result-stage
+    // fan-in (engine-synthesized result), not an agent-submitted finalize. Only
+    // once the result exists do they rejoin the shared "result ready → merge gate"
+    // tail below.
+    let has_result = dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result);
+    if issue.execution_mode.as_deref() == Some("parallel") && !has_result {
+        return crate::loop_engine::fan_in::run_parallel_finalize(
+            db, data_dir, spawner, emitter, issue, dag, config, worktree_folder_id,
+        )
+        .await;
+    }
+
     let fins = finalize_iterations(db, issue.id).await?;
     if fins
         .iter()
@@ -2352,6 +2364,191 @@ mod tests {
             frozen,
             git_head(&h.worktree_path),
             "frozen commit == accepted worktree tip"
+        );
+    }
+
+    // ---- Parallel result-stage fan-in (Phase 1) ----
+
+    /// Drive one parallel task through its full implement→review→pass lifecycle in
+    /// its OWN worktree, leaving it Done with a frozen commit and the gate free.
+    async fn complete_parallel_task(
+        h: &Harness,
+        cfg: &IssueConfig,
+        marker: &str,
+        body: &str,
+        task: i32,
+    ) {
+        assert_eq!(
+            drive_with(h, cfg).await,
+            StepOutcome::Dispatched,
+            "dispatch implement"
+        );
+        let impl_id = running_implement_id(h).await;
+        let task_wt = worktree::ensure_task_worktree(&h.db.conn, h.data.path(), h.issue_id, task)
+            .await
+            .unwrap();
+        std::fs::write(task_wt.worktree_path.join(marker), body).unwrap();
+        settle_iteration(&h.db, &EventEmitter::Noop, impl_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_with(h, cfg).await,
+            StepOutcome::Advanced,
+            "checkpoint → in_progress"
+        );
+        assert_eq!(
+            drive_with(h, cfg).await,
+            StepOutcome::Dispatched,
+            "dispatch review"
+        );
+        let review = running_review(h).await;
+        submit_verdict(h, review, "pass", "ok").await;
+        settle_iteration(&h.db, &EventEmitter::Noop, review)
+            .await
+            .unwrap();
+        assert_eq!(
+            drive_with(h, cfg).await,
+            StepOutcome::Advanced,
+            "review pass → done + freeze"
+        );
+        assert_eq!(task_node(h, task).await.status, ArtifactStatus::Done);
+    }
+
+    async fn integrate_path(h: &Harness) -> std::path::PathBuf {
+        let seq = load_issue(h).await.seq_no;
+        h.data
+            .path()
+            .join("loop-worktrees")
+            .join(h.space_id.to_string())
+            .join(format!("issue-{seq}-integrate"))
+    }
+
+    async fn set_fan_in_manifest(h: &Harness, json: &str) {
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::FanInManifest,
+                Expr::value(json.to_string()),
+            )
+            .filter(loop_issue::Column::Id.eq(h.issue_id))
+            .exec(&h.db.conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_two_independent_tasks_clean_fan_in_to_result() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
+        let t1 = add_task(&h, "T1").await;
+        let t2 = add_task(&h, "T2").await;
+
+        complete_parallel_task(&h, &cfg, "a.txt", "A\n", t1).await;
+        complete_parallel_task(&h, &cfg, "b.txt", "B\n", t2).await;
+        assert!(task_model(&h, t1).await.fan_in_commit.is_some());
+        assert!(task_model(&h, t2).await.fan_in_commit.is_some());
+
+        // One drive lands the whole fan-in: integrate both task branches, CAS onto
+        // the issue branch, synthesize the result.
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Advanced,
+            "fan-in lands + produces result"
+        );
+
+        let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
+        assert!(dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result));
+        assert!(
+            load_issue(&h).await.fan_in_manifest.is_none(),
+            "session lock cleared after landing"
+        );
+        assert!(
+            h.worktree_path.join("a.txt").exists() && h.worktree_path.join("b.txt").exists(),
+            "both tasks landed on the issue branch (worktree synced to the new tip)"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_conflict_dispatches_resolution_then_lands() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
+        let t1 = add_task(&h, "T1").await;
+        let t2 = add_task(&h, "T2").await;
+        // Both tasks add the SAME file with different content → fan-in conflict.
+        complete_parallel_task(&h, &cfg, "shared.txt", "A\n", t1).await;
+        complete_parallel_task(&h, &cfg, "shared.txt", "B\n", t2).await;
+
+        // Fan-in conflicts on the second task → dispatches a result-stage resolver.
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Dispatched,
+            "conflict dispatches a resolver"
+        );
+        let resolver = running_finalize(&h).await;
+        let integ = integrate_path(&h).await;
+        assert!(
+            worktree::integrate_in_progress(&integ).await,
+            "the in-progress merge is left for the resolver"
+        );
+
+        // Simulate the resolver: resolve the conflict + complete the merge.
+        std::fs::write(integ.join("shared.txt"), "A+B\n").unwrap();
+        git(&integ, &["add", "-A"]);
+        git(&integ, &["commit", "--no-edit"]);
+        settle_iteration(&h.db, &EventEmitter::Noop, resolver.id)
+            .await
+            .unwrap();
+
+        // Re-drive: resume (resolved task now an ancestor) → land + result.
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Advanced,
+            "resumes the fan-in and lands"
+        );
+        let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
+        assert!(dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result));
+        assert!(load_issue(&h).await.fan_in_manifest.is_none());
+        assert!(
+            h.worktree_path.join("shared.txt").exists(),
+            "the resolved merge landed on the issue branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_in_cas_fail_restarts() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
+        let t1 = add_task(&h, "T1").await;
+        complete_parallel_task(&h, &cfg, "a.txt", "A\n", t1).await;
+
+        // Advance the issue branch, then inject a manifest whose issue_base_oid is
+        // the STALE (pre-advance) tip → the CAS landing must miss and restart,
+        // never land.
+        let stale_base = git_head(&h.worktree_path);
+        std::fs::write(h.worktree_path.join("drift.txt"), "drift\n").unwrap();
+        git(&h.worktree_path, &["add", "-A"]);
+        git(&h.worktree_path, &["commit", "-m", "issue branch drift"]);
+        let frozen = task_model(&h, t1).await.fan_in_commit.unwrap();
+        let manifest = format!(
+            r#"{{"v":1,"issue_base_oid":"{stale_base}","ordered":[{{"task_id":{t1},"sha":"{frozen}"}}]}}"#
+        );
+        set_fan_in_manifest(&h, &manifest).await;
+
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Advanced,
+            "stale-base CAS miss → restart"
+        );
+        assert!(
+            load_issue(&h).await.fan_in_manifest.is_none(),
+            "stale session cleared for a fresh retry"
+        );
+        let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
+        assert!(
+            !dag.artifacts.iter().any(|a| a.kind == ArtifactKind::Result),
+            "nothing landed → no result row stranded"
         );
     }
 

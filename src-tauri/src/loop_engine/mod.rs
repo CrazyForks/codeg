@@ -33,6 +33,7 @@ pub mod config_resolver;
 pub mod dispatch;
 pub mod driver;
 pub mod error;
+pub mod fan_in;
 pub mod gates;
 pub mod health;
 pub mod ingest;

@@ -159,6 +159,22 @@ fn tool_contract(stage: Stage) -> &'static str {
     }
 }
 
+/// Parallel-mode finalize is NOT a result submission — the engine integrates the
+/// per-task branches and synthesizes the result itself. A finalize agent is only
+/// dispatched to resolve a fan-in MERGE CONFLICT in the integrate worktree.
+const PARALLEL_FINALIZE_INSTRUCTION: &str =
+    "The engine is integrating this issue's parallel task branches and hit a merge \
+     conflict in THIS worktree. Resolve every conflict so the combined work is \
+     correct and consistent, preserving each task's intent. Do not start new \
+     feature work — only finish the in-progress merge.";
+
+const PARALLEL_FINALIZE_TOOL_CONTRACT: &str =
+    "Do NOT call any submit tool. Resolve the conflicted files in the worktree, \
+     stage them (`git add`), and COMPLETE the in-progress merge with a plain \
+     `git commit` (keep the default merge message — preserve both parents). The \
+     engine detects the completed merge and continues the fan-in. If you cannot \
+     resolve it, call `loop_report_blocked`.";
+
 /// First non-empty paragraph (up to the first blank line) of `s`, trimmed. Used
 /// to summarize farther ancestors without dumping their entire body.
 fn first_paragraph(s: &str) -> String {
@@ -424,12 +440,30 @@ pub async fn assemble_briefing(
         }
     }
 
-    // ⑥ Stage instruction — what to do this turn.
-    sections.push(format!("# Your task\n{}", stage_instruction(stage)));
+    // ⑥ Stage instruction — what to do this turn. A parallel-mode finalize is a
+    // fan-in conflict resolution (the engine synthesizes the result), so it gets
+    // the conflict-resolution briefing instead of the serial result-submit one.
+    let parallel_finalize =
+        stage == Stage::Finalize && issue.execution_mode.as_deref() == Some("parallel");
+    sections.push(format!(
+        "# Your task\n{}",
+        if parallel_finalize {
+            PARALLEL_FINALIZE_INSTRUCTION
+        } else {
+            stage_instruction(stage)
+        }
+    ));
     components.push(json!({ "section": "stage_instruction", "stage": stage_label(stage) }));
 
     // ⑦ Tool contract — how to submit.
-    sections.push(format!("# How to submit\n{}", tool_contract(stage)));
+    sections.push(format!(
+        "# How to submit\n{}",
+        if parallel_finalize {
+            PARALLEL_FINALIZE_TOOL_CONTRACT
+        } else {
+            tool_contract(stage)
+        }
+    ));
     components.push(json!({ "section": "tool_contract", "stage": stage_label(stage) }));
 
     let manifest = json!({
