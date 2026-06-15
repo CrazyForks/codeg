@@ -13,8 +13,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sea_orm::{ActiveModelTrait, DatabaseConnection, IntoActiveModel, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
+    Set,
+};
 
+use crate::db::entities::loop_artifact;
+use crate::db::entities::loop_link::{self, LinkKind};
 use crate::db::service::{folder_service, loop_service};
 use crate::loop_engine::{validation, LoopError};
 
@@ -188,6 +193,152 @@ pub async fn ensure_worktree(
         base_branch,
         base_commit,
     })
+}
+
+/// Peel a ref / sha to a concrete commit OID (`<refspec>^{commit}`), erroring if
+/// it doesn't resolve.
+async fn resolve_oid(repo: &Path, refspec: &str) -> Result<String, LoopError> {
+    let out = run_git(
+        repo,
+        &["rev-parse", "--verify", &format!("{refspec}^{{commit}}")],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(LoopError::Git(format!(
+            "rev-parse {refspec}: {}",
+            stderr_of(&out)
+        )));
+    }
+    Ok(stdout_trimmed(&out))
+}
+
+/// Whether `oid` is an ancestor of the worktree's HEAD (`merge-base
+/// --is-ancestor`: exit 0 = yes, 1 = no, other = error → treated as no, which
+/// triggers a safe rebuild).
+async fn is_ancestor_of_head(worktree: &Path, oid: &str) -> Result<bool, LoopError> {
+    let out = run_git(worktree, &["merge-base", "--is-ancestor", oid, "HEAD"]).await?;
+    Ok(out.status.success())
+}
+
+/// Resolve the base ref a task's worktree branches from: its single `DependsOn`
+/// predecessor's **frozen** integration commit (`loop_artifact.fan_in_commit`),
+/// or — for a root task (no predecessor) — the issue branch tip. NEVER the live
+/// predecessor branch ref, which would smuggle post-Done drift (spec §3.2).
+async fn task_base_ref(
+    conn: &DatabaseConnection,
+    space_id: i32,
+    issue_seq: i32,
+    task_id: i32,
+) -> Result<String, LoopError> {
+    // `DependsOn`: from = successor (this task), to = predecessor.
+    let pred = loop_link::Entity::find()
+        .filter(loop_link::Column::FromArtifactId.eq(task_id))
+        .filter(loop_link::Column::Kind.eq(LinkKind::DependsOn))
+        .one(conn)
+        .await?;
+    if let Some(link) = pred {
+        let pred = loop_artifact::Entity::find_by_id(link.to_artifact_id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| {
+                LoopError::NotFound(format!("predecessor task {}", link.to_artifact_id))
+            })?;
+        let sha = pred.fan_in_commit.ok_or_else(|| {
+            LoopError::Git(format!(
+                "predecessor task {} has no frozen commit yet",
+                pred.id
+            ))
+        })?;
+        return Ok(sha);
+    }
+    Ok(format!("loop/{space_id}/issue-{issue_seq}"))
+}
+
+/// Create (or re-attach) a per-task worktree + branch for **parallel-mode** task
+/// execution, so concurrent tasks never share a tree (spec §3.2).
+///
+/// Branch `loop/{space}/issue-{seq}/task-{id}`; path
+/// `loop-worktrees/{space}/issue-{seq}-tasks/task-{id}` — a **sibling** of the
+/// issue worktree, never nested under it (else the issue worktree's `clean -fd`
+/// during finalize/recovery would delete live task trees). The branch is cut from
+/// [`task_base_ref`] (predecessor's frozen sha, or the issue branch tip).
+///
+/// Attach-first: an on-disk worktree whose current branch is the expected task
+/// branch AND whose HEAD descends from the expected base is reused untouched
+/// (never `-B`, so a task branch with committed work is not rewound). Otherwise
+/// prune + force-remove + `-B` from the base. Task worktree folders have no issue
+/// column; they re-attach by their deterministic path (`add_loop_worktree_folder`
+/// upserts on path).
+pub async fn ensure_task_worktree(
+    conn: &DatabaseConnection,
+    data_dir: &Path,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<WorktreeContext, LoopError> {
+    let issue = loop_service::issue::get_issue(conn, issue_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("issue {issue_id}")))?;
+    let space = loop_service::space::get_space(conn, issue.space_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("space {}", issue.space_id)))?;
+    let repo = folder_service::get_folder_by_id(conn, space.folder_id)
+        .await?
+        .ok_or(LoopError::Detached)?;
+    let repo_path = PathBuf::from(&repo.path);
+    ensure_git_repo(&repo_path).await?;
+
+    // Hyphen, not a slash: `loop/{s}/issue-{n}/task-{id}` would be a git ref
+    // D/F conflict with the issue branch `loop/{s}/issue-{n}` (a ref file cannot
+    // also be a directory). `issue-{n}-task-{id}` is a sibling ref.
+    let branch = format!("loop/{}/issue-{}-task-{}", issue.space_id, issue.seq_no, task_id);
+    let worktree_path = data_dir
+        .join("loop-worktrees")
+        .join(issue.space_id.to_string())
+        .join(format!("issue-{}-tasks", issue.seq_no))
+        .join(format!("task-{task_id}"));
+
+    let base_ref = task_base_ref(conn, issue.space_id, issue.seq_no, task_id).await?;
+    let base_oid = resolve_oid(&repo_path, &base_ref).await?;
+
+    let ctx = |folder_id: i32| WorktreeContext {
+        worktree_path: worktree_path.clone(),
+        worktree_folder_id: folder_id,
+        branch: branch.clone(),
+        base_branch: issue.base_branch.clone().unwrap_or_default(),
+        base_commit: base_oid.clone(),
+    };
+
+    // Attach-first: reuse an identity-matching task worktree (same branch, HEAD
+    // descends from the expected base) without disturbing committed work.
+    if worktree_path.exists() {
+        if let Ok(cur) = current_branch(&worktree_path).await {
+            if cur == branch && is_ancestor_of_head(&worktree_path, &base_oid).await? {
+                let folder =
+                    folder_service::add_loop_worktree_folder(conn, &path_str(&worktree_path), space.folder_id)
+                        .await?;
+                return Ok(ctx(folder.id));
+            }
+        }
+    }
+
+    // Rebuild: prune stale admin entries, force-remove anything at the path, then
+    // `-B` (create-or-reset) the task branch from its base OID.
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LoopError::Git(format!("create task worktree parent dir: {e}")))?;
+    }
+    let wt = path_str(&worktree_path);
+    let _ = run_git(&repo_path, &["worktree", "prune"]).await;
+    if worktree_path.exists() {
+        let _ = run_git(&repo_path, &["worktree", "remove", "--force", &wt]).await;
+        let _ = std::fs::remove_dir_all(&worktree_path);
+    }
+    let out = run_git(&repo_path, &["worktree", "add", "-B", &branch, &wt, &base_oid]).await?;
+    if !out.status.success() {
+        return Err(LoopError::Git(format!("task worktree add: {}", stderr_of(&out))));
+    }
+    let folder = folder_service::add_loop_worktree_folder(conn, &wt, space.folder_id).await?;
+    Ok(ctx(folder.id))
 }
 
 /// Stage everything and, if there is a non-empty diff, create an engine
@@ -890,5 +1041,146 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, MergeOutcome::BaseGone));
+    }
+
+    // ---- Per-task worktrees (Phase 1) ----
+
+    async fn mk_task(
+        db: &crate::db::AppDatabase,
+        space_id: i32,
+        issue_id: i32,
+        title: &str,
+    ) -> i32 {
+        use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
+        use crate::db::entities::loop_artifact_revision::ActorKind;
+        loop_service::artifact::create_artifact(
+            &db.conn,
+            space_id,
+            issue_id,
+            ArtifactKind::Task,
+            title,
+            ArtifactStatus::Pending,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn set_fan_in_commit(db: &crate::db::AppDatabase, task_id: i32, sha: &str) {
+        let row = loop_artifact::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.fan_in_commit = Set(Some(sha.to_string()));
+        active.update(&db.conn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_task_worktree_creates_from_issue_head() {
+        let (db, _repo, data, issue_id, space_id, seq) = setup().await;
+        // The issue worktree (and its branch) must exist first — root tasks cut
+        // from the issue branch tip.
+        let issue_ctx = ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        let issue_head = git_out(&issue_ctx.worktree_path, &["rev-parse", "HEAD"]);
+
+        let task = mk_task(&db, space_id, issue_id, "T").await;
+        let ctx = ensure_task_worktree(&db.conn, data.path(), issue_id, task)
+            .await
+            .unwrap();
+
+        assert!(ctx.worktree_path.is_dir());
+        assert_eq!(ctx.branch, format!("loop/{space_id}/issue-{seq}-task-{task}"));
+        assert_eq!(git_out(&ctx.worktree_path, &["rev-parse", "HEAD"]), issue_head);
+        // Sibling of the issue worktree, never nested under it.
+        assert!(!ctx.worktree_path.starts_with(&issue_ctx.worktree_path));
+    }
+
+    #[tokio::test]
+    async fn ensure_task_worktree_creates_from_predecessor_frozen_sha() {
+        let (db, _repo, data, issue_id, space_id, _seq) = setup().await;
+        let issue_ctx = ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        // The frozen sha the predecessor "produced".
+        loop_commit(&issue_ctx.worktree_path, "pred.txt", "pred work\n").await;
+        let frozen = git_out(&issue_ctx.worktree_path, &["rev-parse", "HEAD"]);
+
+        let pred = mk_task(&db, space_id, issue_id, "pred").await;
+        set_fan_in_commit(&db, pred, &frozen).await;
+        // Advance the issue branch PAST the frozen sha, to prove the successor
+        // cuts from the FROZEN commit, never the live tip.
+        loop_commit(&issue_ctx.worktree_path, "more.txt", "drift\n").await;
+        let live_tip = git_out(&issue_ctx.worktree_path, &["rev-parse", "HEAD"]);
+        assert_ne!(frozen, live_tip);
+
+        let succ = mk_task(&db, space_id, issue_id, "succ").await;
+        loop_service::link::create_link(&db.conn, space_id, succ, pred, LinkKind::DependsOn)
+            .await
+            .unwrap();
+        let ctx = ensure_task_worktree(&db.conn, data.path(), issue_id, succ)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_out(&ctx.worktree_path, &["rev-parse", "HEAD"]),
+            frozen,
+            "successor cut from predecessor's frozen sha, not the live tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_worktree_reattach_validates_identity() {
+        let (db, _repo, data, issue_id, space_id, _seq) = setup().await;
+        ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        let task = mk_task(&db, space_id, issue_id, "T").await;
+        let ctx1 = ensure_task_worktree(&db.conn, data.path(), issue_id, task)
+            .await
+            .unwrap();
+
+        // Corrupt identity: switch the worktree onto a different branch.
+        git(&ctx1.worktree_path, &["checkout", "-b", "rogue"]);
+        assert_ne!(
+            git_out(&ctx1.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            ctx1.branch
+        );
+
+        // Re-attach detects the mismatch and rebuilds onto the task branch.
+        let ctx2 = ensure_task_worktree(&db.conn, data.path(), issue_id, task)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_out(&ctx2.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            ctx2.branch,
+            "rebuilt onto the task branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_worktree_no_b_on_live_branch() {
+        let (db, _repo, data, issue_id, space_id, _seq) = setup().await;
+        ensure_worktree(&db.conn, data.path(), issue_id).await.unwrap();
+        let task = mk_task(&db, space_id, issue_id, "T").await;
+        let ctx1 = ensure_task_worktree(&db.conn, data.path(), issue_id, task)
+            .await
+            .unwrap();
+        loop_commit(&ctx1.worktree_path, "feature.txt", "work\n").await;
+        let committed = git_out(&ctx1.worktree_path, &["rev-parse", "HEAD"]);
+
+        // Re-attach must NOT rewind a task branch carrying committed work.
+        let ctx2 = ensure_task_worktree(&db.conn, data.path(), issue_id, task)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx2.worktree_folder_id, ctx1.worktree_folder_id,
+            "same folder reused"
+        );
+        assert_eq!(
+            git_out(&ctx2.worktree_path, &["rev-parse", "HEAD"]),
+            committed,
+            "committed work preserved (no -B rewind)"
+        );
+        assert!(ctx2.worktree_path.join("feature.txt").exists());
     }
 }
