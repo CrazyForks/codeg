@@ -300,6 +300,10 @@ impl LoopEngine {
             // Best-effort teardown; the DB closure below is the source of truth —
             // a merged issue never restarts, so a stale folder/worktree is inert.
             let _ = worktree::remove_worktree(&repo_path, &worktree_path).await;
+            // The loop branch is now in base behind the --no-ff merge commit, so
+            // drop it. Safe `-d`: git refuses if it is somehow not merged, so this
+            // can never discard unlanded work.
+            let _ = worktree::delete_branch(&repo_path, &branch, false).await;
             let _ = folder_service::remove_folder(conn, &folder.path).await;
             resolve_approval_card(
                 conn,

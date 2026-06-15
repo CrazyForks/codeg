@@ -154,7 +154,21 @@ pub async fn ensure_worktree(
     }
 
     let wt = path_str(&worktree_path);
-    let out = run_git(&repo_path, &["worktree", "add", "-b", &branch, &wt]).await?;
+    // Reconcile leftovers from a prior life of this (space_id, seq_no): a stale
+    // admin entry (data_dir wiped, dir gone), an orphaned worktree dir (DB-only
+    // reset), or a leftover `loop/*` branch — teardown intentionally keeps
+    // cancel/merge branches, and a DB reset reuses the same name. `loop/*` is an
+    // engine-owned, disposable namespace, so prune dangling entries, force-remove
+    // anything still at the path, then `-B` (create-or-reset) the branch from the
+    // current base HEAD. A (re)triggered issue always starts from base HEAD
+    // (matching the `base_commit` recorded just above) — reset is correct here,
+    // never a reuse of stale loop commits.
+    let _ = run_git(&repo_path, &["worktree", "prune"]).await;
+    if worktree_path.exists() {
+        let _ = run_git(&repo_path, &["worktree", "remove", "--force", &wt]).await;
+        let _ = std::fs::remove_dir_all(&worktree_path);
+    }
+    let out = run_git(&repo_path, &["worktree", "add", "-B", &branch, &wt]).await?;
     if !out.status.success() {
         return Err(LoopError::Git(format!("worktree add: {}", stderr_of(&out))));
     }
@@ -364,13 +378,33 @@ pub async fn merge_issue(
 }
 
 /// Remove the worktree directory and its administrative entry (best-effort
-/// `--force` to tolerate a dirty tree). The branch is left intact.
+/// `--force` to tolerate a dirty tree). The branch is left intact — call
+/// [`delete_branch`] separately for paths that should also drop it.
 pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<(), LoopError> {
     let wt = path_str(worktree_path);
     let out = run_git(repo_path, &["worktree", "remove", "--force", &wt]).await?;
     if !out.status.success() {
         return Err(LoopError::Git(format!(
             "worktree remove: {}",
+            stderr_of(&out)
+        )));
+    }
+    Ok(())
+}
+
+/// Delete an engine-owned `loop/*` branch after its worktree has been removed (a
+/// branch checked out in a worktree cannot be deleted). `force` selects `-D`
+/// (unconditional — for permanent issue/space deletion, which discards unmerged
+/// WIP by user intent) versus `-d` (safe — git refuses unless the branch is
+/// already merged, used after a successful landing as a guard that we never drop
+/// unmerged work). Call sites treat this as best-effort: a missing branch or a
+/// safe-delete refusal is not fatal (the create path reconciles any leftover).
+pub async fn delete_branch(repo_path: &Path, branch: &str, force: bool) -> Result<(), LoopError> {
+    let flag = if force { "-D" } else { "-d" };
+    let out = run_git(repo_path, &["branch", flag, branch]).await?;
+    if !out.status.success() {
+        return Err(LoopError::Git(format!(
+            "branch {flag} {branch}: {}",
             stderr_of(&out)
         )));
     }
@@ -472,6 +506,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_worktree_reconciles_leftover_branch_and_dir() {
+        let (db, repo, data, issue_id, space_id, seq) = setup().await;
+        let branch = format!("loop/{space_id}/issue-{seq}");
+
+        // A prior life left the branch behind (teardown keeps it; a DB reset reuses
+        // the same name). Point it at the *old* HEAD, then advance the base so we
+        // can prove the re-created worktree starts from the current HEAD, not the
+        // stale branch tip.
+        git(repo.path(), &["branch", &branch]);
+        let stale_tip = git_out(repo.path(), &["rev-parse", &branch]);
+        std::fs::write(repo.path().join("advance.txt"), "more\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base advance"]);
+        let new_head = git_out(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(stale_tip, new_head, "base advanced past the stale branch");
+
+        // An orphaned directory also sits exactly where the worktree will go.
+        let wt = data
+            .path()
+            .join("loop-worktrees")
+            .join(space_id.to_string())
+            .join(format!("issue-{seq}"));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("junk.txt"), "leftover\n").unwrap();
+
+        // Was fatal: "a branch named 'loop/.../issue-...' already exists".
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        assert_eq!(ctx.branch, branch);
+        // Branch reset to the current base HEAD; worktree checked out there.
+        assert_eq!(ctx.base_commit, new_head);
+        assert_eq!(git_out(&ctx.worktree_path, &["rev-parse", "HEAD"]), new_head);
+        // The orphaned dir was wiped and recreated clean.
+        assert!(!ctx.worktree_path.join("junk.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_branch_safe_refuses_unmerged_force_removes() {
+        let (db, repo, data, issue_id, _space, _seq) = setup().await;
+        let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
+            .await
+            .unwrap();
+        loop_commit(&ctx.worktree_path, "feature.txt", "work\n").await;
+
+        // A branch checked out in a worktree can't be deleted — remove it first.
+        remove_worktree(repo.path(), &ctx.worktree_path)
+            .await
+            .unwrap();
+
+        // Safe delete refuses an unmerged branch (the guard behind the merge path)…
+        assert!(delete_branch(repo.path(), &ctx.branch, false)
+            .await
+            .is_err());
+        assert!(branch_exists(repo.path(), &ctx.branch));
+        // …force delete drops it (the permanent-delete path).
+        delete_branch(repo.path(), &ctx.branch, true)
+            .await
+            .unwrap();
+        assert!(!branch_exists(repo.path(), &ctx.branch));
+    }
+
+    #[tokio::test]
     async fn checkpoint_commits_changes_then_noops_when_clean() {
         let (db, _repo, data, issue_id, _space, _seq) = setup().await;
         let ctx = ensure_worktree(&db.conn, data.path(), issue_id)
@@ -531,6 +628,20 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        StdCommand::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(repo)
+            .status()
+            .expect("spawn git")
+            .success()
     }
 
     /// One loop commit (a feature file) checkpointed onto the issue branch.

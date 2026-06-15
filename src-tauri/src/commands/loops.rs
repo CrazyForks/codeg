@@ -141,27 +141,43 @@ async fn cleanup_issue_artifacts(conn: &DatabaseConnection, issue: &loop_issue::
     let Some(worktree_folder_id) = issue.worktree_folder_id else {
         return;
     };
-    // On-disk worktree removal (best-effort; mirrors the cancel path).
-    if let Ok(Some(folder)) = folder_service::get_folder_by_id(conn, worktree_folder_id).await {
-        if Path::new(&folder.path).exists() {
-            if let Ok(Some(space_row)) = space::get_space(conn, issue.space_id).await {
-                if let Ok(Some(repo)) =
-                    folder_service::get_folder_by_id(conn, space_row.folder_id).await
+    // Resolve the repo once — needed both to remove the on-disk worktree and to
+    // drop the issue's engine-owned `loop/*` branch.
+    let repo_path = resolve_space_repo_path(conn, issue.space_id).await;
+
+    if let Some(repo_path) = repo_path.as_deref() {
+        // On-disk worktree removal (best-effort; mirrors the cancel path).
+        if let Ok(Some(folder)) = folder_service::get_folder_by_id(conn, worktree_folder_id).await {
+            if Path::new(&folder.path).exists() {
+                if let Err(e) =
+                    worktree::remove_worktree(Path::new(repo_path), Path::new(&folder.path)).await
                 {
-                    if let Err(e) =
-                        worktree::remove_worktree(Path::new(&repo.path), Path::new(&folder.path))
-                            .await
-                    {
-                        eprintln!("[loop] delete: remove worktree {} failed: {e}", folder.path);
-                    }
+                    eprintln!("[loop] delete: remove worktree {} failed: {e}", folder.path);
                 }
             }
         }
+        // Permanent delete discards everything → drop the branch too. Force (`-D`):
+        // it may carry unmerged WIP the user is intentionally deleting, and a DB
+        // reset leaves no other record by which to clean it up later.
+        let branch = format!("loop/{}/issue-{}", issue.space_id, issue.seq_no);
+        let _ = worktree::delete_branch(Path::new(repo_path), &branch, true).await;
     }
+
     // DB orphans: the worktree folder row + its loop conversations.
     if let Err(e) = issue::cleanup_worktree_rows(conn, worktree_folder_id).await {
         eprintln!("[loop] delete: cleanup worktree rows ({worktree_folder_id}) failed: {e}");
     }
+}
+
+/// The on-disk path of the git repo backing a space (the space folder's root),
+/// or `None` if the space or its folder row is gone.
+async fn resolve_space_repo_path(conn: &DatabaseConnection, space_id: i32) -> Option<String> {
+    let space_row = space::get_space(conn, space_id).await.ok().flatten()?;
+    folder_service::get_folder_by_id(conn, space_row.folder_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|f| f.path)
 }
 
 async fn summary_for(
