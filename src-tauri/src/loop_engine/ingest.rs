@@ -97,6 +97,44 @@ fn default_status_for_kind(kind: ArtifactKind) -> ArtifactStatus {
     }
 }
 
+/// Parse an item's optional `depends_on` into the index of its single
+/// predecessor *within this same batch* (0-based, into the `artifacts` array).
+///
+/// v1 dependency model (spec §3.1, §4.1): a task may declare **at most one**
+/// predecessor, referenced by its position earlier in the same submission. That
+/// a reference can only point *backward* (`n < idx`) makes the batch acyclic by
+/// construction and sidesteps cross-batch id resolution — so cross-issue and
+/// forward/self references are structurally impossible, not just rejected.
+/// `None` (absent / null / empty array) means a root task (no predecessor).
+fn parse_depends_on(item: &Value, idx: usize) -> Result<Option<usize>, LoopError> {
+    let Some(raw) = item.get("depends_on") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| invalid("depends_on must be an array"))?;
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    if arr.len() > 1 {
+        return Err(invalid(
+            "a task may declare at most one predecessor (v1 forbids multiple dependencies)",
+        ));
+    }
+    let n = arr[0]
+        .as_i64()
+        .ok_or_else(|| invalid("depends_on entry must be an integer batch index"))?;
+    if n < 0 || (n as usize) >= idx {
+        return Err(invalid(format!(
+            "depends_on index {n} out of range; must reference an earlier task in this batch (0..{idx})"
+        )));
+    }
+    Ok(Some(n as usize))
+}
+
 /// Entry point: validate `(token, tool, payload)` and persist. Returns a small
 /// JSON outcome the companion relays back to the agent.
 pub async fn ingest(
@@ -294,9 +332,24 @@ async fn submit_artifacts(
         Vec::new()
     };
 
+    // Validate every item's `depends_on` up-front, before any artifact is
+    // written — a bad reference must abort the whole batch with no partial rows
+    // (a partial write would then look "done" to the idempotency replay guard).
+    // Only Task artifacts carry dependencies; depends_on on other kinds is
+    // ignored.
+    let dep_indices: Vec<Option<usize>> = if kind == ArtifactKind::Task {
+        items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| parse_depends_on(item, idx))
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![None; items.len()]
+    };
+
     let status = default_status_for_kind(kind);
     let mut ids = Vec::new();
-    for item in items {
+    for (idx, item) in items.iter().enumerate() {
         let title = item
             .get("title")
             .and_then(|v| v.as_str())
@@ -347,6 +400,19 @@ async fn submit_artifacts(
             .await?;
         }
         ids.push(art.id);
+        // Wire the task dependency edge: from = this (successor) task, to = its
+        // predecessor (already created earlier in this batch, so `ids[pred]`
+        // exists). Validated above to be backward-only.
+        if let Some(pred) = dep_indices[idx] {
+            loop_service::link::create_link(
+                conn,
+                it.space_id,
+                art.id,
+                ids[pred],
+                LinkKind::DependsOn,
+            )
+            .await?;
+        }
     }
 
     Ok(json!({ "ok": true, "ids": ids }))
@@ -702,5 +768,103 @@ mod tests {
             .links
             .iter()
             .any(|l| matches!(l.kind, LinkKind::Reviews) && l.to_artifact_id == task_id));
+    }
+
+    #[tokio::test]
+    async fn submit_tasks_with_deps_creates_depends_on_links() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-plan").await;
+        let out = ingest(
+            &db.conn,
+            "tok-plan",
+            "loop_submit_artifacts",
+            &json!({"artifacts":[
+                {"title":"T0","content":"first"},
+                {"title":"T1","content":"second","depends_on":[0]}
+            ]}),
+        )
+        .await
+        .unwrap();
+        let ids = out["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 2);
+        let t0 = ids[0].as_i64().unwrap() as i32;
+        let t1 = ids[1].as_i64().unwrap() as i32;
+
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        // Edge contract: DependsOn from = successor (T1), to = predecessor (T0).
+        assert!(dag.links.iter().any(|l| matches!(l.kind, LinkKind::DependsOn)
+            && l.from_artifact_id == t1
+            && l.to_artifact_id == t0));
+        // The root task (T0) has no DependsOn edge of its own.
+        assert!(!dag
+            .links
+            .iter()
+            .any(|l| matches!(l.kind, LinkKind::DependsOn) && l.from_artifact_id == t0));
+    }
+
+    #[tokio::test]
+    async fn submit_tasks_rejects_cycle() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-plan").await;
+        // Item 0 references index 1 (forward). Refs may only point backward, so
+        // cycles are impossible by construction — this is rejected.
+        let err = ingest(
+            &db.conn,
+            "tok-plan",
+            "loop_submit_artifacts",
+            &json!({"artifacts":[
+                {"title":"A","content":"x","depends_on":[1]},
+                {"title":"B","content":"y"}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_tasks_rejects_multi_predecessor() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-plan").await;
+        let err = ingest(
+            &db.conn,
+            "tok-plan",
+            "loop_submit_artifacts",
+            &json!({"artifacts":[
+                {"title":"A","content":"x"},
+                {"title":"B","content":"y"},
+                {"title":"C","content":"z","depends_on":[0,1]}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        // No partial write: up-front validation aborted before any task row.
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        assert_eq!(
+            dag.artifacts
+                .iter()
+                .filter(|a| matches!(a.kind, ArtifactKind::Task))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_tasks_rejects_out_of_range_dep() {
+        let (db, space, issue, root) = seed().await;
+        let _ = running_iter(&db.conn, space, issue, Stage::Plan, Some(root), "tok-plan").await;
+        // Batch-index refs can't name another issue's task (cross-issue deps are
+        // structurally impossible); the equivalent boundary guard rejects an
+        // index past the batch.
+        let err = ingest(
+            &db.conn,
+            "tok-plan",
+            "loop_submit_artifacts",
+            &json!({"artifacts":[{"title":"A","content":"x","depends_on":[5]}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
     }
 }
