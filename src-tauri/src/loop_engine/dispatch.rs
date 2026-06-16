@@ -743,14 +743,57 @@ async fn clear_pending(
     Ok(())
 }
 
-/// Issue-level budget circuit breaker (§4.10). Once accumulated `token_used`
-/// crosses the issue's `token_budget` (`NULL` = unlimited, the default — no
-/// artificial cap), CAS the issue `running → paused`, stamp `pause_reason =
-/// budget`, and file a `budget_exhausted` card. The per-issue driver then stops
-/// dispatching on its next tick (status no longer `running`).
-///
-/// Idempotent: the CAS only fires on the `running → paused` edge, and the inbox
-/// upsert dedupes on `(issue, budget_exhausted, budget:{id})`.
+/// Whether the issue has a budget and has reached or exceeded it — i.e. there is
+/// no room to start new work. `NULL` budget = unlimited (the default — no
+/// artificial cap). Used by the dispatch-time pre-check; the settle-time trip
+/// uses a strict `>` (already overspent).
+pub(crate) fn over_budget(issue: &loop_issue::Model) -> bool {
+    issue.token_budget.is_some_and(|b| issue.token_used >= b)
+}
+
+/// Pause an issue for budget exhaustion: CAS `running → paused`, stamp
+/// `pause_reason = budget`, and file the dedup'd `budget_exhausted` card. Shared
+/// by the settle-time trip and the dispatch-time pre-check. Returns whether it
+/// applied the pause. Idempotent: the CAS only fires on the `running → paused`
+/// edge, and the inbox upsert dedupes on `(issue, budget_exhausted, budget:{id})`.
+pub(crate) async fn pause_for_budget(
+    conn: &sea_orm::DatabaseConnection,
+    issue: &loop_issue::Model,
+    iteration_id: Option<i32>,
+) -> Result<bool, LoopError> {
+    if !cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Paused).await? {
+        return Ok(false);
+    }
+    loop_issue::Entity::update_many()
+        .col_expr(
+            loop_issue::Column::PauseReason,
+            Expr::value(PauseReason::Budget.to_value()),
+        )
+        .filter(loop_issue::Column::Id.eq(issue.id))
+        .exec(conn)
+        .await?;
+    inbox::upsert_inbox(
+        conn,
+        issue.space_id,
+        issue.id,
+        iteration_id,
+        InboxKind::BudgetExhausted,
+        &format!("budget:{}", issue.id),
+        serde_json::json!({
+            "token_used": issue.token_used,
+            "token_budget": issue.token_budget,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Issue-level budget circuit breaker (§4.10), settle-time edge. Once accumulated
+/// `token_used` crosses the issue's `token_budget`, pause the issue + file a card.
+/// The per-issue driver then stops dispatching on its next tick (status no longer
+/// `running`). The dispatch-time [`over_budget`] pre-check complements this by
+/// refusing to start new work once the budget is reached (parallel fan-out can
+/// otherwise launch several writes before any settles here).
 async fn trip_budget_if_exhausted(
     conn: &sea_orm::DatabaseConnection,
     issue_id: i32,
@@ -765,29 +808,7 @@ async fn trip_budget_if_exhausted(
     if issue.token_used <= budget {
         return Ok(());
     }
-    if cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Paused).await? {
-        loop_issue::Entity::update_many()
-            .col_expr(
-                loop_issue::Column::PauseReason,
-                Expr::value(PauseReason::Budget.to_value()),
-            )
-            .filter(loop_issue::Column::Id.eq(issue.id))
-            .exec(conn)
-            .await?;
-        inbox::upsert_inbox(
-            conn,
-            issue.space_id,
-            issue.id,
-            Some(iteration_id),
-            InboxKind::BudgetExhausted,
-            &format!("budget:{}", issue.id),
-            serde_json::json!({
-                "token_used": issue.token_used,
-                "token_budget": budget,
-            }),
-        )
-        .await?;
-    }
+    pause_for_budget(conn, &issue, Some(iteration_id)).await?;
     Ok(())
 }
 

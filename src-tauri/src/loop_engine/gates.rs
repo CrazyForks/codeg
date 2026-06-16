@@ -38,7 +38,10 @@ use crate::db::AppDatabase;
 use crate::models::loops::{IssueConfig, LoopArtifactRow, LoopDagView, ReviewPassRule, ReviewerSpec};
 use crate::web::event_bridge::EventEmitter;
 
-use crate::loop_engine::dispatch::{dispatch_iteration, emit_changed, DispatchInput, LoopAgentSpawner};
+use crate::loop_engine::dispatch::{
+    dispatch_iteration, emit_changed, over_budget, pause_for_budget, DispatchInput,
+    LoopAgentSpawner,
+};
 use crate::loop_engine::driver::resolve_agent_spec;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
@@ -130,6 +133,19 @@ pub(crate) async fn drive_active_task(
     config: &IssueConfig,
     worktree_folder_id: i32,
 ) -> Result<StepOutcome, LoopError> {
+    // Budget pre-check (dispatch-time half of the double-check): refuse to start
+    // new task work once the issue has reached its budget. Parallel fan-out can
+    // otherwise launch several writes before any settles and trips the settle-time
+    // breaker. In-flight work still settles (and may mildly overspend — budget is
+    // not reserved); this only stops NEW dispatch and pauses so the driver halts
+    // next tick.
+    if over_budget(issue) {
+        if pause_for_budget(&db.conn, issue, None).await? {
+            emit_changed(emitter, issue.space_id, issue.id, issue.id, "budget");
+        }
+        return Ok(StepOutcome::Advanced);
+    }
+
     // The tasks that can make progress this tick: those mid-review
     // (`in_progress`) and those whose every dependency is `Done` (ready pending).
     // `in_progress` first so a serial issue continues an in-flight task's review
@@ -2276,26 +2292,33 @@ mod tests {
         assert_eq!(load_issue(&h).await.status, IssueStatus::Blocked);
     }
 
-    /// Budget breaker: once accumulated `token_used` crosses `token_budget`,
-    /// settling any iteration pauses the issue (`pause_reason = budget`) and
-    /// files a `budget_exhausted` card.
+    /// Settle-time budget breaker: once accumulated `token_used` crosses
+    /// `token_budget`, settling the iteration pauses the issue (`pause_reason =
+    /// budget`) and files a `budget_exhausted` card. (Complements the dispatch-time
+    /// pre-check below — here the overspend lands *during* an in-flight iteration.)
     #[tokio::test]
     async fn breaker_budget_pause_on_exhaustion() {
         let h = setup().await;
         let _task = add_task(&h, "Task 1").await;
 
-        // Pre-seed accumulated usage already over a tight budget.
+        // Under budget at dispatch time so the pre-check admits the implement.
         loop_issue::Entity::update_many()
-            .col_expr(loop_issue::Column::TokenUsed, Expr::value(1000_i64))
+            .col_expr(loop_issue::Column::TokenUsed, Expr::value(0_i64))
             .col_expr(loop_issue::Column::TokenBudget, Expr::value(500_i64))
             .filter(loop_issue::Column::Id.eq(h.issue_id))
             .exec(&h.db.conn)
             .await
             .unwrap();
-
-        // Dispatch + settle any iteration; settlement evaluates the budget breaker.
         assert_eq!(drive(&h).await, StepOutcome::Dispatched, "dispatch implement");
         let iter_id = running_implement_id(&h).await;
+
+        // The iteration's usage lands over budget; settling re-evaluates the breaker.
+        loop_issue::Entity::update_many()
+            .col_expr(loop_issue::Column::TokenUsed, Expr::value(1000_i64))
+            .filter(loop_issue::Column::Id.eq(h.issue_id))
+            .exec(&h.db.conn)
+            .await
+            .unwrap();
         settle_iteration(&h.db, &EventEmitter::Noop, iter_id)
             .await
             .unwrap();
@@ -2313,6 +2336,39 @@ mod tests {
                     && i.subject_key == format!("budget:{}", h.issue_id)),
             "budget_exhausted card filed"
         );
+    }
+
+    /// Dispatch-time budget pre-check: when the issue is already at/over budget, a
+    /// drive must NOT start new task work — it pauses the issue instead. Bounds the
+    /// overspend a parallel fan-out could otherwise cause by launching many writes
+    /// before any settles.
+    #[tokio::test]
+    async fn budget_exhausted_skips_dispatch() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        add_task(&h, "A").await;
+        add_task(&h, "B").await;
+
+        // Budget already fully consumed.
+        loop_issue::Entity::update_many()
+            .col_expr(loop_issue::Column::TokenUsed, Expr::value(500_i64))
+            .col_expr(loop_issue::Column::TokenBudget, Expr::value(500_i64))
+            .filter(loop_issue::Column::Id.eq(h.issue_id))
+            .exec(&h.db.conn)
+            .await
+            .unwrap();
+
+        // Drive: over budget → pause, nothing dispatched.
+        assert_eq!(drive(&h).await, StepOutcome::Advanced);
+        let issue = load_issue(&h).await;
+        assert_eq!(issue.status, IssueStatus::Paused, "issue paused, not driven");
+        assert_eq!(issue.pause_reason, Some(loop_issue::PauseReason::Budget));
+        let any_impl = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Implement))
+            .one(&h.db.conn)
+            .await
+            .unwrap();
+        assert!(any_impl.is_none(), "no implement dispatched when over budget");
     }
 
     // ---- Task 2.5: finalize → result ----
