@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    Set,
+    QueryOrder, Set,
 };
 use serde_json::{json, Value};
 
@@ -134,6 +134,81 @@ fn parse_depends_on(item: &Value, idx: usize) -> Result<Option<usize>, LoopError
         )));
     }
     Ok(Some(n as usize))
+}
+
+/// Parse + validate one item's `criteria`, typed by the batch artifact kind
+/// (spec §3.1). Requirements and tasks carry only `acceptance`; designs carry
+/// `constraint`/`invariant`/`obligation` (cross-cutting properties, never
+/// acceptance); other kinds carry none. Each entry is a bare string (defaulted
+/// by artifact kind) or `{ "text": str, "kind"?: str }`. A disallowed or
+/// unparseable kind is rejected so the caller can abort the whole batch before
+/// any write — same all-or-nothing contract as `depends_on`.
+fn parse_criteria(
+    item: &Value,
+    kind: ArtifactKind,
+) -> Result<Vec<(CriterionKind, String)>, LoopError> {
+    let Some(raw) = item.get("criteria") else {
+        return Ok(Vec::new());
+    };
+    if raw.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| invalid("criteria must be an array"))?;
+
+    // Default + allow-set per artifact kind.
+    let (default_kind, allowed): (Option<CriterionKind>, &[CriterionKind]) = match kind {
+        ArtifactKind::Requirement | ArtifactKind::Task => {
+            (Some(CriterionKind::Acceptance), &[CriterionKind::Acceptance])
+        }
+        ArtifactKind::Design => (
+            Some(CriterionKind::Constraint),
+            &[
+                CriterionKind::Constraint,
+                CriterionKind::Invariant,
+                CriterionKind::Obligation,
+            ],
+        ),
+        _ => (None, &[]),
+    };
+
+    let mut out = Vec::new();
+    for c in arr {
+        let (text, explicit_kind) = if let Some(s) = c.as_str() {
+            (s.trim().to_string(), None)
+        } else if let Some(obj) = c.as_object() {
+            let text = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let k = match obj.get("kind").and_then(|v| v.as_str()) {
+                Some(ks) => Some(
+                    serde_json::from_value::<CriterionKind>(json!(ks))
+                        .map_err(|_| invalid(format!("invalid criterion kind '{ks}'")))?,
+                ),
+                None => None,
+            };
+            (text, k)
+        } else {
+            return Err(invalid("criterion must be a string or an object"));
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let ck = explicit_kind
+            .or(default_kind)
+            .ok_or_else(|| invalid(format!("{kind:?} artifacts do not accept criteria")))?;
+        if !allowed.contains(&ck) {
+            return Err(invalid(format!(
+                "criterion kind {ck:?} not allowed for {kind:?} artifacts"
+            )));
+        }
+        out.push((ck, text));
+    }
+    Ok(out)
 }
 
 /// Entry point: validate `(token, tool, payload)` and persist. Returns a small
@@ -333,6 +408,31 @@ async fn submit_artifacts(
         Vec::new()
     };
 
+    // A design fans into EVERY done requirement of the issue (spec §3.2), not
+    // just the iteration's single anchor node — so requirement criteria reach
+    // implement/review through a real edge. Each edge is bound to the
+    // requirement's latest revision (a content snapshot, so a later requirement
+    // edit is detectable as stale lineage). Ordered by (sort, id) to match the
+    // R{i} ordinals the plan stage references.
+    let design_targets: Vec<(i32, Option<i32>)> = if kind == ArtifactKind::Design {
+        let reqs = loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(it.issue_id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Requirement))
+            .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Done))
+            .order_by_asc(loop_artifact::Column::Sort)
+            .order_by_asc(loop_artifact::Column::Id)
+            .all(conn)
+            .await?;
+        let mut out = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let rev = loop_service::artifact::latest_revision_id(conn, r.id).await?;
+            out.push((r.id, rev));
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
     // Validate every item's `depends_on` up-front, before any artifact is
     // written — a bad reference must abort the whole batch with no partial rows
     // (a partial write would then look "done" to the idempotency replay guard).
@@ -347,6 +447,14 @@ async fn submit_artifacts(
     } else {
         vec![None; items.len()]
     };
+
+    // Validate every item's criteria up-front (typed, per-artifact-kind
+    // allow-set) — same all-or-nothing contract as depends_on: a disallowed kind
+    // aborts the batch before any row is written.
+    let criteria_per_item: Vec<Vec<(CriterionKind, String)>> = items
+        .iter()
+        .map(|item| parse_criteria(item, kind))
+        .collect::<Result<_, _>>()?;
 
     let status = default_status_for_kind(kind);
     let mut ids = Vec::new();
@@ -372,21 +480,24 @@ async fn submit_artifacts(
         .await?;
         loop_service::artifact::add_revision(conn, art.id, &content, ActorKind::Agent, Some(it.id))
             .await?;
-        if let Some(criteria) = item.get("criteria").and_then(|v| v.as_array()) {
-            for c in criteria {
-                if let Some(text) = c.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                    loop_service::artifact::add_criterion(
-                        conn,
-                        art.id,
-                        CriterionKind::Acceptance,
-                        text,
-                    )
-                    .await?;
-                }
-            }
+        for (ck, text) in &criteria_per_item[idx] {
+            loop_service::artifact::add_criterion(conn, art.id, *ck, text).await?;
         }
         // Canonical edge direction: from = derived/result node, to = its source.
-        if let Some(target) = derive_target {
+        if kind == ArtifactKind::Design {
+            // Fan into every done requirement, each bound to its latest revision.
+            for (req_id, rev) in &design_targets {
+                loop_service::link::create_link(
+                    conn,
+                    it.space_id,
+                    art.id,
+                    *req_id,
+                    LinkKind::DerivesFrom,
+                    *rev,
+                )
+                .await?;
+            }
+        } else if let Some(target) = derive_target {
             loop_service::link::create_link(
                 conn,
                 it.space_id,
@@ -725,6 +836,109 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn design_fans_into_all_requirements_with_bound_revisions() {
+        let (db, space, issue, root) = seed().await;
+        // Refine: two requirements, each with an acceptance criterion.
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-r").await;
+        ingest(
+            &db.conn,
+            "tok-r",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [
+                    {"title": "Req A", "content": "shall A", "criteria": ["A1"]},
+                    {"title": "Req B", "content": "shall B", "criteria": ["B1"]}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        let reqs: std::collections::HashSet<i32> = dag
+            .artifacts
+            .iter()
+            .filter(|a| matches!(a.kind, ArtifactKind::Requirement))
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(reqs.len(), 2);
+
+        // Design: one design fans into BOTH requirements, each edge bound to a rev.
+        let _ = running_iter(&db.conn, space, issue, Stage::Design, Some(root), "tok-d").await;
+        ingest(
+            &db.conn,
+            "tok-d",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [
+                    {"title": "Design", "content": "the design",
+                     "criteria": [{"text": "stays O(1)", "kind": "invariant"}]}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        let design_id = dag
+            .artifacts
+            .iter()
+            .find(|a| matches!(a.kind, ArtifactKind::Design))
+            .unwrap()
+            .id;
+        let edges: Vec<_> = dag
+            .links
+            .iter()
+            .filter(|l| matches!(l.kind, LinkKind::DerivesFrom) && l.from_artifact_id == design_id)
+            .collect();
+        assert_eq!(edges.len(), 2, "design derives from both requirements");
+        assert!(
+            edges.iter().all(|e| e.source_revision_id.is_some()),
+            "each lineage edge binds a requirement revision"
+        );
+        let targets: std::collections::HashSet<i32> =
+            edges.iter().map(|e| e.to_artifact_id).collect();
+        assert_eq!(targets, reqs, "edges point at exactly the requirements");
+    }
+
+    #[tokio::test]
+    async fn typed_criteria_allow_set_enforced() {
+        let (db, space, issue, root) = seed().await;
+        // A design may not carry an acceptance criterion → batch aborts, no write.
+        let _ = running_iter(&db.conn, space, issue, Stage::Design, Some(root), "tok-d").await;
+        let err = ingest(
+            &db.conn,
+            "tok-d",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [{"title": "D", "content": "x",
+                    "criteria": [{"text": "do x", "kind": "acceptance"}]}]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+        let dag = loop_service::artifact::list_dag(&db.conn, issue).await.unwrap();
+        assert!(
+            !dag.artifacts.iter().any(|a| matches!(a.kind, ArtifactKind::Design)),
+            "rejected batch wrote nothing"
+        );
+
+        // A requirement may not carry an obligation.
+        let _ = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-r").await;
+        let err = ingest(
+            &db.conn,
+            "tok-r",
+            "loop_submit_artifacts",
+            &json!({
+                "artifacts": [{"title": "R", "content": "x",
+                    "criteria": [{"text": "no panics", "kind": "obligation"}]}]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
     }
 
     #[tokio::test]

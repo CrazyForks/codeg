@@ -124,6 +124,21 @@ pub async fn add_revision(
     .await?)
 }
 
+/// The id of the artifact's most recent revision (highest seq), if any. Used to
+/// bind a design→requirement lineage edge to the exact requirement content the
+/// design derived from.
+pub async fn latest_revision_id(
+    conn: &sea_orm::DatabaseConnection,
+    artifact_id: i32,
+) -> Result<Option<i32>, DbError> {
+    Ok(loop_artifact_revision::Entity::find()
+        .filter(loop_artifact_revision::Column::ArtifactId.eq(artifact_id))
+        .order_by_desc(loop_artifact_revision::Column::Seq)
+        .one(conn)
+        .await?
+        .map(|m| m.id))
+}
+
 /// Auto-labels `AC-{n}` and appends at the end. `kind` types the criterion
 /// (acceptance for requirements/tasks; constraint/invariant/obligation for
 /// designs) — ingest enforces the per-artifact-kind allow-set before calling.
