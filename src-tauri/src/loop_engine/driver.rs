@@ -496,7 +496,7 @@ pub(crate) async fn tick_once(
     infra_retries: &mut HashMap<i32, u32>,
 ) -> Result<TickOutcome, LoopError> {
     let conn = &db.conn;
-    let issue = loop_issue::Entity::find_by_id(issue_id)
+    let mut issue = loop_issue::Entity::find_by_id(issue_id)
         .one(conn)
         .await?
         .ok_or_else(|| LoopError::NotFound(format!("issue {issue_id}")))?;
@@ -611,10 +611,15 @@ pub(crate) async fn tick_once(
     }
 
     // Decide the issue's execution mode once the task DAG exists (write-once;
-    // no-op while read stages are still in flight). Recorded for the parallel
-    // pipeline (phases 1–2) and the DAG view; the serial wiring below is
-    // unaffected by it in phase 0.
-    ensure_execution_mode(conn, &issue, &dag).await?;
+    // no-op while read stages are still in flight), and apply the authoritative
+    // value to the in-memory issue for THIS tick. The write pipeline below picks
+    // each task's worktree by it (parallel → per-task tree; else the shared issue
+    // tree) and fans out parallel tasks; a stale in-memory `None` would drive the
+    // first task of a freshly decided parallel issue into the wrong (shared) tree
+    // and only fan out from the next tick.
+    if let Some(mode) = ensure_execution_mode(conn, &issue, &dag).await? {
+        issue.execution_mode = Some(mode);
+    }
 
     // Read pipeline complete (tasks exist) → drive the write pipeline. A no-op
     // when there are no tasks yet (read stages still in flight), so it is safe
@@ -1175,6 +1180,64 @@ mod tests {
         (db, PathBuf::from("/tmp/data"), issue.row.id)
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "tester"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Like [`setup`] but backed by a real git repo + on-disk worktree, so a tick
+    /// that reaches the write pipeline (which provisions per-task worktrees) works.
+    /// Returns the tempdir guards so the repo/data dirs outlive the test.
+    async fn setup_real() -> (AppDatabase, tempfile::TempDir, tempfile::TempDir, i32) {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let data = tempfile::tempdir().unwrap();
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, &repo.path().to_string_lossy()).await;
+        let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &db.conn,
+            space.id,
+            "Issue",
+            "body",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        let ctx = crate::loop_engine::worktree::ensure_worktree(&db.conn, data.path(), issue.row.id)
+            .await
+            .unwrap();
+        // Trigger: mark running + bind the issue's real worktree folder.
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Status,
+                Expr::value(IssueStatus::Running.to_value()),
+            )
+            .col_expr(
+                loop_issue::Column::WorktreeFolderId,
+                Expr::value(ctx.worktree_folder_id),
+            )
+            .filter(loop_issue::Column::Id.eq(issue.row.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        (db, data, repo, issue.row.id)
+    }
+
     /// Settle every currently-running triage iteration WITHOUT submitting a
     /// route (simulates a triage agent whose turn ended without
     /// `loop_submit_route`), leaving `issue.route` undecided.
@@ -1645,8 +1708,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_route_grows_dag_through_tasks() {
-        let (db, data_dir, issue_id) = setup().await;
-        drive_through_read_pipeline(&db, &data_dir, issue_id, "full").await;
+        let (db, data, _repo, issue_id) = setup_real().await;
+        drive_through_read_pipeline(&db, data.path(), issue_id, "full").await;
 
         let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
         assert_eq!(kind_count(&dag, ArtifactKind::Issue), 1);
@@ -1689,8 +1752,8 @@ mod tests {
 
     #[tokio::test]
     async fn direct_route_skips_refine_and_design_with_skips_to() {
-        let (db, data_dir, issue_id) = setup().await;
-        drive_through_read_pipeline(&db, &data_dir, issue_id, "direct").await;
+        let (db, data, _repo, issue_id) = setup_real().await;
+        drive_through_read_pipeline(&db, data.path(), issue_id, "direct").await;
 
         let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
         assert_eq!(kind_count(&dag, ArtifactKind::Requirement), 0, "no requirements");
@@ -1713,6 +1776,47 @@ mod tests {
         assert!(!iters
             .iter()
             .any(|it| matches!(it.stage, Stage::Refine | Stage::Design)));
+    }
+
+    /// Regression: the execution mode decided on the first write tick must take
+    /// effect THAT tick. A parallel plan (two independent tasks) must fan out both
+    /// implements into their OWN per-task worktrees on the deciding tick — not
+    /// drive the first task serially into the shared issue worktree. (Bug: tick
+    /// persisted the decided mode to the DB but kept driving with the stale
+    /// pre-decision in-memory issue, so a freshly parallel issue's first task ran
+    /// in the shared tree and only fanned out from the next tick — stranding that
+    /// task's edits when its checkpoint later looked in the per-task tree.)
+    #[tokio::test]
+    async fn first_write_tick_applies_decided_parallel_mode() {
+        let (db, data, _repo, issue_id) = setup_real().await;
+        // "direct" route → the planner submits two independent tasks → parallel.
+        drive_through_read_pipeline(&db, data.path(), issue_id, "direct").await;
+
+        let issue = loop_issue::Entity::find_by_id(issue_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.execution_mode.as_deref(), Some("parallel"));
+
+        // Both tasks' implements launched on the SAME tick that decided the mode —
+        // not just one. With the stale-`None` bug the deciding tick truncates to a
+        // single task driven into the shared issue worktree; the fan-out (and the
+        // per-task worktree each implement needs to dispatch) only appears here
+        // because the decided mode is applied in-tick. (Each running implement
+        // implies its per-task worktree was provisioned: a worktree failure would
+        // have skipped the task, leaving fewer than two.)
+        let impls = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Implement))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            impls.len(),
+            2,
+            "parallel fan-out applies on the deciding tick, not the next one"
+        );
     }
 
     #[tokio::test]
