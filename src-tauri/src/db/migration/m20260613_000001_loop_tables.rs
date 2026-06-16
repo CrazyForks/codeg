@@ -104,6 +104,7 @@ const UP: &[&str] = &[
         to_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         kind TEXT NOT NULL
             CHECK (kind IN ('derives_from','skips_to','reviews','depends_on','results_from')),
+        source_revision_id INTEGER REFERENCES loop_artifact_revision(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL
     )",
     "CREATE UNIQUE INDEX uniq_loop_link ON loop_link(from_artifact_id, to_artifact_id, kind)",
@@ -113,9 +114,23 @@ const UP: &[&str] = &[
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
         label TEXT NOT NULL,
         text TEXT NOT NULL,
-        sort INTEGER NOT NULL DEFAULT 0
+        sort INTEGER NOT NULL DEFAULT 0,
+        kind TEXT NOT NULL DEFAULT 'acceptance'
+            CHECK (kind IN ('acceptance','constraint','invariant','obligation'))
     )",
     "CREATE INDEX idx_loop_criterion_artifact ON loop_criterion(artifact_id)",
+    // Criterion-level coverage: which task artifact satisfies which (acceptance)
+    // criterion. The unit of traceability — a requirement AC is "covered" once a
+    // task claims it, and the driver's bounded replan loop-back fires on any gap.
+    "CREATE TABLE loop_coverage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
+        task_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
+        criterion_id INTEGER NOT NULL REFERENCES loop_criterion(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+    )",
+    "CREATE UNIQUE INDEX uniq_loop_coverage ON loop_coverage(task_artifact_id, criterion_id)",
+    "CREATE INDEX idx_loop_coverage_criterion ON loop_coverage(criterion_id)",
     "CREATE TABLE loop_iteration (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
@@ -205,6 +220,7 @@ const UP: &[&str] = &[
 
 /// Reverse dependency order (children before parents).
 const DOWN: &[&str] = &[
+    "DROP TABLE IF EXISTS loop_coverage",
     "DROP TABLE IF EXISTS loop_validation_run",
     "DROP TABLE IF EXISTS loop_inbox_item",
     "DROP TABLE IF EXISTS loop_memory",
@@ -270,6 +286,7 @@ mod tests {
             "loop_artifact_revision",
             "loop_link",
             "loop_criterion",
+            "loop_coverage",
             "loop_iteration",
             "loop_validation_run",
             "loop_inbox_item",
@@ -285,11 +302,13 @@ mod tests {
             "uniq_review_slot",
             "uniq_inbox_pending",
             "uniq_result_per_issue",
+            "uniq_loop_coverage",
             // Plain lookup indexes.
             "idx_loop_iteration_issue_status",
             "idx_loop_artifact_produced_by",
             "idx_loop_link_to",
             "idx_loop_criterion_artifact",
+            "idx_loop_coverage_criterion",
             "idx_loop_validation_run_issue",
             "idx_loop_validation_run_task",
             "idx_loop_validation_run_iter",

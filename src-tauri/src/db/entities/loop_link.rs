@@ -31,6 +31,11 @@ pub struct Model {
     pub from_artifact_id: i32,
     pub to_artifact_id: i32,
     pub kind: LinkKind,
+    /// For `derives_from` edges from a design to a requirement: the requirement
+    /// revision this design was derived from — a content snapshot binding, so a
+    /// later requirement edit is detectable as a stale lineage. `None` for edges
+    /// that don't snapshot a source (task deps, reviews, results).
+    pub source_revision_id: Option<i32>,
     pub created_at: DateTimeUtc,
 }
 
