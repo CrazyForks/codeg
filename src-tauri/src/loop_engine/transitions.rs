@@ -1,9 +1,8 @@
 //! The single funnel for loop state changes: compare-and-swap status
-//! transitions, the durable dispatch leases (partial unique indexes enforce
-//! one active write-iteration per issue, one active iteration per (target,
-//! stage) excluding review, and N review slots per task), and the per-issue
-//! serial-task pipeline gate. All concurrency safety bottoms out here, not in
-//! the in-memory driver registry.
+//! transitions and the durable dispatch leases (partial unique indexes enforce
+//! one active finalize per issue, one active iteration per (target, stage)
+//! excluding review, and N review slots per task). All concurrency safety
+//! bottoms out here, not in the in-memory driver registry.
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;

@@ -662,9 +662,10 @@ async fn implement_iterations(
 
 /// CAS a task artifact's status `from → to` — the artifact analogue of the
 /// `cas_*_status` discipline used for issues and iterations. Returns whether the
-/// transition applied. The loop serializes task work (single per-issue driver +
-/// the serial task gate), so a `false` here means the expected `from` was wrong —
-/// a logic bug — and is logged rather than silently swallowed.
+/// transition applied. A single per-issue driver advances its tasks (they fan
+/// out within a tick but are stepped one at a time), so a `false` here means the
+/// expected `from` was wrong — a logic bug — and is logged rather than silently
+/// swallowed.
 async fn set_task_status_cas(
     db: &AppDatabase,
     task_id: i32,
