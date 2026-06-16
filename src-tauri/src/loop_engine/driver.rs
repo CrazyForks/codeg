@@ -14,6 +14,7 @@
 //! (implement → verify → review → finalize, in [`crate::loop_engine::gates`])
 //! takes over for each task. Both are dispatched from [`tick_once`].
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -492,6 +493,7 @@ pub(crate) async fn tick_once(
     spawner: &dyn LoopAgentSpawner,
     emitter: &EventEmitter,
     issue_id: i32,
+    infra_retries: &mut HashMap<i32, u32>,
 ) -> Result<TickOutcome, LoopError> {
     let conn = &db.conn;
     let issue = loop_issue::Entity::find_by_id(issue_id)
@@ -626,6 +628,7 @@ pub(crate) async fn tick_once(
         &dag,
         &config,
         worktree_folder_id,
+        infra_retries,
     )
     .await?
     {
@@ -780,6 +783,11 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
     // Counts consecutive `Advanced` re-ticks for the diagnostic above; reset on
     // any tick that parks or breaks.
     let mut consecutive_advances: u32 = 0;
+    // Per-task infrastructure-failure streaks (worktree-ensure failures), in driver
+    // memory. While non-empty, the park below arms the heartbeat so the driver
+    // re-ticks to retry even when nothing is in flight. Reset/pruned per tick by
+    // `drive_active_task`; a streak crossing INFRA_RETRY_MAX blocks the task.
+    let mut infra_retries: HashMap<i32, u32> = HashMap::new();
     loop {
         // DB-authoritative backstop before each tick: settle iterations whose
         // agent connection is gone (the event-driven settle alone can wedge).
@@ -807,6 +815,7 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
             &engine.manager,
             &engine.emitter,
             issue_id,
+            &mut infra_retries,
         )
         .instrument(tracing::info_span!("loop_tick", issue_id))
         .await
@@ -867,11 +876,12 @@ pub(crate) async fn run_driver(engine: Arc<LoopEngine>, issue_id: i32, wake: Arc
         // A tick that parks (or errs) ends any advance chain.
         consecutive_advances = 0;
         // Park until an iteration settles (the completion watcher fires `wake`)
-        // or — only while work is actually in flight — the periodic heartbeat
-        // elapses (which runs the reconcile above). An idle issue waits purely on
-        // `wake` and issues no blind periodic query. `notify_one` buffers a
-        // permit, so a wake that races ahead is not lost.
-        if has_inflight_iteration(&engine.db, issue_id).await {
+        // or — while work is in flight OR an infra-retry is pending — the periodic
+        // heartbeat elapses (which runs the reconcile above and re-ticks to retry
+        // the failed worktree). An otherwise-idle issue waits purely on `wake` and
+        // issues no blind periodic query. `notify_one` buffers a permit, so a wake
+        // that races ahead is not lost.
+        if has_inflight_iteration(&engine.db, issue_id).await || !infra_retries.is_empty() {
             tokio::select! {
                 _ = wake.notified() => {}
                 _ = heartbeat.tick() => {}
@@ -1189,7 +1199,7 @@ mod tests {
         issue_id: i32,
     ) -> loop_iteration::Model {
         let spawner = StubSpawner;
-        tick_once(db, data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(db, data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         let running = loop_iteration::Entity::find()
@@ -1371,13 +1381,13 @@ mod tests {
         let spawner = StubSpawner;
 
         // Tick 1: dispatch triage, then settle it with no route.
-        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         settle_running_triage_without_route(&db).await;
 
         // Tick 2: triage settled but undecided → re-dispatch (attempt 1).
-        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         assert_eq!(out, TickOutcome::Dispatched);
@@ -1385,7 +1395,7 @@ mod tests {
 
         // Tick 3: attempts hit max → block + inbox card. The block reports
         // Advanced so the driver re-ticks and stops on the now-blocked issue.
-        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         assert_eq!(out, TickOutcome::Advanced);
@@ -1426,7 +1436,7 @@ mod tests {
         let spawner = StubSpawner;
 
         // Tick 1: dispatch triage, then abandon it (dead connection → Failed).
-        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         let running = loop_iteration::Entity::find()
@@ -1444,7 +1454,7 @@ mod tests {
         // Tick 2: one Failed triage + undecided route + max_attempts=1 → block,
         // NOT a fresh attempt-0 dispatch (the pre-fix bug). The block reports
         // Advanced (re-tick → stop), not a redispatch.
-        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         assert_eq!(out, TickOutcome::Advanced);
@@ -1507,7 +1517,7 @@ mod tests {
         let spawner = StubSpawner;
 
         // Get past triage with a decided route.
-        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         respond_and_settle(&db, "skip_design").await;
@@ -1517,7 +1527,7 @@ mod tests {
         // it must terminate, never redispatch forever (the D5 bug).
         let mut stopped = false;
         for _ in 0..12 {
-            let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            let out = tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
                 .await
                 .unwrap();
             if out == TickOutcome::Stop {
@@ -1610,7 +1620,7 @@ mod tests {
     ) {
         let spawner = StubSpawner;
         for _ in 0..30 {
-            let _ = tick_once(db, data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            let _ = tick_once(db, data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
                 .await
                 .unwrap();
             let into_implement = loop_iteration::Entity::find()
@@ -1719,7 +1729,7 @@ mod tests {
         // Drive triage(full) → refine → design, settling each but NOT approving.
         let mut awaiting = false;
         for _ in 0..12 {
-            tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
                 .await
                 .unwrap();
             respond_and_settle(&db, "full").await;
@@ -1735,7 +1745,7 @@ mod tests {
 
         // The gate holds: a card is filed and no task is dispatched, even on a
         // further tick.
-        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+        tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
             .await
             .unwrap();
         let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
@@ -1756,7 +1766,7 @@ mod tests {
         approve_awaiting_designs(&db, issue_id).await;
         let mut tasks = 0;
         for _ in 0..12 {
-            tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id)
+            tick_once(&db, &data_dir, &spawner, &EventEmitter::Noop, issue_id, &mut HashMap::new())
                 .await
                 .unwrap();
             respond_and_settle(&db, "full").await;

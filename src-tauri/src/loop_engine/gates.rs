@@ -112,6 +112,14 @@ impl StepOutcome {
     }
 }
 
+/// Consecutive per-task infrastructure failures (e.g. worktree creation) tolerated
+/// before the task + issue are blocked. NOT a business cap — a pure safety net so a
+/// genuinely broken environment surfaces as a `blocked` card instead of an infinite
+/// retry/log loop. The count is driver-memory, per task, reset on any success and
+/// pruned when the task leaves the drivable set, so unrelated transient failures
+/// never accumulate into a false block.
+const INFRA_RETRY_MAX: u32 = 5;
+
 /// Drive the issue's tasks through the write pipeline (implement → validate →
 /// review) for one tick. See [`StepOutcome`] for how the driver reacts to the
 /// return value.
@@ -122,6 +130,11 @@ impl StepOutcome {
 /// time (sharing the issue worktree). A no-op while no task exists yet (read
 /// stages still in flight), so the driver can call it on every "read frontier
 /// empty" tick.
+///
+/// `infra_retries` is the driver's per-task infrastructure-failure counter (keyed
+/// by task id). A worktree-ensure failure increments it and skips that task —
+/// siblings still run — and `run_driver` keeps re-ticking (it arms a timer while
+/// the map is non-empty) until the worktree succeeds or [`INFRA_RETRY_MAX`] trips.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_active_task(
     db: &AppDatabase,
@@ -132,6 +145,7 @@ pub(crate) async fn drive_active_task(
     dag: &LoopDagView,
     config: &IssueConfig,
     worktree_folder_id: i32,
+    infra_retries: &mut HashMap<i32, u32>,
 ) -> Result<StepOutcome, LoopError> {
     // Budget pre-check (dispatch-time half of the double-check): refuse to start
     // new task work once the issue has reached its budget. Parallel fan-out can
@@ -173,23 +187,54 @@ pub(crate) async fn drive_active_task(
         drivable.truncate(1);
     }
 
+    let drivable_set: std::collections::HashSet<i32> = drivable.iter().copied().collect();
     let mut outcome = StepOutcome::Idle;
-    for task_id in drivable {
-        let wt = task_worktree_folder(db, data_dir, issue, task_id, worktree_folder_id).await?;
+    for task_id in &drivable {
+        let task_id = *task_id;
+        let wt = match task_worktree_folder(db, data_dir, issue, task_id, worktree_folder_id).await {
+            Ok(wt) => wt,
+            Err(e) => {
+                // Infra failure (e.g. worktree creation). Don't abort the tick or
+                // starve sibling tasks — count it and, after a bounded run of
+                // consecutive failures, block the task + issue (a real, persistent
+                // environment fault). Otherwise skip it this tick; `run_driver`
+                // re-ticks (it arms a timer while `infra_retries` is non-empty).
+                let n = infra_retries.entry(task_id).or_insert(0);
+                *n += 1;
+                tracing::warn!(
+                    issue_id = issue.id,
+                    task_id,
+                    attempt = *n,
+                    error = %e,
+                    "drive: task worktree ensure failed"
+                );
+                if *n >= INFRA_RETRY_MAX {
+                    infra_retries.remove(&task_id);
+                    block_task_infra(db, emitter, issue, task_id).await?;
+                    outcome = outcome.merge(StepOutcome::Advanced);
+                }
+                continue;
+            }
+        };
+        // Worktree is available → clear any prior failure streak for this task.
+        infra_retries.remove(&task_id);
         let step =
             advance_active_task(db, data_dir, spawner, emitter, issue, dag, config, wt, task_id)
                 .await?;
         outcome = outcome.merge(step);
     }
+    // Drop failure counts for tasks no longer drivable (reached a terminal state),
+    // so an unrelated transient failure can never accumulate into a false block.
+    infra_retries.retain(|tid, _| drivable_set.contains(tid));
     Ok(outcome)
 }
 
 /// The worktree folder a task's write-pipeline iterations (implement / review /
 /// checkpoint / validation) run in. Parallel-mode issues give each task its own
-/// worktree — ensured idempotently here so two tasks never share a tree;
-/// serial-mode issues share the issue worktree (behavior unchanged). Phase 1
-/// still serializes dispatch via the task gate; phase 2 unleashes concurrency
-/// over this.
+/// worktree — ensured idempotently here so two concurrently-driven tasks never
+/// share a tree; serial-mode issues share the issue worktree. The ensure can fail
+/// (a transient infra error); the caller treats that as a bounded-retry skip
+/// rather than aborting the whole tick.
 async fn task_worktree_folder(
     db: &AppDatabase,
     data_dir: &Path,
@@ -762,6 +807,42 @@ async fn mark_blocked(
         }),
     )
     .await?;
+    Ok(())
+}
+
+/// Block a task whose worktree could not be provisioned after
+/// [`INFRA_RETRY_MAX`] consecutive attempts: set the task `blocked`, CAS the issue
+/// `running → blocked` (driver stops next tick), and file an `infra_failure:{task}`
+/// card for a human. Distinct subject from the no-progress breaker — this is an
+/// environment fault (disk, git), not a stuck agent.
+async fn block_task_infra(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    issue: &loop_issue::Model,
+    task_id: i32,
+) -> Result<(), LoopError> {
+    crate::loop_engine::transitions::cas_artifact_status_from(
+        &db.conn,
+        task_id,
+        &[ArtifactStatus::Pending, ArtifactStatus::InProgress],
+        ArtifactStatus::Blocked,
+    )
+    .await?;
+    cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
+    loop_service::inbox::upsert_inbox(
+        &db.conn,
+        issue.space_id,
+        issue.id,
+        None,
+        InboxKind::Blocked,
+        &format!("infra_failure:{task_id}"),
+        serde_json::json!({
+            "task_artifact_id": task_id,
+            "reason": "worktree_unavailable",
+        }),
+    )
+    .await?;
+    emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
     Ok(())
 }
 
@@ -1359,6 +1440,16 @@ mod tests {
     }
 
     async fn drive(h: &Harness) -> StepOutcome {
+        drive_tracking(h, &IssueConfig::default(), &mut HashMap::new()).await
+    }
+
+    /// Drive with an explicit infra-retry counter that persists across calls (for
+    /// the bounded-retry test); the convenience `drive`/`drive_with` discard it.
+    async fn drive_tracking(
+        h: &Harness,
+        config: &IssueConfig,
+        infra_retries: &mut HashMap<i32, u32>,
+    ) -> StepOutcome {
         let issue = load_issue(h).await;
         let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
         drive_active_task(
@@ -1368,8 +1459,9 @@ mod tests {
             &EventEmitter::Noop,
             &issue,
             &dag,
-            &IssueConfig::default(),
+            config,
             h.worktree_folder_id,
+            infra_retries,
         )
         .await
         .unwrap()
@@ -1538,6 +1630,51 @@ mod tests {
             running.len(),
             2,
             "both ready tasks have a running implement in the same tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_failure_retries_then_blocks() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        let a = add_task(&h, "A").await;
+        let b = add_task(&h, "B").await;
+        // B depends on A. Mark A Done but freeze it at a BOGUS commit, so
+        // ensure_task_worktree(B) cannot resolve its base ref — a deterministic
+        // infra failure on every attempt.
+        link::create_link(&h.db.conn, h.space_id, b, a, LinkKind::DependsOn)
+            .await
+            .unwrap();
+        cas_artifact_status(&h.db.conn, a, ArtifactStatus::Pending, ArtifactStatus::InProgress)
+            .await
+            .unwrap();
+        crate::loop_engine::transitions::cas_task_done_with_freeze(&h.db.conn, a, &"dead".repeat(10))
+            .await
+            .unwrap();
+        assert_eq!(task_node(&h, a).await.status, ArtifactStatus::Done);
+
+        let mut retries: HashMap<i32, u32> = HashMap::new();
+        // Each of the first INFRA_RETRY_MAX-1 drives skips B (retry pending) without
+        // blocking; the failure streak is counted in driver memory.
+        for i in 1..INFRA_RETRY_MAX {
+            let out = drive_tracking(&h, &IssueConfig::default(), &mut retries).await;
+            assert_eq!(out, StepOutcome::Idle, "skip, awaiting retry");
+            assert_eq!(retries.get(&b), Some(&i), "failure streak counted in memory");
+            assert_eq!(load_issue(&h).await.status, IssueStatus::Running);
+        }
+        // The next failure trips the breaker: B + issue blocked, card filed, streak cleared.
+        let out = drive_tracking(&h, &IssueConfig::default(), &mut retries).await;
+        assert_eq!(out, StepOutcome::Advanced, "block is durable progress");
+        assert_eq!(task_node(&h, b).await.status, ArtifactStatus::Blocked);
+        assert_eq!(load_issue(&h).await.status, IssueStatus::Blocked);
+        assert!(!retries.contains_key(&b), "streak cleared once blocked");
+        let inbox = loop_service::inbox::list_inbox(&h.db.conn, h.space_id, None)
+            .await
+            .unwrap();
+        assert!(
+            inbox.iter().any(|i| i.kind == InboxKind::Blocked
+                && i.subject_key == format!("infra_failure:{b}")),
+            "infra_failure card filed for the task"
         );
     }
 
@@ -1832,20 +1969,7 @@ mod tests {
     }
 
     async fn drive_with(h: &Harness, config: &IssueConfig) -> StepOutcome {
-        let issue = load_issue(h).await;
-        let dag = artifact::list_dag(&h.db.conn, h.issue_id).await.unwrap();
-        drive_active_task(
-            &h.db,
-            h.data.path(),
-            &StubSpawner,
-            &EventEmitter::Noop,
-            &issue,
-            &dag,
-            config,
-            h.worktree_folder_id,
-        )
-        .await
-        .unwrap()
+        drive_tracking(h, config, &mut HashMap::new()).await
     }
 
     /// Implement → checkpoint → validation passes → task implemented (in_progress).
