@@ -483,6 +483,7 @@ mod tests {
     use super::*;
     use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
     use crate::db::entities::loop_artifact_revision::ActorKind;
+    use crate::db::entities::loop_criterion::CriterionKind;
     use crate::db::entities::loop_issue::IssuePriority;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::loops::IssueConfig;
@@ -550,13 +551,20 @@ mod tests {
             .await
             .unwrap();
         for c in criteria {
-            loop_service::artifact::add_criterion(&db.conn, art.id, c)
+            loop_service::artifact::add_criterion(&db.conn, art.id, CriterionKind::Acceptance, c)
                 .await
                 .unwrap();
         }
-        loop_service::link::create_link(&db.conn, space_id, art.id, source, LinkKind::DerivesFrom)
-            .await
-            .unwrap();
+        loop_service::link::create_link(
+            &db.conn,
+            space_id,
+            art.id,
+            source,
+            LinkKind::DerivesFrom,
+            None,
+        )
+        .await
+        .unwrap();
         art.id
     }
 
@@ -704,7 +712,7 @@ mod tests {
         )
         .await;
         // Add the back-edge A→B to close the cycle (A derives_from B as well).
-        loop_service::link::create_link(&db.conn, space, a, b, LinkKind::DerivesFrom)
+        loop_service::link::create_link(&db.conn, space, a, b, LinkKind::DerivesFrom, None)
             .await
             .unwrap();
 

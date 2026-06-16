@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::agent::AgentType;
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::ActorKind;
+use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{IssuePriority, IssueRoute, IssueStatus, PauseReason};
 use crate::db::entities::loop_iteration::{IterationStatus, LaunchedBy, Stage};
@@ -270,6 +271,7 @@ pub struct LoopCriterionRow {
     pub label: String,
     pub text: String,
     pub sort: i32,
+    pub kind: CriterionKind,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,6 +280,18 @@ pub struct LoopLinkRow {
     pub from_artifact_id: i32,
     pub to_artifact_id: i32,
     pub kind: LinkKind,
+    /// For design→requirement `derives_from` edges: the requirement revision this
+    /// design derived from (lineage content snapshot). `None` for other edges.
+    pub source_revision_id: Option<i32>,
+}
+
+/// One criterion-level coverage edge: `task_artifact_id` claims it satisfies
+/// `criterion_id` (an acceptance criterion on some requirement).
+#[derive(Debug, Clone, Serialize)]
+pub struct LoopCoverageRow {
+    pub id: i32,
+    pub task_artifact_id: i32,
+    pub criterion_id: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -294,6 +308,8 @@ pub struct LoopArtifactDetail {
 pub struct LoopDagView {
     pub artifacts: Vec<LoopArtifactRow>,
     pub links: Vec<LoopLinkRow>,
+    /// Criterion-level coverage edges across this issue (task → criterion).
+    pub coverage: Vec<LoopCoverageRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]

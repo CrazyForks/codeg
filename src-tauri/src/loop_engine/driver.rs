@@ -330,7 +330,7 @@ async fn ensure_skip_provenance(
             .iter()
             .any(|l| l.from_artifact_id == task.id && l.kind == LinkKind::SkipsTo);
         if !has_skip {
-            link::create_link(&db.conn, space_id, task.id, root, LinkKind::SkipsTo).await?;
+            link::create_link(&db.conn, space_id, task.id, root, LinkKind::SkipsTo, None).await?;
         }
     }
     Ok(())
@@ -968,8 +968,10 @@ mod tests {
                     from_artifact_id: succ,
                     to_artifact_id: pred,
                     kind: LinkKind::DependsOn,
+                    source_revision_id: None,
                 })
                 .collect(),
+            coverage: Vec::new(),
         }
     }
 
@@ -1906,6 +1908,7 @@ mod tests {
         let dag = LoopDagView {
             artifacts: vec![root.clone()],
             links: vec![],
+            coverage: vec![],
         };
         let f = ready_nodes(&dag, IssueRoute::Full);
         assert_eq!(f.len(), 1);
@@ -1919,6 +1922,7 @@ mod tests {
                 mk(2, ArtifactKind::Requirement, ArtifactStatus::Done),
             ],
             links: vec![],
+            coverage: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::Full)[0].stage, Stage::Design);
 
@@ -1930,6 +1934,7 @@ mod tests {
                 mk(3, ArtifactKind::Design, ArtifactStatus::Done),
             ],
             links: vec![],
+            coverage: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::Full)[0].stage, Stage::Plan);
 
@@ -1942,6 +1947,7 @@ mod tests {
                 mk(4, ArtifactKind::Task, ArtifactStatus::Pending),
             ],
             links: vec![],
+            coverage: vec![],
         };
         assert!(ready_nodes(&dag, IssueRoute::Full).is_empty());
     }
@@ -1968,6 +1974,7 @@ mod tests {
         let dag = LoopDagView {
             artifacts: vec![root.clone()],
             links: vec![],
+            coverage: vec![],
         };
         let f = ready_nodes(&dag, IssueRoute::Direct);
         assert_eq!(f[0].stage, Stage::Plan);
@@ -1982,6 +1989,7 @@ mod tests {
                 mk(2, ArtifactKind::Requirement, ArtifactStatus::Done),
             ],
             links: vec![],
+            coverage: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::SkipDesign)[0].stage, Stage::Plan);
     }

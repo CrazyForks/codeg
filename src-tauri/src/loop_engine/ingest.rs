@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::acp::delegation::listener::LoopIngestAccess;
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::{self, ActorKind};
+use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssuePriority, IssueRoute};
 use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
@@ -374,7 +375,13 @@ async fn submit_artifacts(
         if let Some(criteria) = item.get("criteria").and_then(|v| v.as_array()) {
             for c in criteria {
                 if let Some(text) = c.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                    loop_service::artifact::add_criterion(conn, art.id, text).await?;
+                    loop_service::artifact::add_criterion(
+                        conn,
+                        art.id,
+                        CriterionKind::Acceptance,
+                        text,
+                    )
+                    .await?;
                 }
             }
         }
@@ -386,6 +393,7 @@ async fn submit_artifacts(
                 art.id,
                 target,
                 LinkKind::DerivesFrom,
+                None,
             )
             .await?;
         }
@@ -396,6 +404,7 @@ async fn submit_artifacts(
                 art.id,
                 *task_id,
                 LinkKind::ResultsFrom,
+                None,
             )
             .await?;
         }
@@ -410,6 +419,7 @@ async fn submit_artifacts(
                 art.id,
                 ids[pred],
                 LinkKind::DependsOn,
+                None,
             )
             .await?;
         }
@@ -466,7 +476,8 @@ async fn submit_review(
 
     loop_service::artifact::add_revision(conn, art.id, &findings, ActorKind::Agent, Some(it.id))
         .await?;
-    loop_service::link::create_link(conn, it.space_id, art.id, target, LinkKind::Reviews).await?;
+    loop_service::link::create_link(conn, it.space_id, art.id, target, LinkKind::Reviews, None)
+        .await?;
 
     Ok(json!({ "ok": true, "id": art.id, "verdict": verdict_str }))
 }

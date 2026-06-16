@@ -3,6 +3,7 @@
 //! `loop_engine::transitions`.
 
 pub mod artifact;
+pub mod coverage;
 pub mod inbox;
 pub mod issue;
 pub mod iteration;
@@ -18,6 +19,7 @@ mod tests {
     use crate::db::entities::loop_artifact_revision::ActorKind;
     use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
     use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
+    use crate::db::entities::loop_criterion::CriterionKind;
     use crate::db::entities::loop_iteration::Stage;
     use crate::db::entities::loop_link::LinkKind;
     use crate::db::entities::loop_memory::MemoryKind;
@@ -89,18 +91,21 @@ mod tests {
         artifact::add_revision(&db.conn, req.id, "req body", ActorKind::Agent, None)
             .await
             .unwrap();
-        let crit = artifact::add_criterion(&db.conn, req.id, "must do x")
+        let crit = artifact::add_criterion(&db.conn, req.id, CriterionKind::Acceptance, "must do x")
             .await
             .unwrap();
         assert_eq!(crit.label, "AC-1");
+        assert_eq!(crit.kind, CriterionKind::Acceptance);
 
         // `requirement derives_from issue` — repeated, must dedupe.
-        let l1 = link::create_link(&db.conn, space.id, req.id, root_id, LinkKind::DerivesFrom)
-            .await
-            .unwrap();
-        let l2 = link::create_link(&db.conn, space.id, req.id, root_id, LinkKind::DerivesFrom)
-            .await
-            .unwrap();
+        let l1 =
+            link::create_link(&db.conn, space.id, req.id, root_id, LinkKind::DerivesFrom, None)
+                .await
+                .unwrap();
+        let l2 =
+            link::create_link(&db.conn, space.id, req.id, root_id, LinkKind::DerivesFrom, None)
+                .await
+                .unwrap();
         assert_eq!(l1.id, l2.id, "link is idempotent");
 
         let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
@@ -114,6 +119,80 @@ mod tests {
         assert_eq!(det.revisions.len(), 1);
         assert_eq!(det.criteria.len(), 1);
         assert_eq!(det.links.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn coverage_idempotent_and_typed_criteria() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/repo-cov").await;
+        let space = space::create_space(&db.conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &db.conn,
+            space.id,
+            "I",
+            "d",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        let issue_id = issue.row.id;
+
+        // A requirement with one acceptance criterion + one constraint.
+        let req = artifact::create_artifact(
+            &db.conn,
+            space.id,
+            issue_id,
+            ArtifactKind::Requirement,
+            "R1",
+            ArtifactStatus::Done,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        let ac = artifact::add_criterion(&db.conn, req.id, CriterionKind::Acceptance, "do x")
+            .await
+            .unwrap();
+        artifact::add_criterion(&db.conn, req.id, CriterionKind::Constraint, "no panics")
+            .await
+            .unwrap();
+
+        // Kinds round-trip through the detail read.
+        let det = artifact::get_artifact_detail(&db.conn, req.id).await.unwrap().unwrap();
+        assert_eq!(det.criteria.len(), 2);
+        assert_eq!(det.criteria[0].kind, CriterionKind::Acceptance);
+        assert_eq!(det.criteria[1].kind, CriterionKind::Constraint);
+
+        // A task covers the acceptance criterion; coverage is idempotent.
+        let task = artifact::create_artifact(
+            &db.conn,
+            space.id,
+            issue_id,
+            ArtifactKind::Task,
+            "T1",
+            ArtifactStatus::Pending,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        let c1 = coverage::create_coverage(&db.conn, space.id, task.id, ac.id)
+            .await
+            .unwrap();
+        let c2 = coverage::create_coverage(&db.conn, space.id, task.id, ac.id)
+            .await
+            .unwrap();
+        assert_eq!(c1.id, c2.id, "coverage is idempotent");
+
+        // Surfaced both by list_for_issue and inside the DAG view.
+        let cov = coverage::list_for_issue(&db.conn, issue_id).await.unwrap();
+        assert_eq!(cov.len(), 1);
+        assert_eq!(cov[0].task_artifact_id, task.id);
+        assert_eq!(cov[0].criterion_id, ac.id);
+        let dag = artifact::list_dag(&db.conn, issue_id).await.unwrap();
+        assert_eq!(dag.coverage.len(), 1);
+        assert_eq!(dag.coverage[0].criterion_id, ac.id);
     }
 
     #[tokio::test]

@@ -1426,7 +1426,7 @@ mod tests {
         )
         .await
         .unwrap();
-        link::create_link(&h.db.conn, h.space_id, task.id, root, LinkKind::DerivesFrom)
+        link::create_link(&h.db.conn, h.space_id, task.id, root, LinkKind::DerivesFrom, None)
             .await
             .unwrap();
         task.id
@@ -1529,8 +1529,10 @@ mod tests {
                     from_artifact_id: succ,
                     to_artifact_id: pred,
                     kind: LinkKind::DependsOn,
+                    source_revision_id: None,
                 })
                 .collect(),
+            coverage: Vec::new(),
         }
     }
 
@@ -1643,7 +1645,7 @@ mod tests {
         // B depends on A. Mark A Done but freeze it at a BOGUS commit, so
         // ensure_task_worktree(B) cannot resolve its base ref — a deterministic
         // infra failure on every attempt.
-        link::create_link(&h.db.conn, h.space_id, b, a, LinkKind::DependsOn)
+        link::create_link(&h.db.conn, h.space_id, b, a, LinkKind::DependsOn, None)
             .await
             .unwrap();
         cas_artifact_status(&h.db.conn, a, ArtifactStatus::Pending, ArtifactStatus::InProgress)
@@ -1685,7 +1687,7 @@ mod tests {
         let t1 = add_task(&h, "T1").await;
         let t2 = add_task(&h, "T2").await;
         // T2 depends on T1; T1 is blocked → T2 can never start.
-        link::create_link(&h.db.conn, h.space_id, t2, t1, LinkKind::DependsOn)
+        link::create_link(&h.db.conn, h.space_id, t2, t1, LinkKind::DependsOn, None)
             .await
             .unwrap();
         cas_artifact_status(&h.db.conn, t1, ArtifactStatus::Pending, ArtifactStatus::Blocked)

@@ -481,6 +481,7 @@ async fn create_result_artifact(
                 art.id,
                 task_id,
                 LinkKind::ResultsFrom,
+                None,
             )
             .await?;
         }

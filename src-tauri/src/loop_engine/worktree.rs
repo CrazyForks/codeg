@@ -1445,7 +1445,7 @@ mod tests {
         assert_ne!(frozen, live_tip);
 
         let succ = mk_task(&db, space_id, issue_id, "succ").await;
-        loop_service::link::create_link(&db.conn, space_id, succ, pred, LinkKind::DependsOn)
+        loop_service::link::create_link(&db.conn, space_id, succ, pred, LinkKind::DependsOn, None)
             .await
             .unwrap();
         let ctx = ensure_task_worktree(&db.conn, data.path(), issue_id, succ)

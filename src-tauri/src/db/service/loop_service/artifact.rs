@@ -7,6 +7,7 @@ use sea_orm::{
 
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::ActorKind;
+use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_link::LinkKind;
 use crate::db::entities::{
     loop_artifact, loop_artifact_revision, loop_criterion, loop_issue, loop_iteration, loop_link,
@@ -52,6 +53,7 @@ fn to_criterion_row(m: loop_criterion::Model) -> LoopCriterionRow {
         label: m.label,
         text: m.text,
         sort: m.sort,
+        kind: m.kind,
     }
 }
 
@@ -122,10 +124,13 @@ pub async fn add_revision(
     .await?)
 }
 
-/// Auto-labels `AC-{n}` and appends at the end.
+/// Auto-labels `AC-{n}` and appends at the end. `kind` types the criterion
+/// (acceptance for requirements/tasks; constraint/invariant/obligation for
+/// designs) — ingest enforces the per-artifact-kind allow-set before calling.
 pub async fn add_criterion(
     conn: &sea_orm::DatabaseConnection,
     artifact_id: i32,
+    kind: CriterionKind,
     text: &str,
 ) -> Result<loop_criterion::Model, DbError> {
     let next = loop_criterion::Entity::find()
@@ -140,6 +145,7 @@ pub async fn add_criterion(
         label: Set(format!("AC-{}", next + 1)),
         text: Set(text.to_string()),
         sort: Set(next),
+        kind: Set(kind),
         ..Default::default()
     }
     .insert(conn)
@@ -232,7 +238,9 @@ pub async fn list_dag(
             .collect()
     };
 
-    Ok(LoopDagView { artifacts, links })
+    let coverage = super::coverage::list_for_issue(conn, issue_id).await?;
+
+    Ok(LoopDagView { artifacts, links, coverage })
 }
 
 pub async fn list_artifacts_for_space(
