@@ -561,7 +561,6 @@ export interface LoopIssueDetail extends LoopIssueRow {
   worktree_folder_id: number | null
   base_branch: string | null
   base_commit: string | null
-  active_task_artifact_id: number | null
 }
 
 export interface LoopArtifactRow {

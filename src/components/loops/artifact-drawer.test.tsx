@@ -122,7 +122,6 @@ function issue(status: LoopIssueDetail["status"]): LoopIssueDetail {
     worktree_folder_id: null,
     base_branch: null,
     base_commit: null,
-    active_task_artifact_id: null,
   }
 }
 

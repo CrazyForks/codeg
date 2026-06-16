@@ -93,9 +93,6 @@ pub struct Model {
     /// Merge baseline recorded at trigger time.
     pub base_branch: Option<String>,
     pub base_commit: Option<String>,
-    /// Per-issue serial-task pipeline gate: the task whose implement/review
-    /// cycle currently holds the issue worktree. NULL = a new task may start.
-    pub active_task_artifact_id: Option<i32>,
     /// JSON-encoded fan-in session lock — the write-once, versioned manifest
     /// (`{v, issue_base_oid, ordered:[{task_id, sha}]}`) claimed for the parallel
     /// result-stage integration. `NULL` = no active fan-in session. Distinct from

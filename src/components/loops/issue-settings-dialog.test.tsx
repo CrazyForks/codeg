@@ -72,7 +72,6 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
     worktree_folder_id: null,
     base_branch: null,
     base_commit: null,
-    active_task_artifact_id: null,
     ...over,
   }
 }

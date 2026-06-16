@@ -267,7 +267,8 @@ mod tests {
         .unwrap();
         claim(&db, space_id, issue_id, Stage::Implement, Some(task.id), 0, true).await;
 
-        // While the lease is held, a second implement on the issue is leased out.
+        // While the lease is held, a second implement of the SAME task is leased
+        // out by `uniq_active_node(target, stage)`.
         let blocked = try_claim_iteration(
             &db.conn,
             IterationClaim {
@@ -282,7 +283,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(blocked.is_none(), "uniq_active_write holds before recovery");
+        assert!(blocked.is_none(), "uniq_active_node holds before recovery");
 
         reconcile_on_boot(&db).await.unwrap();
 

@@ -56,7 +56,6 @@ pub fn to_issue_detail(m: loop_issue::Model) -> Result<LoopIssueDetail, DbError>
         worktree_folder_id: m.worktree_folder_id,
         base_branch: m.base_branch,
         base_commit: m.base_commit,
-        active_task_artifact_id: m.active_task_artifact_id,
     })
 }
 
@@ -101,7 +100,6 @@ pub async fn create_issue(
         worktree_folder_id: Set(None),
         base_branch: Set(None),
         base_commit: Set(None),
-        active_task_artifact_id: Set(None),
         token_used: Set(0),
         token_budget: Set(None),
         created_at: Set(now),

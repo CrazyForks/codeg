@@ -236,7 +236,6 @@ pub struct LoopIssueDetail {
     pub worktree_folder_id: Option<i32>,
     pub base_branch: Option<String>,
     pub base_commit: Option<String>,
-    pub active_task_artifact_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -52,7 +52,6 @@ const UP: &[&str] = &[
         worktree_folder_id INTEGER,
         base_branch TEXT,
         base_commit TEXT,
-        active_task_artifact_id INTEGER,
         fan_in_manifest TEXT,
         fan_in_resolver_tip TEXT,
         token_used BIGINT NOT NULL DEFAULT 0,
@@ -145,8 +144,12 @@ const UP: &[&str] = &[
     "CREATE INDEX idx_loop_iteration_conv ON loop_iteration(conversation_id)",
     // Dispatch leases (DB-authoritative double-dispatch guards). Partial unique
     // indexes — SeaORM's Index builder can't express the WHERE clause.
-    "CREATE UNIQUE INDEX uniq_active_write ON loop_iteration(issue_id) \
-     WHERE stage IN ('implement','finalize') AND status IN ('queued','running')",
+    // Task parallelism (phase 2) drops the old per-issue `uniq_active_write` (one
+    // implement-or-finalize per issue): several tasks now implement/review at once,
+    // each guarded by `uniq_active_node(target, stage)`. Finalize stays singular
+    // per issue (one fan-in / result-stage agent), so it keeps its own lease.
+    "CREATE UNIQUE INDEX uniq_active_finalize ON loop_iteration(issue_id) \
+     WHERE stage = 'finalize' AND status IN ('queued','running')",
     "CREATE UNIQUE INDEX uniq_active_node ON loop_iteration(target_artifact_id, stage) \
      WHERE status IN ('queued','running') AND stage <> 'review'",
     "CREATE UNIQUE INDEX uniq_review_slot ON loop_iteration(target_artifact_id, slot_no) \
@@ -277,7 +280,7 @@ mod tests {
 
         for index in [
             // Partial unique dispatch leases + pending-inbox dedupe.
-            "uniq_active_write",
+            "uniq_active_finalize",
             "uniq_active_node",
             "uniq_review_slot",
             "uniq_inbox_pending",

@@ -341,44 +341,6 @@ pub async fn fail_iteration_active(conn: &DatabaseConnection, id: i32) -> Result
     Ok(res.rows_affected == 1)
 }
 
-/// Acquire the per-issue serial-task pipeline gate for `task_artifact_id`. Wins
-/// (`true`) only when no task currently holds it (`active_task_artifact_id IS
-/// NULL`). Keeps two tasks of one issue from sharing the worktree.
-pub async fn try_acquire_task_gate(
-    conn: &DatabaseConnection,
-    issue_id: i32,
-    task_artifact_id: i32,
-) -> Result<bool, LoopError> {
-    let res = loop_issue::Entity::update_many()
-        .col_expr(
-            loop_issue::Column::ActiveTaskArtifactId,
-            Expr::value(task_artifact_id),
-        )
-        .filter(loop_issue::Column::Id.eq(issue_id))
-        .filter(loop_issue::Column::ActiveTaskArtifactId.is_null())
-        .exec(conn)
-        .await?;
-    Ok(res.rows_affected == 1)
-}
-
-/// Release the task gate, but only if it is still held by `task_artifact_id`.
-pub async fn release_task_gate(
-    conn: &DatabaseConnection,
-    issue_id: i32,
-    task_artifact_id: i32,
-) -> Result<bool, LoopError> {
-    let res = loop_issue::Entity::update_many()
-        .col_expr(
-            loop_issue::Column::ActiveTaskArtifactId,
-            Expr::value(Option::<i32>::None),
-        )
-        .filter(loop_issue::Column::Id.eq(issue_id))
-        .filter(loop_issue::Column::ActiveTaskArtifactId.eq(task_artifact_id))
-        .exec(conn)
-        .await?;
-    Ok(res.rows_affected == 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,14 +397,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_lease_blocks_second_implement_per_issue() {
+    async fn node_lease_blocks_second_implement_per_task() {
         let (db, space_id, issue_id) = seed().await;
         let task = artifact::create_artifact(&db.conn, space_id, issue_id, ArtifactKind::Task, "T", ArtifactStatus::Pending, ActorKind::Agent, None).await.unwrap();
         let first = try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Implement, Some(task.id), None, "tok-a")).await.unwrap();
         assert!(first.is_some());
-        // Same issue, another implement → uniq_active_write blocks it.
+        // Same task, another implement → uniq_active_node(target, stage) blocks it
+        // (phase 2: per-task, not per-issue; different tasks now run concurrently).
         let second = try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Implement, Some(task.id), None, "tok-b")).await.unwrap();
-        assert!(second.is_none(), "second implement on the issue is leased out");
+        assert!(second.is_none(), "second implement of the same task is leased out");
     }
 
     #[tokio::test]
@@ -456,19 +419,6 @@ mod tests {
         // Same slot again → blocked.
         let dup = try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Review, Some(task.id), Some(0), "r0b")).await.unwrap();
         assert!(dup.is_none(), "duplicate review slot is leased out");
-    }
-
-    #[tokio::test]
-    async fn task_gate_serializes_then_releases() {
-        let (db, _space, issue_id) = seed().await;
-        assert!(try_acquire_task_gate(&db.conn, issue_id, 100).await.unwrap());
-        // A different task cannot acquire while 100 holds the gate.
-        assert!(!try_acquire_task_gate(&db.conn, issue_id, 200).await.unwrap());
-        // Releasing with the wrong task is a no-op.
-        assert!(!release_task_gate(&db.conn, issue_id, 200).await.unwrap());
-        // Correct release frees the gate.
-        assert!(release_task_gate(&db.conn, issue_id, 100).await.unwrap());
-        assert!(try_acquire_task_gate(&db.conn, issue_id, 200).await.unwrap());
     }
 
     #[tokio::test]

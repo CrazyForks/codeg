@@ -7,11 +7,13 @@
 //!   calls no `loop_submit_*` tool (its briefing tool-contract says so). The
 //!   engine measures progress by *checkpointing*: a non-empty diff that commits
 //!   is success; an empty diff is no progress.
-//! - **Serial per issue.** The per-issue task gate (`active_task_artifact_id`)
-//!   lets only one task occupy the worktree at a time, so two tasks never race
-//!   on the same tree. The gate is acquired when a task starts implementing and
-//!   released only when it finishes review — so a task holds the gate across its
-//!   whole implement → validate → review arc.
+//! - **Per-task isolation, concurrent across tasks.** There is no per-issue
+//!   write gate. A `parallel` issue drives every ready/in-review task at once,
+//!   each in its **own** worktree (so two tasks never race on one tree); the
+//!   `(issue, target)` / review-slot dispatch leases keep a repeated tick from
+//!   double-dispatching a task. A `serial` (or not-yet-decided) issue shares the
+//!   issue worktree, so it drives exactly one task at a time — a serial chain
+//!   yields ≤1 ready task anyway.
 //!
 //! Idempotency across ticks keys on `iteration.attempt == task.attempt`: a
 //! settled implement iteration is only checkpointed once, because a no-progress
@@ -41,7 +43,6 @@ use crate::loop_engine::driver::resolve_agent_spec;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
     cas_artifact_status, cas_issue_status, cas_iteration_status, cas_task_done_with_freeze,
-    release_task_gate, try_acquire_task_gate,
 };
 use crate::loop_engine::validation::{self, ValidationOutcome};
 use crate::loop_engine::worktree;
@@ -91,14 +92,33 @@ impl StepOutcome {
             StepOutcome::Idle
         }
     }
+
+    /// Combine the outcomes of the several tasks driven in one tick. Priority:
+    /// `Advanced` > `Dispatched` > `Idle`. Any durable change (a task promoted /
+    /// done / blocked, a rework bump) forces a re-tick so the driver re-reads the
+    /// now-changed frontier (a done task may unblock a dependent or open finalize;
+    /// a blocked issue must stop). Else, if anything launched, park awaiting its
+    /// settlement; else idle.
+    fn merge(self, other: StepOutcome) -> StepOutcome {
+        use StepOutcome::*;
+        match (self, other) {
+            (Advanced, _) | (_, Advanced) => Advanced,
+            (Dispatched, _) | (_, Dispatched) => Dispatched,
+            _ => Idle,
+        }
+    }
 }
 
-/// Drive the active task through the write pipeline (implement → validate →
+/// Drive the issue's tasks through the write pipeline (implement → validate →
 /// review) for one tick. See [`StepOutcome`] for how the driver reacts to the
 /// return value.
 ///
-/// A no-op while no task exists yet (read stages still in flight), so the driver
-/// can call it on every "read frontier empty" tick.
+/// No per-issue write gate: a `parallel` issue fans out over **every** drivable
+/// task (each in its own worktree, dispatch idempotent via the `(issue, target)`
+/// / review-slot leases); a `serial`/undecided issue drives exactly one task at a
+/// time (sharing the issue worktree). A no-op while no task exists yet (read
+/// stages still in flight), so the driver can call it on every "read frontier
+/// empty" tick.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_active_task(
     db: &AppDatabase,
@@ -110,69 +130,42 @@ pub(crate) async fn drive_active_task(
     config: &IssueConfig,
     worktree_folder_id: i32,
 ) -> Result<StepOutcome, LoopError> {
-    // Gate scrub: a gate pointing at a task that reached a terminal state
-    // (Blocked / Cancelled, or — defensively — Done) without releasing the gate,
-    // or at a node no longer in the DAG, would strand the issue forever on the
-    // `Some(active)` idle arm. CAS-clear it and fall through to ready-task
-    // selection / dead-dependency detection. Load-bearing once a task can block
-    // without blocking the whole issue; harmless otherwise.
-    let active_task = match issue.active_task_artifact_id {
-        Some(active) => {
-            let live = dag
-                .artifacts
-                .iter()
-                .find(|a| a.id == active)
-                .map(|a| {
-                    !matches!(
-                        a.status,
-                        ArtifactStatus::Blocked | ArtifactStatus::Cancelled | ArtifactStatus::Done
-                    )
-                })
-                .unwrap_or(false); // not in the DAG → stale, scrub it
-            if live {
-                Some(active)
-            } else {
-                release_task_gate(&db.conn, issue.id, active).await?;
-                None
-            }
-        }
-        None => None,
-    };
+    // The tasks that can make progress this tick: those mid-review
+    // (`in_progress`) and those whose every dependency is `Done` (ready pending).
+    // `in_progress` first so a serial issue continues an in-flight task's review
+    // before starting a fresh one.
+    let mut drivable: Vec<i32> = dag
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::Task && a.status == ArtifactStatus::InProgress)
+        .map(|a| a.id)
+        .collect();
+    drivable.extend(ready_tasks(dag).into_iter().map(|t| t.id));
 
-    match active_task {
-        // A live task holds the gate → advance it (in its own worktree under
-        // parallel mode, the shared issue worktree otherwise).
-        Some(active) => {
-            let wt = task_worktree_folder(db, data_dir, issue, active, worktree_folder_id).await?;
-            advance_active_task(
-                db, data_dir, spawner, emitter, issue, dag, config, wt, active,
-            )
-            .await
-        }
-        // Gate free → claim it for the next ready task awaiting implement and
-        // start. Serial wiring: take the first of the dependency-aware ready set
-        // (≤1 for a serial/single-chain issue; phase 2 fans out the full set).
-        None => {
-            let Some(task) = ready_tasks(dag).into_iter().next() else {
-                // Nothing ready. If a pending task is wedged behind a Blocked /
-                // Cancelled dependency that can never become Done, block the issue
-                // (retry-reachable) instead of parking silently.
-                return detect_dead_dependency(db, emitter, issue, dag).await;
-            };
-            if try_acquire_task_gate(&db.conn, issue.id, task.id).await? {
-                let wt =
-                    task_worktree_folder(db, data_dir, issue, task.id, worktree_folder_id).await?;
-                let dispatched = dispatch_implement(
-                    db, data_dir, spawner, emitter, issue, config, wt, task.id, task.attempt,
-                )
-                .await?;
-                Ok(StepOutcome::from_dispatched(dispatched))
-            } else {
-                // Lost the gate race to a concurrent driver tick — try next time.
-                Ok(StepOutcome::Idle)
-            }
-        }
+    if drivable.is_empty() {
+        // Nothing drivable. If a pending task is wedged behind a Blocked /
+        // Cancelled dependency that can never become Done, block the issue
+        // (retry-reachable) instead of parking silently.
+        return detect_dead_dependency(db, emitter, issue, dag).await;
     }
+
+    // Parallel issues fan out — each drivable task runs in its OWN worktree, so
+    // concurrent dispatch is safe. Serial / undecided issues would share the issue
+    // worktree, so drive exactly one task (the safety floor for the not-yet-decided
+    // case; a serial chain yields ≤1 ready task regardless).
+    if issue.execution_mode.as_deref() != Some("parallel") {
+        drivable.truncate(1);
+    }
+
+    let mut outcome = StepOutcome::Idle;
+    for task_id in drivable {
+        let wt = task_worktree_folder(db, data_dir, issue, task_id, worktree_folder_id).await?;
+        let step =
+            advance_active_task(db, data_dir, spawner, emitter, issue, dag, config, wt, task_id)
+                .await?;
+        outcome = outcome.merge(step);
+    }
+    Ok(outcome)
 }
 
 /// The worktree folder a task's write-pipeline iterations (implement / review /
@@ -313,7 +306,7 @@ fn ready_tasks(dag: &LoopDagView) -> Vec<&LoopArtifactRow> {
     out
 }
 
-/// Route the gate-holding task to its write-pipeline stage by status: `pending`
+/// Route one drivable task to its write-pipeline stage by status: `pending`
 /// implements, `in_progress` (implemented + validated) reviews, terminal idles.
 #[allow(clippy::too_many_arguments)]
 async fn advance_active_task(
@@ -588,11 +581,11 @@ async fn dispatch_implement(
 }
 
 /// All implement iterations for **one task** — keyed by `(issue, target)`, never
-/// "the issue's single write". So once `uniq_active_write` is dropped (phase 2)
-/// and several tasks implement concurrently, this still resolves exactly this
-/// task's iterations. (P2-invariant audit: no in-flight-write lookup assumes a
-/// per-issue singleton — they key on `(issue, target)` here / `(issue, finalize)`
-/// for the issue-level finalize, or iterate all in-flight rows.)
+/// "the issue's single write". With several tasks implementing concurrently
+/// (phase 2 dropped the per-issue write lease), this still resolves exactly this
+/// task's iterations. (No in-flight-write lookup assumes a per-issue singleton —
+/// they key on `(issue, target)` here / `(issue, finalize)` for the issue-level
+/// finalize, or iterate all in-flight rows.)
 async fn implement_iterations(
     db: &AppDatabase,
     issue_id: i32,
@@ -782,8 +775,8 @@ enum ReviewDecision {
 
 /// Drive an `in_progress` (implemented + validated) task through its review
 /// round: ensure `reviewer_count` review slots run, aggregate their verdicts,
-/// then accept (task `done` + release the task gate) or reject (rework + cancel
-/// the remaining reviewers). See [`StepOutcome`] for the return semantics.
+/// then accept (task `done`, freezing its integration commit) or reject (rework +
+/// cancel the remaining reviewers). See [`StepOutcome`] for the return semantics.
 #[allow(clippy::too_many_arguments)]
 async fn drive_reviews(
     db: &AppDatabase,
@@ -825,9 +818,9 @@ async fn drive_reviews(
             // otherwise the snapshot was stale (a prior tick already settled this
             // task), so don't report Advanced — that would re-enter this arm on
             // stale verdicts and hot-spin. Idle instead; a real wake re-ticks
-            // against fresh state.
+            // against fresh state. (No gate to release: a done task simply drops
+            // out of the next tick's drivable set.)
             if freeze_and_done(db, worktree_folder_id, task.id).await? {
-                release_task_gate(&db.conn, issue.id, task.id).await?;
                 Ok(StepOutcome::Advanced)
             } else {
                 Ok(StepOutcome::Idle)
@@ -1062,7 +1055,12 @@ pub(crate) async fn run_finalize(
     if tasks.is_empty() || !tasks.iter().all(|t| t.status == ArtifactStatus::Done) {
         return Ok(StepOutcome::Idle);
     }
-    if issue.active_task_artifact_id.is_some() {
+    // The issue must be fully quiescent before finalizing — every task `Done` is
+    // not enough on its own: a losing review slot (or any stray write) could still
+    // be settling. With no per-issue write gate, "no in-flight iteration of any
+    // stage" is the precondition. (The parallel fan-in path below re-checks this
+    // internally so a conflict resolver it dispatches can still settle.)
+    if issue_has_inflight(db, issue.id).await? {
         return Ok(StepOutcome::Idle);
     }
 
@@ -1139,7 +1137,7 @@ pub(crate) async fn run_finalize(
 }
 
 /// Dispatch the finalize iteration (issue-level: `target = None`; the
-/// `uniq_active_write` lease admits one implement-or-finalize per issue).
+/// `uniq_active_finalize` lease admits one finalize per issue).
 async fn dispatch_finalize(
     db: &AppDatabase,
     data_dir: &Path,
@@ -1479,29 +1477,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_scrub_releases_terminal_gated_task() {
+    async fn blocked_task_does_not_strand_other_ready_tasks() {
         let h = setup().await;
-        let t1 = add_task(&h, "T1").await;
-        let t2 = add_task(&h, "T2").await;
-        // T1 holds the gate but reached a terminal state without releasing it
-        // (e.g. a crash between marking it done and releasing the gate). Drive it
-        // through the legal Pending→InProgress→Done path.
-        assert!(try_acquire_task_gate(&h.db.conn, h.issue_id, t1)
-            .await
-            .unwrap());
-        cas_artifact_status(&h.db.conn, t1, ArtifactStatus::Pending, ArtifactStatus::InProgress)
+        set_execution_mode(&h, "parallel").await;
+        let a = add_task(&h, "A").await;
+        let b = add_task(&h, "B").await;
+        // A is blocked; B is independent and ready. With no per-issue write gate, a
+        // blocked task must not strand B — the drive still dispatches B's implement.
+        cas_artifact_status(&h.db.conn, a, ArtifactStatus::Pending, ArtifactStatus::Blocked)
             .await
             .unwrap();
-        cas_artifact_status(&h.db.conn, t1, ArtifactStatus::InProgress, ArtifactStatus::Done)
-            .await
-            .unwrap();
-        // Drive: the scrub clears the stale gate, then the next ready task (T2) is
-        // claimed + dispatched — no permanent strand on the idle arm.
         assert_eq!(drive(&h).await, StepOutcome::Dispatched);
         assert_eq!(
-            load_issue(&h).await.active_task_artifact_id,
-            Some(t2),
-            "gate scrubbed off terminal T1 and re-acquired for ready T2"
+            implement_iterations(&h.db, h.issue_id, b).await.unwrap().len(),
+            1,
+            "ready task B dispatched despite blocked A"
+        );
+        assert!(
+            implement_iterations(&h.db, h.issue_id, a)
+                .await
+                .unwrap()
+                .is_empty(),
+            "blocked A never dispatched"
         );
     }
 
@@ -1648,25 +1645,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_serializes_implement_to_one_task() {
+    async fn undecided_mode_drives_one_task_at_a_time() {
         let h = setup().await;
         let t1 = add_task(&h, "Task 1").await;
         let t2 = add_task(&h, "Task 2").await;
 
-        // First tick claims the gate for the lowest-ordered task and dispatches.
+        // execution_mode is unset (not `parallel`): the two tasks would share the
+        // issue worktree, so the drive serializes to the lowest-ordered task.
         assert_eq!(
             drive(&h).await,
             StepOutcome::Dispatched,
             "first tick dispatches an implement"
         );
-        let issue = load_issue(&h).await;
-        assert_eq!(issue.active_task_artifact_id, Some(t1), "gate held by task 1");
 
         // A second tick (no completion yet) must not start the other task.
         assert_eq!(
             drive(&h).await,
             StepOutcome::Idle,
-            "no second implement while the gate is held"
+            "no second implement while the first is in flight"
         );
         let iters = loop_iteration::Entity::find()
             .filter(loop_iteration::Column::Stage.eq(Stage::Implement))
@@ -1680,6 +1676,30 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_tick_no_duplicate_dispatch_per_task() {
+        let h = setup().await;
+        set_execution_mode(&h, "parallel").await;
+        let a = add_task(&h, "A").await;
+        let b = add_task(&h, "B").await;
+
+        // First tick fans out implement to both independent tasks.
+        assert_eq!(drive(&h).await, StepOutcome::Dispatched);
+        // A second tick (nothing settled) must not start a duplicate for either —
+        // the `(issue, target)` implement lease makes the re-dispatch a no-op.
+        assert_eq!(drive(&h).await, StepOutcome::Idle);
+        for t in [a, b] {
+            assert_eq!(
+                implement_iterations(&h.db, h.issue_id, t)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "exactly one implement iteration per task across repeated ticks"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1725,9 +1745,6 @@ mod tests {
             .output()
             .unwrap();
         assert!(status.stdout.is_empty(), "worktree clean after checkpoint");
-
-        // Gate is still held by the task (released only after review, M2.3).
-        assert_eq!(load_issue(&h).await.active_task_artifact_id, Some(task));
     }
 
     #[tokio::test]
@@ -1914,8 +1931,6 @@ mod tests {
                 && i.subject_key == format!("validation_blocked:{task}")),
             "blocked inbox card filed"
         );
-        // The gate is still held by the task; no new implement was dispatched.
-        assert_eq!(load_issue(&h).await.active_task_artifact_id, Some(task));
     }
 
     // ---- Task 2.3: review stage ----
@@ -1990,9 +2005,10 @@ mod tests {
         .unwrap();
     }
 
-    /// Review passes → task done + the task gate is released for the next task.
+    /// Review passes → task done (its accepted tip frozen as the integration
+    /// commit), dropping out of the next tick's drivable set.
     #[tokio::test]
-    async fn review_pass_marks_done_and_releases_gate() {
+    async fn review_pass_marks_done() {
         let h = setup().await;
         let task = add_task(&h, "Task 1").await;
         let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
@@ -2011,14 +2027,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Aggregate → pass → task done + gate released.
+        // Aggregate → pass → task done.
         assert_eq!(drive_with(&h, &cfg).await, StepOutcome::Advanced);
         assert_eq!(task_node(&h, task).await.status, ArtifactStatus::Done);
-        assert_eq!(
-            load_issue(&h).await.active_task_artifact_id,
-            None,
-            "task gate released for the next task"
-        );
     }
 
     /// Each configured reviewer runs as its own slot with its own agent.
@@ -2070,8 +2081,8 @@ mod tests {
         );
     }
 
-    /// Review fails → rework (task pending, attempt++, findings recorded), gate
-    /// still held; the findings surface for the next implement briefing.
+    /// Review fails → rework (task pending, attempt++, findings recorded); the
+    /// findings surface for the next implement briefing.
     #[tokio::test]
     async fn review_fail_reworks_with_findings() {
         let h = setup().await;
@@ -2103,11 +2114,6 @@ mod tests {
                 .unwrap()
                 .starts_with("review_rejected:"),
             "failure signature records a review rejection"
-        );
-        assert_eq!(
-            load_issue(&h).await.active_task_artifact_id,
-            Some(task),
-            "gate held across rework"
         );
         let findings = loop_service::artifact::latest_failed_review_findings(&h.db.conn, task)
             .await
@@ -2315,8 +2321,8 @@ mod tests {
             .expect("a running finalize iteration")
     }
 
-    /// Drive a fresh task all the way to `done` via a passing review, freeing the
-    /// task gate so the issue is ready to finalize.
+    /// Drive a fresh task all the way to `done` via a passing review, so the issue
+    /// is ready to finalize.
     async fn complete_task(h: &Harness, cfg: &IssueConfig, marker: &str, task: i32) {
         implement_to_in_progress(h, cfg, marker).await;
         assert_eq!(
@@ -2369,8 +2375,27 @@ mod tests {
 
     // ---- Parallel result-stage fan-in (Phase 1) ----
 
+    /// The running iteration of `stage` targeting `task`. Scoped by target so a
+    /// parallel issue's concurrent sibling tasks (each with its own in-flight
+    /// implement/review) don't collide — `running_implement_id`/`running_review`
+    /// assume a single in-flight write, which only holds in serial mode.
+    async fn running_iter_for(h: &Harness, stage: Stage, task: i32) -> i32 {
+        loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(stage))
+            .filter(loop_iteration::Column::TargetArtifactId.eq(task))
+            .filter(loop_iteration::Column::Status.eq(IterationStatus::Running))
+            .one(&h.db.conn)
+            .await
+            .unwrap()
+            .expect("a running iteration for the task")
+            .id
+    }
+
     /// Drive one parallel task through its full implement→review→pass lifecycle in
-    /// its OWN worktree, leaving it Done with a frozen commit and the gate free.
+    /// its OWN worktree, leaving it Done with a frozen commit. Robust to Phase-2
+    /// concurrency: a prior tick's fan-out may already have dispatched this task's
+    /// implement (and a sibling's), so this scopes every lookup to `task` and
+    /// asserts the task's own state rather than the whole-issue drive outcome.
     async fn complete_parallel_task(
         h: &Harness,
         cfg: &IssueConfig,
@@ -2378,12 +2403,10 @@ mod tests {
         body: &str,
         task: i32,
     ) {
-        assert_eq!(
-            drive_with(h, cfg).await,
-            StepOutcome::Dispatched,
-            "dispatch implement"
-        );
-        let impl_id = running_implement_id(h).await;
+        // Ensure the task's implement is running (dispatched now, or already in
+        // flight from an earlier fan-out tick — driving is idempotent).
+        drive_with(h, cfg).await;
+        let impl_id = running_iter_for(h, Stage::Implement, task).await;
         let task_wt = worktree::ensure_task_worktree(&h.db.conn, h.data.path(), h.issue_id, task)
             .await
             .unwrap();
@@ -2391,26 +2414,18 @@ mod tests {
         settle_iteration(&h.db, &EventEmitter::Noop, impl_id)
             .await
             .unwrap();
-        assert_eq!(
-            drive_with(h, cfg).await,
-            StepOutcome::Advanced,
-            "checkpoint → in_progress"
-        );
-        assert_eq!(
-            drive_with(h, cfg).await,
-            StepOutcome::Dispatched,
-            "dispatch review"
-        );
-        let review = running_review(h).await;
+        // Checkpoint + validate → in_progress.
+        drive_with(h, cfg).await;
+        assert_eq!(task_node(h, task).await.status, ArtifactStatus::InProgress);
+        // Dispatch this task's review.
+        drive_with(h, cfg).await;
+        let review = running_iter_for(h, Stage::Review, task).await;
         submit_verdict(h, review, "pass", "ok").await;
         settle_iteration(&h.db, &EventEmitter::Noop, review)
             .await
             .unwrap();
-        assert_eq!(
-            drive_with(h, cfg).await,
-            StepOutcome::Advanced,
-            "review pass → done + freeze"
-        );
+        // Review pass → done + freeze.
+        drive_with(h, cfg).await;
         assert_eq!(task_node(h, task).await.status, ArtifactStatus::Done);
     }
 
@@ -2658,11 +2673,6 @@ mod tests {
         let task = add_task(&h, "Task 1").await;
         let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
         complete_task(&h, &cfg, "feature.txt", task).await;
-        assert_eq!(
-            load_issue(&h).await.active_task_artifact_id,
-            None,
-            "task gate freed"
-        );
 
         // Finalize dispatches (issue-level, target = None).
         assert_eq!(
@@ -2710,6 +2720,73 @@ mod tests {
             })
             .count();
         assert_eq!(edges, 1, "results_from edge from result to the task");
+    }
+
+    /// Finalize must wait for the issue to be **fully quiescent** — every task
+    /// `Done` is not enough if any iteration is still in flight (e.g. a losing
+    /// review slot mid-settle). The old per-issue write gate proxied this; the
+    /// replacement is an explicit "no in-flight iteration of any stage" check.
+    #[tokio::test]
+    async fn finalize_waits_for_all_inflight_including_losing_review_slots() {
+        use crate::loop_engine::transitions::{try_claim_iteration, IterationClaim};
+        let h = setup().await;
+        let task = add_task(&h, "T").await;
+        let cfg = config_reviewers(1, ReviewPassRule::Unanimous);
+        complete_task(&h, &cfg, "feature.txt", task).await;
+
+        // Inject a still-running review iteration (a losing slot that has not yet
+        // settled): every task is Done, but the issue is NOT quiescent.
+        let lingering = try_claim_iteration(
+            &h.db.conn,
+            IterationClaim {
+                space_id: h.space_id,
+                issue_id: h.issue_id,
+                stage: Stage::Review,
+                target_artifact_id: Some(task),
+                slot_no: Some(7),
+                capability_token: "lingering".into(),
+                attempt: 99,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("claim a spare review slot");
+        cas_iteration_status(
+            &h.db.conn,
+            lingering.id,
+            IterationStatus::Queued,
+            IterationStatus::Running,
+        )
+        .await
+        .unwrap();
+
+        // Finalize waits while the review slot is in flight.
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Idle,
+            "finalize waits for the in-flight review slot"
+        );
+        let fins = loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::Stage.eq(Stage::Finalize))
+            .all(&h.db.conn)
+            .await
+            .unwrap();
+        assert!(fins.is_empty(), "no finalize dispatched while not quiescent");
+
+        // Once the slot settles, finalize proceeds.
+        cas_iteration_status(
+            &h.db.conn,
+            lingering.id,
+            IterationStatus::Running,
+            IterationStatus::Cancelled,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            drive_finalize(&h, &cfg).await,
+            StepOutcome::Dispatched,
+            "finalize proceeds once the issue is quiescent"
+        );
     }
 
     /// A dirty worktree at finalize time (stray uncommitted state) blocks the
