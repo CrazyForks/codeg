@@ -10,6 +10,8 @@ pub mod loop_artifact;
 pub mod loop_artifact_revision;
 pub mod loop_coverage;
 pub mod loop_criterion;
+pub mod loop_criterion_check;
+pub mod loop_gate_decision;
 pub mod loop_inbox_item;
 pub mod loop_iteration;
 pub mod loop_issue;

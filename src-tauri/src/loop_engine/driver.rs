@@ -1097,6 +1097,8 @@ mod tests {
                 })
                 .collect(),
             coverage: Vec::new(),
+            criterion_checks: Vec::new(),
+            gate_decisions: Vec::new(),
         }
     }
 
@@ -2172,6 +2174,8 @@ mod tests {
             artifacts: vec![root.clone()],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         let f = ready_nodes(&dag, IssueRoute::Full);
         assert_eq!(f.len(), 1);
@@ -2186,6 +2190,8 @@ mod tests {
             ],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::Full)[0].stage, Stage::Design);
 
@@ -2198,6 +2204,8 @@ mod tests {
             ],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::Full)[0].stage, Stage::Plan);
 
@@ -2211,6 +2219,8 @@ mod tests {
             ],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         assert!(ready_nodes(&dag, IssueRoute::Full).is_empty());
     }
@@ -2238,6 +2248,8 @@ mod tests {
             artifacts: vec![root.clone()],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         let f = ready_nodes(&dag, IssueRoute::Direct);
         assert_eq!(f[0].stage, Stage::Plan);
@@ -2253,6 +2265,8 @@ mod tests {
             ],
             links: vec![],
             coverage: vec![],
+            criterion_checks: vec![],
+            gate_decisions: vec![],
         };
         assert_eq!(ready_nodes(&dag, IssueRoute::SkipDesign)[0].stage, Stage::Plan);
     }

@@ -254,8 +254,16 @@ pub async fn list_dag(
     };
 
     let coverage = super::coverage::list_for_issue(conn, issue_id).await?;
+    let criterion_checks = super::criterion_check::list_for_issue(conn, issue_id).await?;
+    let gate_decisions = super::gate_decision::list_for_issue(conn, issue_id).await?;
 
-    Ok(LoopDagView { artifacts, links, coverage })
+    Ok(LoopDagView {
+        artifacts,
+        links,
+        coverage,
+        criterion_checks,
+        gate_decisions,
+    })
 }
 
 pub async fn list_artifacts_for_space(

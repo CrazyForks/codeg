@@ -1533,6 +1533,8 @@ mod tests {
                 })
                 .collect(),
             coverage: Vec::new(),
+            criterion_checks: Vec::new(),
+            gate_decisions: Vec::new(),
         }
     }
 

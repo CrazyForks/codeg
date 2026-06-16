@@ -11,6 +11,8 @@ use super::agent::AgentType;
 use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus, ReviewVerdict};
 use crate::db::entities::loop_artifact_revision::ActorKind;
 use crate::db::entities::loop_criterion::CriterionKind;
+use crate::db::entities::loop_criterion_check::CheckVerdict;
+use crate::db::entities::loop_gate_decision::GateOutcome;
 use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{IssuePriority, IssueRoute, IssueStatus, PauseReason};
 use crate::db::entities::loop_iteration::{IterationStatus, LaunchedBy, Stage};
@@ -294,6 +296,33 @@ pub struct LoopCoverageRow {
     pub criterion_id: i32,
 }
 
+/// One reviewer's structured pass/fail of one criterion (§3.4). `iteration_id`
+/// is the stable reviewer identity for per-criterion quorum aggregation;
+/// `scope_artifact_id` is the artifact judged (a task, or the result for the
+/// integration gate).
+#[derive(Debug, Clone, Serialize)]
+pub struct LoopCriterionCheckRow {
+    pub id: i32,
+    pub criterion_id: i32,
+    pub iteration_id: i32,
+    pub scope_artifact_id: i32,
+    pub verdict: CheckVerdict,
+    pub evidence: String,
+}
+
+/// Immutable gate-decision audit row: the aggregated `outcome` of a gate over
+/// `target_artifact_id` at `(stage, attempt)`, plus the check ids it aggregated.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoopGateDecisionRow {
+    pub id: i32,
+    pub target_artifact_id: i32,
+    pub stage: String,
+    pub attempt: i32,
+    pub outcome: GateOutcome,
+    pub input_check_ids: Vec<i32>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LoopArtifactDetail {
     #[serde(flatten)]
@@ -310,6 +339,10 @@ pub struct LoopDagView {
     pub links: Vec<LoopLinkRow>,
     /// Criterion-level coverage edges across this issue (task → criterion).
     pub coverage: Vec<LoopCoverageRow>,
+    /// Per-criterion review checks across this issue (the trace matrix).
+    pub criterion_checks: Vec<LoopCriterionCheckRow>,
+    /// Immutable gate decisions across this issue (task review + integration).
+    pub gate_decisions: Vec<LoopGateDecisionRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]

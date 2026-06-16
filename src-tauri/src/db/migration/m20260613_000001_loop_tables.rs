@@ -85,8 +85,11 @@ const UP: &[&str] = &[
     "CREATE INDEX idx_loop_artifact_issue_kind ON loop_artifact(issue_id, kind)",
     "CREATE INDEX idx_loop_artifact_space ON loop_artifact(space_id)",
     "CREATE INDEX idx_loop_artifact_produced_by ON loop_artifact(produced_by_iteration_id)",
-    // At most one result artifact per issue (the engine-synthesized capstone).
-    "CREATE UNIQUE INDEX uniq_result_per_issue ON loop_artifact(issue_id) WHERE kind = 'result'",
+    // At most one LIVE result artifact per issue (the engine-synthesized capstone).
+    // Excludes superseded/cancelled so an integration loop-back can supersede a
+    // failed result and a fresh finalize can produce a new one (§3.6 / P2.4).
+    "CREATE UNIQUE INDEX uniq_result_per_issue ON loop_artifact(issue_id) \
+     WHERE kind = 'result' AND status NOT IN ('superseded','cancelled')",
     "CREATE TABLE loop_artifact_revision (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
@@ -169,6 +172,42 @@ const UP: &[&str] = &[
      WHERE status IN ('queued','running') AND stage <> 'review'",
     "CREATE UNIQUE INDEX uniq_review_slot ON loop_iteration(target_artifact_id, slot_no) \
      WHERE stage = 'review' AND status IN ('queued','running')",
+    // Per-criterion structured judgement (§3.4): one reviewer's pass/fail of one
+    // criterion, scoped to the artifact it judged (a task, or the result for the
+    // integration gate). Idempotent on (criterion, iteration, scope) so a crash
+    // replay of a review submission never double-writes.
+    "CREATE TABLE loop_criterion_check (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
+        criterion_id INTEGER NOT NULL REFERENCES loop_criterion(id) ON DELETE CASCADE,
+        iteration_id INTEGER NOT NULL REFERENCES loop_iteration(id) ON DELETE CASCADE,
+        scope_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
+        verdict TEXT NOT NULL CHECK (verdict IN ('pass','fail')),
+        evidence TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )",
+    "CREATE UNIQUE INDEX uniq_loop_criterion_check \
+     ON loop_criterion_check(criterion_id, iteration_id, scope_artifact_id)",
+    "CREATE INDEX idx_loop_criterion_check_scope ON loop_criterion_check(scope_artifact_id)",
+    // Immutable gate-decision audit (§3.4): the aggregated outcome of a gate over a
+    // target at one attempt, recording WHICH checks it aggregated (input_check_ids)
+    // + a digest of the inputs, so a later check supersede never rewrites history.
+    "CREATE TABLE loop_gate_decision (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
+        issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
+        target_artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        policy_json TEXT NOT NULL,
+        input_check_ids TEXT NOT NULL,
+        input_digest TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('pass','fail','undecided')),
+        created_at TEXT NOT NULL
+    )",
+    "CREATE UNIQUE INDEX uniq_loop_gate_decision \
+     ON loop_gate_decision(target_artifact_id, stage, attempt)",
+    "CREATE INDEX idx_loop_gate_decision_issue ON loop_gate_decision(issue_id)",
     "CREATE TABLE loop_validation_run (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
@@ -220,6 +259,8 @@ const UP: &[&str] = &[
 
 /// Reverse dependency order (children before parents).
 const DOWN: &[&str] = &[
+    "DROP TABLE IF EXISTS loop_gate_decision",
+    "DROP TABLE IF EXISTS loop_criterion_check",
     "DROP TABLE IF EXISTS loop_coverage",
     "DROP TABLE IF EXISTS loop_validation_run",
     "DROP TABLE IF EXISTS loop_inbox_item",
@@ -287,6 +328,8 @@ mod tests {
             "loop_link",
             "loop_criterion",
             "loop_coverage",
+            "loop_criterion_check",
+            "loop_gate_decision",
             "loop_iteration",
             "loop_validation_run",
             "loop_inbox_item",
@@ -303,6 +346,8 @@ mod tests {
             "uniq_inbox_pending",
             "uniq_result_per_issue",
             "uniq_loop_coverage",
+            "uniq_loop_criterion_check",
+            "uniq_loop_gate_decision",
             // Plain lookup indexes.
             "idx_loop_iteration_issue_status",
             "idx_loop_artifact_produced_by",
