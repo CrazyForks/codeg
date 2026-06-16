@@ -291,20 +291,44 @@ async fn done_requirement_details(
     Ok(out)
 }
 
+/// `criterion_id → "R{i}.AC{j}"` for every acceptance criterion of the issue,
+/// built from the SINGLE shared ordinal source so the ordinals shown in a
+/// briefing are byte-identical to what ingest stored on `covers` and what the
+/// driver's coverage gate reasons about (spec invariant). Requirements ordered
+/// by (sort,id) here match `done_requirement_details`, so the `## R{i}` headers
+/// stay aligned with these criterion ordinals.
+async fn ordinal_map(
+    conn: &DatabaseConnection,
+    issue_id: i32,
+) -> Result<HashMap<i32, String>, LoopError> {
+    let ordered = loop_service::coverage::acceptance_ordinals_for_issue(conn, issue_id).await?;
+    let mut map = HashMap::new();
+    for (ri, (_req, crits)) in ordered.iter().enumerate() {
+        for (ci, cid) in crits.iter().enumerate() {
+            map.insert(*cid, format!("R{}.AC{}", ri + 1, ci + 1));
+        }
+    }
+    Ok(map)
+}
+
 /// Render all requirements + their acceptance criteria for the design/plan
-/// briefing. Plan annotates each criterion with its `R{i}.AC{j}` ordinal (so the
-/// planner can declare `covers`); design omits ordinals (it satisfies them all).
-fn render_requirements(reqs: &[LoopArtifactDetail], with_ordinals: bool) -> String {
+/// briefing. Plan annotates each criterion with its `R{i}.AC{j}` ordinal (from
+/// the shared `ordinals` map, so the planner's `covers` matches); design omits
+/// ordinals (it satisfies them all).
+fn render_requirements(
+    reqs: &[LoopArtifactDetail],
+    ordinals: &HashMap<i32, String>,
+    with_ordinals: bool,
+) -> String {
     let mut body = String::new();
     for (ri, r) in reqs.iter().enumerate() {
         let rbody = r.revisions.last().map(|x| x.content.trim()).unwrap_or("");
         body.push_str(&format!("## R{}: {}\n{}\n", ri + 1, r.row.title, rbody));
-        let mut j = 0;
         for c in &r.criteria {
             if c.kind == CriterionKind::Acceptance {
-                j += 1;
                 if with_ordinals {
-                    body.push_str(&format!("- [R{}.AC{}] {}\n", ri + 1, j, c.text));
+                    let ord = ordinals.get(&c.id).cloned().unwrap_or_default();
+                    body.push_str(&format!("- [{}] {}\n", ord, c.text));
                 } else {
                     body.push_str(&format!("- {}\n", c.text));
                 }
@@ -323,18 +347,21 @@ fn render_requirements(reqs: &[LoopArtifactDetail], with_ordinals: bool) -> Stri
 /// criteria of any kind.
 async fn acceptance_closure(
     conn: &DatabaseConnection,
+    issue_id: i32,
     task_id: i32,
     dag: &LoopDagView,
 ) -> Result<Option<String>, LoopError> {
     let reqs = done_requirement_details(conn, dag).await?;
-    // criterion id -> (ordinal, text) over acceptance criteria.
+    let ordinals = ordinal_map(conn, issue_id).await?;
+    // criterion id -> (ordinal, text) over acceptance criteria, ordinal from the
+    // shared source.
     let mut by_id: HashMap<i32, (String, String)> = HashMap::new();
-    for (ri, r) in reqs.iter().enumerate() {
-        let mut j = 0;
+    for r in &reqs {
         for c in &r.criteria {
             if c.kind == CriterionKind::Acceptance {
-                j += 1;
-                by_id.insert(c.id, (format!("R{}.AC{}", ri + 1, j), c.text.clone()));
+                if let Some(ord) = ordinals.get(&c.id) {
+                    by_id.insert(c.id, (ord.clone(), c.text.clone()));
+                }
             }
         }
     }
@@ -358,7 +385,7 @@ async fn acceptance_closure(
             "This task declared no specific coverage, so it must respect ALL of the \
              issue's acceptance criteria:\n",
         );
-        body.push_str(&render_requirements(&reqs, true));
+        body.push_str(&render_requirements(&reqs, &ordinals, true));
         body.push('\n');
     }
 
@@ -440,10 +467,11 @@ pub async fn assemble_briefing(
     if matches!(stage, Stage::Design | Stage::Plan) {
         let dag = loop_service::artifact::list_dag(conn, issue.id).await?;
         let reqs = done_requirement_details(conn, &dag).await?;
+        let ordinals = ordinal_map(conn, issue.id).await?;
         if !reqs.is_empty() {
             sections.push(format!(
                 "# Requirements\n{}",
-                render_requirements(&reqs, stage == Stage::Plan)
+                render_requirements(&reqs, &ordinals, stage == Stage::Plan)
             ));
             components.push(json!({ "section": "requirements", "count": reqs.len() }));
         }
@@ -456,26 +484,16 @@ pub async fn assemble_briefing(
                 .iter()
                 .any(|a| a.kind == ArtifactKind::Task && a.status == ArtifactStatus::Superseded)
         {
-            let ordinals: Vec<(i32, Vec<i32>)> = reqs
-                .iter()
-                .map(|r| {
-                    (
-                        r.row.id,
-                        r.criteria
-                            .iter()
-                            .filter(|c| c.kind == CriterionKind::Acceptance)
-                            .map(|c| c.id)
-                            .collect(),
-                    )
-                })
-                .collect();
+            let ord_pairs =
+                loop_service::coverage::acceptance_ordinals_for_issue(conn, issue.id).await?;
             let all_tasks: HashSet<i32> = dag
                 .artifacts
                 .iter()
                 .filter(|a| a.kind == ArtifactKind::Task)
                 .map(|a| a.id)
                 .collect();
-            let gap = loop_service::coverage::uncovered_ordinals(&ordinals, &dag.coverage, &all_tasks);
+            let gap =
+                loop_service::coverage::uncovered_ordinals(&ord_pairs, &dag.coverage, &all_tasks);
             if !gap.is_empty() {
                 let list = gap
                     .iter()
@@ -520,7 +538,7 @@ pub async fn assemble_briefing(
             // obligations + fallback); other staged targets get the target's +
             // direct parent's criteria verbatim.
             if matches!(stage, Stage::Implement | Stage::Review) {
-                if let Some(closure) = acceptance_closure(conn, target, &dag).await? {
+                if let Some(closure) = acceptance_closure(conn, issue.id, target, &dag).await? {
                     sections.push(format!("# Acceptance criteria\n{closure}"));
                     components.push(json!({ "section": "acceptance_criteria", "closure": true }));
                 }

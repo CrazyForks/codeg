@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde_json::{json, Value};
 
@@ -518,6 +518,14 @@ async fn submit_artifacts(
     };
 
     let status = default_status_for_kind(kind);
+    // One transaction for the whole batch: artifacts + revisions + criteria +
+    // edges + coverage commit all-or-nothing. This is what makes the
+    // "any produced artifact exists → idempotent replay" guard above CORRECT — a
+    // crash mid-batch rolls everything back, so on replay either the full batch
+    // is present (skip) or none of it is (rewrite). Without this, a crash after
+    // an artifact but before its links/coverage would leave them permanently
+    // skipped.
+    let txn = conn.begin().await?;
     let mut ids = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let title = item
@@ -529,7 +537,7 @@ async fn submit_artifacts(
         let content = truncate(item.get("content").and_then(|v| v.as_str()).unwrap_or(""));
 
         let art = loop_service::artifact::create_artifact(
-            conn,
+            &txn,
             it.space_id,
             it.issue_id,
             kind,
@@ -539,17 +547,17 @@ async fn submit_artifacts(
             Some(it.id),
         )
         .await?;
-        loop_service::artifact::add_revision(conn, art.id, &content, ActorKind::Agent, Some(it.id))
+        loop_service::artifact::add_revision(&txn, art.id, &content, ActorKind::Agent, Some(it.id))
             .await?;
         for (ck, text) in &criteria_per_item[idx] {
-            loop_service::artifact::add_criterion(conn, art.id, *ck, text).await?;
+            loop_service::artifact::add_criterion(&txn, art.id, *ck, text).await?;
         }
         // Canonical edge direction: from = derived/result node, to = its source.
         if kind == ArtifactKind::Design {
             // Fan into every done requirement, each bound to its latest revision.
             for (req_id, rev) in &design_targets {
                 loop_service::link::create_link(
-                    conn,
+                    &txn,
                     it.space_id,
                     art.id,
                     *req_id,
@@ -560,7 +568,7 @@ async fn submit_artifacts(
             }
         } else if let Some(target) = derive_target {
             loop_service::link::create_link(
-                conn,
+                &txn,
                 it.space_id,
                 art.id,
                 target,
@@ -571,7 +579,7 @@ async fn submit_artifacts(
         }
         for task_id in &result_targets {
             loop_service::link::create_link(
-                conn,
+                &txn,
                 it.space_id,
                 art.id,
                 *task_id,
@@ -586,7 +594,7 @@ async fn submit_artifacts(
         // exists). Validated above to be backward-only.
         if let Some(pred) = dep_indices[idx] {
             loop_service::link::create_link(
-                conn,
+                &txn,
                 it.space_id,
                 art.id,
                 ids[pred],
@@ -599,9 +607,10 @@ async fn submit_artifacts(
         // `covers` ordinals named (resolved + validated up-front). Idempotent on
         // replay via `uniq_loop_coverage`.
         for &cid in &covers_per_item[idx] {
-            loop_service::coverage::create_coverage(conn, it.space_id, art.id, cid).await?;
+            loop_service::coverage::create_coverage(&txn, it.space_id, art.id, cid).await?;
         }
     }
+    txn.commit().await?;
 
     Ok(json!({ "ok": true, "ids": ids }))
 }
@@ -637,8 +646,12 @@ async fn submit_review(
     let findings = truncate(payload.get("findings").and_then(|v| v.as_str()).unwrap_or(""));
 
     let title = format!("Review (slot {})", it.slot_no.unwrap_or(0));
+    // Atomic: the review artifact, its verdict, its findings revision, and the
+    // `reviews` edge land all-or-nothing, so the idempotency guard above (a review
+    // by this iteration exists → skip) is correct under crash replay.
+    let txn = conn.begin().await?;
     let art = loop_service::artifact::create_artifact(
-        conn,
+        &txn,
         it.space_id,
         it.issue_id,
         ArtifactKind::Review,
@@ -650,12 +663,13 @@ async fn submit_review(
     .await?;
     let mut active = art.clone().into_active_model();
     active.verdict = Set(Some(verdict));
-    active.update(conn).await?;
+    active.update(&txn).await?;
 
-    loop_service::artifact::add_revision(conn, art.id, &findings, ActorKind::Agent, Some(it.id))
+    loop_service::artifact::add_revision(&txn, art.id, &findings, ActorKind::Agent, Some(it.id))
         .await?;
-    loop_service::link::create_link(conn, it.space_id, art.id, target, LinkKind::Reviews, None)
+    loop_service::link::create_link(&txn, it.space_id, art.id, target, LinkKind::Reviews, None)
         .await?;
+    txn.commit().await?;
 
     Ok(json!({ "ok": true, "id": art.id, "verdict": verdict_str }))
 }

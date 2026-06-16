@@ -23,7 +23,7 @@ pub fn to_link_row(m: loop_link::Model) -> LoopLinkRow {
 /// `None` for edges that don't bind a source. On an idempotent hit the existing
 /// edge is returned unchanged — the first write fixes the bound revision.
 pub async fn create_link(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     space_id: i32,
     from_artifact_id: i32,
     to_artifact_id: i32,

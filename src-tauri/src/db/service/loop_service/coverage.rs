@@ -20,7 +20,7 @@ pub fn to_coverage_row(m: loop_coverage::Model) -> LoopCoverageRow {
 /// Idempotent: a repeated `(task, criterion)` pair returns the existing row
 /// instead of inserting a duplicate (also guarded by `uniq_loop_coverage`).
 pub async fn create_coverage(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     space_id: i32,
     task_artifact_id: i32,
     criterion_id: i32,

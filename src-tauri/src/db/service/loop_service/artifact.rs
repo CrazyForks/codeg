@@ -59,7 +59,7 @@ fn to_criterion_row(m: loop_criterion::Model) -> LoopCriterionRow {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_artifact(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     space_id: i32,
     issue_id: i32,
     kind: ArtifactKind,
@@ -98,7 +98,7 @@ pub async fn create_artifact(
 }
 
 pub async fn add_revision(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     artifact_id: i32,
     content: &str,
     actor_kind: ActorKind,
@@ -143,7 +143,7 @@ pub async fn latest_revision_id(
 /// (acceptance for requirements/tasks; constraint/invariant/obligation for
 /// designs) — ingest enforces the per-artifact-kind allow-set before calling.
 pub async fn add_criterion(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl sea_orm::ConnectionTrait,
     artifact_id: i32,
     kind: CriterionKind,
     text: &str,

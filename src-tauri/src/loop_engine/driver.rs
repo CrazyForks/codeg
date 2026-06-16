@@ -508,38 +508,54 @@ async fn maybe_coverage_loopback(
 ) -> Result<Option<TickOutcome>, LoopError> {
     let conn = &db.conn;
 
-    // Live (non-superseded/cancelled) tasks. If none exist the read frontier
+    // Live (non-superseded/cancelled) task rows. If none exist the read frontier
     // would have re-emitted Plan, so there is nothing to gate here.
-    let live_tasks: std::collections::HashSet<i32> = dag
+    let live_tasks: Vec<&LoopArtifactRow> = dag
         .artifacts
         .iter()
         .filter(|a| {
             a.kind == ArtifactKind::Task
                 && !matches!(a.status, ArtifactStatus::Superseded | ArtifactStatus::Cancelled)
         })
-        .map(|a| a.id)
         .collect();
     if live_tasks.is_empty() {
         return Ok(None);
     }
+    let live_ids: std::collections::HashSet<i32> = live_tasks.iter().map(|a| a.id).collect();
 
     let ordinals = coverage::acceptance_ordinals_for_issue(conn, issue.id).await?;
-    let uncovered = coverage::uncovered_ordinals(&ordinals, &dag.coverage, &live_tasks);
+    let uncovered = coverage::uncovered_ordinals(&ordinals, &dag.coverage, &live_ids);
     if uncovered.is_empty() {
         return Ok(None); // every acceptance criterion is covered → proceed
     }
 
-    // Bound the replan loop by the rework cap. Every plan dispatch (initial +
-    // each replan) is one plan iteration on record; once that count reaches the
-    // cap, stop churning and ask a human.
+    // The gate runs BEFORE any implement, so a clean replan supersedes the
+    // still-`pending` plan output. Bound the loop by the rework cap (every plan
+    // dispatch is one plan iteration on record).
+    let pending: Vec<i32> = live_tasks
+        .iter()
+        .filter(|a| a.status == ArtifactStatus::Pending)
+        .map(|a| a.id)
+        .collect();
     let plan_attempts = loop_iteration::Entity::find()
         .filter(loop_iteration::Column::IssueId.eq(issue.id))
         .filter(loop_iteration::Column::Stage.eq(Stage::Plan))
         .count(conn)
         .await? as u32;
+    let exhausted = config.max_attempts != 0 && plan_attempts >= config.max_attempts;
+    // If a task already advanced past `pending` while a gap remains (shouldn't
+    // happen — coverage is monotonic for a fixed task set — but defend against
+    // it), superseding the pending subset would NOT clear the read frontier, so
+    // auto-replan can't make progress. Block instead of spinning on `Advanced`.
+    let can_replan = pending.len() == live_tasks.len();
 
-    if config.max_attempts != 0 && plan_attempts >= config.max_attempts {
+    if exhausted || !can_replan {
         cas_issue_status(conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
+        let reason = if exhausted {
+            "coverage_gap_exhausted"
+        } else {
+            "coverage_gap_unresolvable"
+        };
         inbox::upsert_inbox(
             conn,
             issue.space_id,
@@ -549,7 +565,7 @@ async fn maybe_coverage_loopback(
             &format!("coverage_gap:{}", issue.id),
             serde_json::json!({
                 "v": 1,
-                "reason": "coverage_gap_exhausted",
+                "reason": reason,
                 "uncovered": uncovered,
                 "plan_attempts": plan_attempts,
             }),
@@ -559,9 +575,9 @@ async fn maybe_coverage_loopback(
         return Ok(Some(TickOutcome::Advanced));
     }
 
-    // Supersede the under-covering plan tasks (all still `pending` — the gate
-    // runs before any implement) so the read frontier re-emits Plan next tick.
-    for &tid in &live_tasks {
+    // All live tasks are still pending → supersede them so the read frontier
+    // re-emits Plan next tick (the briefing then carries the gap).
+    for &tid in &pending {
         crate::loop_engine::transitions::cas_artifact_status_from(
             conn,
             tid,
