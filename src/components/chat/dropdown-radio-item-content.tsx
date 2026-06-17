@@ -12,7 +12,7 @@ export function DropdownRadioItemContent({
   const normalizedDescription = description?.trim()
 
   return (
-    <div className="w-full min-w-0 pr-2">
+    <div className="w-full min-w-0 pr-2" title={label}>
       <p className="truncate">{label}</p>
       {normalizedDescription ? (
         <p className="text-muted-foreground mt-0.5 text-xs leading-snug whitespace-pre-wrap wrap-break-word">
