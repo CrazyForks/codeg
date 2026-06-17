@@ -822,6 +822,7 @@ fn stage_title(stage: Stage) -> &'static str {
         Stage::Implement => "Implement",
         Stage::Review => "Review",
         Stage::Finalize => "Finalize",
+        Stage::Reflect => "Reflect",
     }
 }
 

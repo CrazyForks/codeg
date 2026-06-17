@@ -19,6 +19,14 @@ pub enum MemoryKind {
     Preference,
     #[sea_orm(string_value = "pitfall")]
     Pitfall,
+    /// CoALA episodic layer: a note about what happened on a specific issue.
+    /// Reflect-authored only (humans curate the five semantic kinds above).
+    #[sea_orm(string_value = "episodic")]
+    Episodic,
+    /// CoALA procedural layer: a reusable recipe distilled from how an issue was
+    /// solved. Reflect-authored only.
+    #[sea_orm(string_value = "procedural")]
+    Procedural,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]

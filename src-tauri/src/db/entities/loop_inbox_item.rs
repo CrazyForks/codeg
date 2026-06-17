@@ -15,6 +15,11 @@ pub enum InboxKind {
     BudgetExhausted,
     #[sea_orm(string_value = "question")]
     Question,
+    /// Informational (non-blocking): post-merge memory consolidation exhausted its
+    /// bounded retries without producing a reflection. A `Done` issue is never
+    /// mislabeled blocked; the card is a dismissible notice (§4.4/§5.3, P4/D11).
+    #[sea_orm(string_value = "reflection_failed")]
+    ReflectionFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]

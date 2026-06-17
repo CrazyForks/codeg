@@ -20,6 +20,11 @@ pub enum ArtifactKind {
     Review,
     #[sea_orm(string_value = "result")]
     Result,
+    /// Post-merge retrospective produced by the reflect stage; `derives_from` the
+    /// issue's result (else its root). At most one per issue (the durable memory
+    /// consolidation idempotency anchor, `uniq_reflection_per_issue`). See §4.4/P4.
+    #[sea_orm(string_value = "reflection")]
+    Reflection,
 }
 
 /// Engine-driven node status (humans never hand-edit these except via gates).

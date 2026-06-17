@@ -21,6 +21,11 @@ pub enum Stage {
     Review,
     #[sea_orm(string_value = "finalize")]
     Finalize,
+    /// Post-merge memory consolidation: distill durable lessons into a reflection
+    /// artifact + space memories. Issue-level (`target = None`), runs on a `Done`
+    /// issue, best-effort (never rolls back the merge). See §4.4/P4.
+    #[sea_orm(string_value = "reflect")]
+    Reflect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]

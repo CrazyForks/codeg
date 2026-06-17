@@ -54,6 +54,7 @@ pub fn stage_label(stage: Stage) -> &'static str {
         Stage::Implement => "implement",
         Stage::Review => "review",
         Stage::Finalize => "finalize",
+        Stage::Reflect => "reflect",
     }
 }
 
@@ -64,6 +65,8 @@ fn memory_kind_label(kind: MemoryKind) -> &'static str {
         MemoryKind::Decision => "decision",
         MemoryKind::Preference => "preference",
         MemoryKind::Pitfall => "pitfall",
+        MemoryKind::Episodic => "episodic",
+        MemoryKind::Procedural => "procedural",
     }
 }
 
@@ -75,7 +78,7 @@ fn trust_tier_label(t: TrustTier) -> &'static str {
     }
 }
 
-/// The agent-facing working instruction for a stage. Exhaustive over all seven
+/// The agent-facing working instruction for a stage. Exhaustive over all eight
 /// stages so a newly added stage can never silently fall through to a generic
 /// prompt.
 fn stage_instruction(stage: Stage) -> &'static str {
@@ -133,11 +136,23 @@ fn stage_instruction(stage: Stage) -> &'static str {
              satisfies the requirements, and anything a reviewer or maintainer \
              should know before it merges."
         }
+        Stage::Reflect => {
+            "This issue is complete and merged. Reflect on how it went and distill \
+             durable lessons for this space's future work — review what was built, the \
+             key decisions and trade-offs, what went smoothly, and what caused rework. \
+             This is a READ-ONLY task: do NOT modify, create, or delete any files; your \
+             only side effect is the one tool call below. Propose memories worth keeping: \
+             episodic notes (what happened on this issue) and procedural notes (a reusable \
+             recipe), plus any constraint / decision / preference / pitfall worth promoting. \
+             Be selective — record only what will genuinely help future issues. If a new \
+             memory makes an existing one obsolete, supersede it by its [M{n}] handle. \
+             Recording nothing is a valid outcome."
+        }
     }
 }
 
 /// The submission contract for a stage — which MCP tool the agent must call and
-/// what it produces. Exhaustive over all seven stages.
+/// what it produces. Exhaustive over all eight stages.
 fn tool_contract(stage: Stage) -> &'static str {
     match stage {
         Stage::Triage => {
@@ -185,6 +200,18 @@ fn tool_contract(stage: Stage) -> &'static str {
         }
         Stage::Finalize => {
             "Call `loop_submit_artifacts` exactly once with the result summary."
+        }
+        Stage::Reflect => {
+            "Call `loop_submit_reflection` exactly once (and call no other write tool). \
+             Pass a `reflection` object `{\"title\": \"...\", \"content\": \"...\"}` (your \
+             retrospective) and a `memories` array — each entry \
+             `{\"kind\": \"episodic\"|\"procedural\"|\"constraint\"|\"decision\"|\
+             \"preference\"|\"pitfall\", \"title\": \"...\", \"summary\": \"one line\", \
+             \"content\": \"...\", \"supersedes\": [\"M2\"]}`. `summary` is the one line \
+             shown in future briefings' Memory index; `supersedes` is optional and names \
+             existing memories by their [M{n}] handle from the Memory index above (each \
+             handle may be superseded by at most one memory). You may NOT record or \
+             supersede the space constitution. The `memories` array may be empty."
         }
     }
 }

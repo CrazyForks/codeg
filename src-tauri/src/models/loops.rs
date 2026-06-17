@@ -85,6 +85,8 @@ pub struct StageAgents {
     pub implement: Option<AgentSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalize: Option<AgentSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflect: Option<AgentSpec>,
 }
 
 impl StageAgents {
@@ -98,6 +100,7 @@ impl StageAgents {
             Stage::Plan => self.plan.as_ref(),
             Stage::Implement => self.implement.as_ref(),
             Stage::Finalize => self.finalize.as_ref(),
+            Stage::Reflect => self.reflect.as_ref(),
             Stage::Review => None,
         };
         o.unwrap_or(&self.default)
@@ -153,6 +156,7 @@ impl Default for IssueConfig {
                 plan: None,
                 implement: None,
                 finalize: None,
+                reflect: None,
             },
             validation_commands: Vec::new(),
             // One reviewer that inherits the default agent.
@@ -444,6 +448,7 @@ mod tests {
             plan: None,
             implement: None,
             finalize: None,
+            reflect: None,
         }
     }
 

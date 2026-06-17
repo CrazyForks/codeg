@@ -19,8 +19,10 @@ use crate::loop_engine::error::LoopError;
 /// A SQLite UNIQUE-constraint failure — a dispatch lease was already held by a
 /// concurrent claimer. Classified through SeaORM's driver-typed `sql_err()`
 /// (`SqlErr::UniqueConstraintViolation`) rather than matching the message text,
-/// which silently breaks when a driver reworded its error.
-fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
+/// which silently breaks when a driver reworded its error. `pub(crate)` so the
+/// reflect ingest path can classify the `uniq_reflection_per_issue` race as an
+/// idempotent replay (P4/D12).
+pub(crate) fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
     matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
 }
 

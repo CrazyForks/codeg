@@ -68,7 +68,7 @@ const UP: &[&str] = &[
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
         kind TEXT NOT NULL
-            CHECK (kind IN ('issue','requirement','design','task','review','result')),
+            CHECK (kind IN ('issue','requirement','design','task','review','result','reflection')),
         title TEXT NOT NULL,
         status TEXT NOT NULL
             CHECK (status IN ('pending','in_progress','awaiting_approval','done','blocked','superseded','cancelled')),
@@ -90,6 +90,13 @@ const UP: &[&str] = &[
     // failed result and a fresh finalize can produce a new one (§3.6 / P2.4).
     "CREATE UNIQUE INDEX uniq_result_per_issue ON loop_artifact(issue_id) \
      WHERE kind = 'result' AND status NOT IN ('superseded','cancelled')",
+    // At most one reflection artifact per issue, EVER — the durable idempotency
+    // anchor for memory consolidation (§4.4/§5.5, P4/D12). Reflect runs best-effort
+    // post-merge from several paths (merge hook, settle self-retry, boot recovery);
+    // this index makes the consolidated-signal a DB fact, so a crash between the
+    // ingest commit and settle can never double-distill on replay.
+    "CREATE UNIQUE INDEX uniq_reflection_per_issue ON loop_artifact(issue_id) \
+     WHERE kind = 'reflection'",
     "CREATE TABLE loop_artifact_revision (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         artifact_id INTEGER NOT NULL REFERENCES loop_artifact(id) ON DELETE CASCADE,
@@ -139,7 +146,7 @@ const UP: &[&str] = &[
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
         stage TEXT NOT NULL
-            CHECK (stage IN ('triage','refine','design','plan','implement','review','finalize')),
+            CHECK (stage IN ('triage','refine','design','plan','implement','review','finalize','reflect')),
         target_artifact_id INTEGER,
         slot_no INTEGER,
         conversation_id INTEGER,
@@ -168,6 +175,11 @@ const UP: &[&str] = &[
     // per issue (one fan-in / result-stage agent), so it keeps its own lease.
     "CREATE UNIQUE INDEX uniq_active_finalize ON loop_iteration(issue_id) \
      WHERE stage = 'finalize' AND status IN ('queued','running')",
+    // One active reflect per issue (issue-level lease, mirrors uniq_active_finalize;
+    // §4.7/P4/D5). target_artifact_id is NULL for reflect, so uniq_active_node does
+    // not constrain it (SQLite treats NULLs as distinct).
+    "CREATE UNIQUE INDEX uniq_active_reflect ON loop_iteration(issue_id) \
+     WHERE stage = 'reflect' AND status IN ('queued','running')",
     "CREATE UNIQUE INDEX uniq_active_node ON loop_iteration(target_artifact_id, stage) \
      WHERE status IN ('queued','running') AND stage <> 'review'",
     "CREATE UNIQUE INDEX uniq_review_slot ON loop_iteration(target_artifact_id, slot_no) \
@@ -229,7 +241,7 @@ const UP: &[&str] = &[
         issue_id INTEGER NOT NULL REFERENCES loop_issue(id) ON DELETE CASCADE,
         iteration_id INTEGER,
         kind TEXT NOT NULL
-            CHECK (kind IN ('approval','blocked','budget_exhausted','question')),
+            CHECK (kind IN ('approval','blocked','budget_exhausted','question','reflection_failed')),
         subject_key TEXT NOT NULL,
         payload TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending'
@@ -245,7 +257,7 @@ const UP: &[&str] = &[
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
         kind TEXT NOT NULL
-            CHECK (kind IN ('constitution','constraint','decision','preference','pitfall')),
+            CHECK (kind IN ('constitution','constraint','decision','preference','pitfall','episodic','procedural')),
         source TEXT NOT NULL CHECK (source IN ('human','agent')),
         title TEXT NOT NULL,
         summary TEXT,
@@ -348,10 +360,12 @@ mod tests {
         for index in [
             // Partial unique dispatch leases + pending-inbox dedupe.
             "uniq_active_finalize",
+            "uniq_active_reflect",
             "uniq_active_node",
             "uniq_review_slot",
             "uniq_inbox_pending",
             "uniq_result_per_issue",
+            "uniq_reflection_per_issue",
             "uniq_loop_coverage",
             "uniq_loop_criterion_check",
             "uniq_loop_gate_decision",

@@ -97,6 +97,9 @@ fn default_status_for_kind(kind: ArtifactKind) -> ArtifactStatus {
     match kind {
         ArtifactKind::Task => ArtifactStatus::Pending,
         ArtifactKind::Design => ArtifactStatus::AwaitingApproval,
+        // The reflection is an accepted output the moment it is written (explicit
+        // so a future kind cannot silently inherit `Done` through the wildcard).
+        ArtifactKind::Reflection => ArtifactStatus::Done,
         _ => ArtifactStatus::Done,
     }
 }

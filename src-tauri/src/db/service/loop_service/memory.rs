@@ -37,7 +37,9 @@ pub struct MemoryProvenance {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_memory(
-    conn: &sea_orm::DatabaseConnection,
+    // `&impl ConnectionTrait` so reflect can create a memory inside the same
+    // transaction as its reflection artifact (`&db.conn` still satisfies it).
+    conn: &impl sea_orm::ConnectionTrait,
     space_id: i32,
     kind: MemoryKind,
     source: ActorKind,
@@ -94,6 +96,34 @@ pub async fn update_memory(
 pub async fn delete_memory(conn: &sea_orm::DatabaseConnection, id: i32) -> Result<(), DbError> {
     loop_memory::Entity::delete_by_id(id).exec(conn).await?;
     Ok(())
+}
+
+/// Supersede a memory: mark it `superseded` and point `superseded_by` at the
+/// memory that replaces it — CAS-guarded on `status = active` so a replay (or a
+/// concurrent supersede) is idempotent. Returns whether it applied (a miss means
+/// the memory was no longer active). The audit pointer is immutable: a miss never
+/// overwrites it. Reflect resolves the `[M{n}]` handle to `old_id` against the
+/// iteration's manifest before calling this (§4.6). Takes `&impl ConnectionTrait`
+/// so it runs inside the reflect distill transaction.
+pub async fn supersede_memory(
+    conn: &impl sea_orm::ConnectionTrait,
+    old_id: i32,
+    new_id: i32,
+) -> Result<bool, DbError> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::ActiveEnum;
+    let res = loop_memory::Entity::update_many()
+        .col_expr(
+            loop_memory::Column::Status,
+            Expr::value(MemoryStatus::Superseded.to_value()),
+        )
+        .col_expr(loop_memory::Column::SupersededBy, Expr::value(new_id))
+        .col_expr(loop_memory::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_memory::Column::Id.eq(old_id))
+        .filter(loop_memory::Column::Status.eq(MemoryStatus::Active))
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
 }
 
 pub async fn list_memory(
@@ -266,5 +296,33 @@ mod tests {
         assert_eq!(m.produced_by_iteration_id, Some(42));
         assert_eq!(m.source_artifact_id, None);
         assert_eq!(m.superseded_by, None);
+    }
+
+    #[tokio::test]
+    async fn supersede_memory_cas_is_idempotent_and_drops_from_index() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/repo-sup").await;
+        let space = space::create_space(&db.conn, "S", folder).await.unwrap();
+        let old = mem(&db.conn, space.id, MemoryKind::Decision, "old").await;
+        let new = mem(&db.conn, space.id, MemoryKind::Decision, "new").await;
+        assert!(supersede_memory(&db.conn, old.id, new.id).await.unwrap());
+        let row = loop_memory::Entity::find_by_id(old.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, MemoryStatus::Superseded);
+        assert_eq!(row.superseded_by, Some(new.id));
+        assert!(build_index(&db.conn, space.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.id != old.id));
+        assert!(get_for_read(&db.conn, space.id, &[old.id])
+            .await
+            .unwrap()
+            .is_empty());
+        // Idempotent miss: a second supersede does not apply (already inactive).
+        assert!(!supersede_memory(&db.conn, old.id, new.id).await.unwrap());
     }
 }
