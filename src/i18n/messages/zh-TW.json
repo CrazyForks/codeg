@@ -3167,6 +3167,11 @@
       "preference": "偏好",
       "pitfall": "陷阱"
     },
+    "trustTier": {
+      "human": "人工",
+      "distilled": "提煉",
+      "proposed": "建議"
+    },
     "iterationList": {
       "empty": "暫無疊代。",
       "expand": "展開",
@@ -3200,6 +3205,9 @@
       "archive": "封存",
       "restore": "還原",
       "archived": "已封存",
+      "summary": "摘要",
+      "superseded": "已取代",
+      "supersededSection": "已取代（{count}）",
       "empty": "暫無記憶。"
     },
     "config": {

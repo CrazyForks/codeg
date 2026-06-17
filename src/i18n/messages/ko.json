@@ -3167,6 +3167,11 @@
       "preference": "선호",
       "pitfall": "함정"
     },
+    "trustTier": {
+      "human": "사람",
+      "distilled": "정제됨",
+      "proposed": "제안됨"
+    },
     "iterationList": {
       "empty": "아직 이터레이션이 없습니다.",
       "expand": "펼치기",
@@ -3200,6 +3205,9 @@
       "archive": "보관",
       "restore": "복원",
       "archived": "보관됨",
+      "summary": "요약",
+      "superseded": "대체됨",
+      "supersededSection": "대체됨 ({count})",
       "empty": "아직 메모리가 없습니다."
     },
     "config": {

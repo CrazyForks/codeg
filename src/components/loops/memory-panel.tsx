@@ -3,7 +3,15 @@
 import { useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Archive, ArchiveRestore, Loader2, Plus, Trash2 } from "lucide-react"
+import {
+  Archive,
+  ArchiveRestore,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  Plus,
+  Trash2,
+} from "lucide-react"
 
 import {
   createLoopMemory,
@@ -54,10 +62,12 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
   const t = useTranslations("Loops.memory")
   const tKind = useTranslations("Loops.memoryKind")
   const tActor = useTranslations("Loops.actorKind")
+  const tTrust = useTranslations("Loops.trustTier")
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
   const [busyId, setBusyId] = useState<number | null>(null)
+  const [showSuperseded, setShowSuperseded] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const [kind, setKind] = useState<LoopMemoryKind>("decision")
   const [title, setTitle] = useState("")
@@ -133,6 +143,84 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
       tToasts("memoryDeleted")
     )
 
+  // One memory row. `actions` adds the archive/restore + delete controls; the
+  // folded superseded section renders rows read-only — supersede reversal is a
+  // P4 concern, so a superseded memory deliberately has no restore action.
+  const renderMemory = (m: LoopMemoryRow, actions: boolean) => {
+    const busy = busyId === m.id
+    const archived = m.status === "archived"
+    const dimmed = archived || m.status === "superseded"
+    return (
+      <li
+        key={m.id}
+        className={`rounded-md border p-2.5 ${dimmed ? "opacity-60" : ""}`}
+      >
+        <div className="flex items-center gap-1.5">
+          <Badge variant="outline">{tKind(m.kind)}</Badge>
+          <Badge variant={m.source === "agent" ? "secondary" : "outline"}>
+            {tActor(m.source)}
+          </Badge>
+          <Badge variant="outline">{tTrust(m.trust_tier)}</Badge>
+          {archived && <Badge variant="ghost">{t("archived")}</Badge>}
+          {m.status === "superseded" && (
+            <Badge variant="ghost">{t("superseded")}</Badge>
+          )}
+          <span className="ml-1 min-w-0 flex-1 truncate text-sm font-medium">
+            {m.title}
+          </span>
+          {actions && (
+            <>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-7 w-7 shrink-0"
+                disabled={busy}
+                onClick={() => void setArchived(m, !archived)}
+                aria-label={archived ? t("restore") : t("archive")}
+              >
+                {archived ? (
+                  <ArchiveRestore className="h-3.5 w-3.5" />
+                ) : (
+                  <Archive className="h-3.5 w-3.5" />
+                )}
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
+                disabled={busy}
+                onClick={() => void remove(m)}
+                aria-label={tCommon("delete")}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </>
+          )}
+        </div>
+        {m.summary?.trim() && (
+          <p
+            className="mt-1 truncate text-xs text-muted-foreground"
+            title={t("summary")}
+          >
+            {m.summary}
+          </p>
+        )}
+        {m.content.trim() && (
+          // Rendered through the shared safe Streamdown pipeline (same as chat)
+          // — no raw HTML, no dangerouslySetInnerHTML.
+          <div className="mt-1 break-words text-xs text-muted-foreground">
+            <MessageResponse>{m.content}</MessageResponse>
+          </div>
+        )}
+      </li>
+    )
+  }
+
+  // The full index reads only `active`/`archived`; `superseded` entries are an
+  // audit trail folded away by default (engine-written, P4 reflect path).
+  const live = items.filter((m) => m.status !== "superseded")
+  const superseded = items.filter((m) => m.status === "superseded")
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center justify-between px-1 pb-2">
@@ -158,62 +246,32 @@ export function MemoryPanel({ spaceId }: { spaceId: number }) {
             {t("empty")}
           </p>
         ) : (
-          <ul className="space-y-2">
-            {items.map((m) => {
-              const busy = busyId === m.id
-              const archived = m.status === "archived"
-              return (
-                <li
-                  key={m.id}
-                  className={`rounded-md border p-2.5 ${archived ? "opacity-60" : ""}`}
+          <div className="space-y-2">
+            <ul className="space-y-2">
+              {live.map((m) => renderMemory(m, true))}
+            </ul>
+            {superseded.length > 0 && (
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSuperseded((v) => !v)}
+                  className="flex w-full items-center gap-1 px-1 pt-1 text-xs text-muted-foreground hover:text-foreground"
                 >
-                  <div className="flex items-center gap-1.5">
-                    <Badge variant="outline">{tKind(m.kind)}</Badge>
-                    <Badge
-                      variant={m.source === "agent" ? "secondary" : "outline"}
-                    >
-                      {tActor(m.source)}
-                    </Badge>
-                    {archived && <Badge variant="ghost">{t("archived")}</Badge>}
-                    <span className="ml-1 min-w-0 flex-1 truncate text-sm font-medium">
-                      {m.title}
-                    </span>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7 shrink-0"
-                      disabled={busy}
-                      onClick={() => void setArchived(m, !archived)}
-                      aria-label={archived ? t("restore") : t("archive")}
-                    >
-                      {archived ? (
-                        <ArchiveRestore className="h-3.5 w-3.5" />
-                      ) : (
-                        <Archive className="h-3.5 w-3.5" />
-                      )}
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
-                      disabled={busy}
-                      onClick={() => void remove(m)}
-                      aria-label={tCommon("delete")}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                  {m.content.trim() && (
-                    // Rendered through the shared safe Streamdown pipeline
-                    // (same as chat) — no raw HTML, no dangerouslySetInnerHTML.
-                    <div className="mt-1 break-words text-xs text-muted-foreground">
-                      <MessageResponse>{m.content}</MessageResponse>
-                    </div>
+                  {showSuperseded ? (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5" />
                   )}
-                </li>
-              )
-            })}
-          </ul>
+                  {t("supersededSection", { count: superseded.length })}
+                </button>
+                {showSuperseded && (
+                  <ul className="space-y-2">
+                    {superseded.map((m) => renderMemory(m, false))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </div>
 

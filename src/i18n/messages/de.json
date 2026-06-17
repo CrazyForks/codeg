@@ -3167,6 +3167,11 @@
       "preference": "Präferenz",
       "pitfall": "Fallstrick"
     },
+    "trustTier": {
+      "human": "Mensch",
+      "distilled": "Destilliert",
+      "proposed": "Vorgeschlagen"
+    },
     "iterationList": {
       "empty": "Noch keine Iterationen.",
       "expand": "Aufklappen",
@@ -3200,6 +3205,9 @@
       "archive": "Archivieren",
       "restore": "Wiederherstellen",
       "archived": "Archiviert",
+      "summary": "Zusammenfassung",
+      "superseded": "Ersetzt",
+      "supersededSection": "Ersetzt ({count})",
       "empty": "Noch kein Speicher."
     },
     "config": {

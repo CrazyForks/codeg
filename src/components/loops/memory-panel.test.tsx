@@ -81,8 +81,14 @@ function mem(over: Partial<LoopMemoryRow>): LoopMemoryRow {
     kind: "decision",
     source: "human",
     title: "Memory",
+    summary: null,
     content: "",
+    trust_tier: "proposed",
     status: "active",
+    superseded_by: null,
+    source_issue_id: null,
+    source_artifact_id: null,
+    produced_by_iteration_id: null,
     created_at: "2026-06-14T00:00:00Z",
     updated_at: "2026-06-14T00:00:00Z",
     ...over,
@@ -143,5 +149,24 @@ describe("MemoryPanel", () => {
         content: "",
       })
     )
+  })
+
+  it("folds superseded entries read-only behind a toggle", async () => {
+    listLoopMemory.mockResolvedValue([
+      mem({ id: 1, title: "Live one" }),
+      mem({ id: 3, title: "Old one", status: "superseded" }),
+    ])
+    render(<MemoryPanel spaceId={1} />)
+    await screen.findByText("Live one")
+    // Trust tier badge renders on the live row (only one visible pre-expand).
+    expect(screen.getByText("proposed")).toBeInTheDocument()
+    // The superseded row is hidden until the section is expanded.
+    expect(screen.queryByText("Old one")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText("supersededSection"))
+    expect(await screen.findByText("Old one")).toBeInTheDocument()
+    // Read-only: a superseded row offers no restore (or archive) action; the live
+    // row keeps its archive control.
+    expect(screen.queryByLabelText("restore")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("archive")).toBeInTheDocument()
   })
 })

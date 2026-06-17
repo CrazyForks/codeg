@@ -3167,6 +3167,11 @@
       "preference": "تفضيل",
       "pitfall": "مأزق"
     },
+    "trustTier": {
+      "human": "بشري",
+      "distilled": "مُستخلَص",
+      "proposed": "مُقترَح"
+    },
     "iterationList": {
       "empty": "لا توجد تكرارات بعد.",
       "expand": "توسيع",
@@ -3200,6 +3205,9 @@
       "archive": "أرشفة",
       "restore": "استعادة",
       "archived": "مؤرشَفة",
+      "summary": "ملخّص",
+      "superseded": "مُستبدَل",
+      "supersededSection": "مُستبدَلة ({count})",
       "empty": "لا توجد ذاكرة بعد."
     },
     "config": {

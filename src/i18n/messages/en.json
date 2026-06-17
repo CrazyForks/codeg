@@ -3167,6 +3167,11 @@
       "preference": "Preference",
       "pitfall": "Pitfall"
     },
+    "trustTier": {
+      "human": "Human",
+      "distilled": "Distilled",
+      "proposed": "Proposed"
+    },
     "iterationList": {
       "empty": "No iterations yet.",
       "expand": "Expand",
@@ -3200,6 +3205,9 @@
       "archive": "Archive",
       "restore": "Restore",
       "archived": "Archived",
+      "summary": "Summary",
+      "superseded": "Superseded",
+      "supersededSection": "Superseded ({count})",
       "empty": "No memory yet."
     },
     "config": {

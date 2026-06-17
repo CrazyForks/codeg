@@ -3167,6 +3167,11 @@
       "preference": "Préférence",
       "pitfall": "Piège"
     },
+    "trustTier": {
+      "human": "Humain",
+      "distilled": "Distillé",
+      "proposed": "Proposé"
+    },
     "iterationList": {
       "empty": "Aucune itération pour le moment.",
       "expand": "Développer",
@@ -3200,6 +3205,9 @@
       "archive": "Archiver",
       "restore": "Restaurer",
       "archived": "Archivée",
+      "summary": "Résumé",
+      "superseded": "Remplacé",
+      "supersededSection": "Remplacées ({count})",
       "empty": "Aucune mémoire pour le moment."
     },
     "config": {

@@ -3167,6 +3167,11 @@
       "preference": "設定",
       "pitfall": "落とし穴"
     },
+    "trustTier": {
+      "human": "人間",
+      "distilled": "抽出",
+      "proposed": "提案"
+    },
     "iterationList": {
       "empty": "イテレーションはまだありません。",
       "expand": "展開",
@@ -3200,6 +3205,9 @@
       "archive": "アーカイブ",
       "restore": "復元",
       "archived": "アーカイブ済み",
+      "summary": "概要",
+      "superseded": "置き換え済み",
+      "supersededSection": "置き換え済み（{count}）",
       "empty": "メモリはまだありません。"
     },
     "config": {

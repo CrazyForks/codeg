@@ -3167,6 +3167,11 @@
       "preference": "偏好",
       "pitfall": "陷阱"
     },
+    "trustTier": {
+      "human": "人工",
+      "distilled": "提炼",
+      "proposed": "建议"
+    },
     "iterationList": {
       "empty": "暂无迭代。",
       "expand": "展开",
@@ -3200,6 +3205,9 @@
       "archive": "归档",
       "restore": "恢复",
       "archived": "已归档",
+      "summary": "摘要",
+      "superseded": "已取代",
+      "supersededSection": "已取代（{count}）",
       "empty": "暂无记忆。"
     },
     "config": {

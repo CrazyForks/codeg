@@ -463,7 +463,8 @@ export type LoopMemoryKind =
   | "decision"
   | "preference"
   | "pitfall"
-export type LoopMemoryStatus = "active" | "archived"
+export type LoopMemoryStatus = "active" | "archived" | "superseded"
+export type LoopTrustTier = "human" | "distilled" | "proposed"
 
 /** An agent plus the same startup mode/config knobs the regular sub-agent
  *  settings expose. Used both for each per-stage agent override (a field of
@@ -710,8 +711,14 @@ export interface LoopMemoryRow {
   kind: LoopMemoryKind
   source: LoopActorKind
   title: string
+  summary: string | null
   content: string
+  trust_tier: LoopTrustTier
   status: LoopMemoryStatus
+  superseded_by: number | null
+  source_issue_id: number | null
+  source_artifact_id: number | null
+  produced_by_iteration_id: number | null
   created_at: string
   updated_at: string
 }
