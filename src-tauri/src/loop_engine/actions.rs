@@ -33,7 +33,7 @@ use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus};
 use crate::db::entities::loop_artifact_revision::ActorKind;
 use crate::db::entities::loop_inbox_item::{self, InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{self, IssueStatus, PauseReason};
-use crate::db::entities::loop_iteration::{self, IterationStatus};
+use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
 use crate::db::service::folder_service;
 use crate::db::service::loop_service::{artifact, inbox, issue, space};
 use crate::models::loops::{LoopChanged, LOOP_CHANGED_EVENT};
@@ -414,7 +414,118 @@ impl LoopEngine {
         self.emit_changed(issue.space_id, issue_id, "merged");
         // Nudge the driver: it re-ticks, sees the terminal status, and stops.
         self.wake(issue_id).await;
+        // Release the per-repo merge lock BEFORE the best-effort reflect dispatch so
+        // spawning the reflect agent can never block another issue's merge on this
+        // repo. Reflect is post-merge memory consolidation (§4.4) — it must never
+        // affect the merge, so it runs only after `done` is durably committed.
+        drop(_guard);
+        if let Ok(Some(done)) = issue::get_issue(conn, issue_id).await {
+            self.dispatch_reflect_best_effort(&done).await;
+        }
         Ok(())
+    }
+
+    /// Best-effort reflect dispatch for a completed (`Done`) issue. NEVER returns
+    /// an error and NEVER changes issue status — reflect must not touch the merge.
+    /// The single guard is the durable anchor (D12): if a `reflection` artifact
+    /// already exists for the issue, do nothing (covers crash-after-commit + a
+    /// no-op success). Bounded by `max_attempts`; exhaustion files a low-priority
+    /// inbox card (D11). Runs in the base repo folder with a read-only briefing (D1).
+    /// Called at the merge hook, on every reflect settle (uptime self-retry), and
+    /// on boot recovery.
+    pub(crate) async fn dispatch_reflect_best_effort(&self, issue: &loop_issue::Model) {
+        use sea_orm::PaginatorTrait;
+        let conn = &self.db.conn;
+        // Anchor: already consolidated?
+        match loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(issue.id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Reflection))
+            .count(conn)
+            .await
+        {
+            Ok(0) => {}
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(issue_id = issue.id, error = %e, "reflect: anchor check failed");
+                return;
+            }
+        }
+        let config = match crate::loop_engine::config_resolver::effective_config(conn, issue).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(issue_id = issue.id, error = %e, "reflect: config resolve failed");
+                return;
+            }
+        };
+        // Count only TERMINAL reflect attempts (exclude queued/running): an in-flight
+        // reflect is not yet a spent attempt, so it can never trigger a premature
+        // exhaustion card while it might still produce the artifact. A finished
+        // reflect counts whether it Succeeded-without-artifact, Failed, Interrupted,
+        // or Cancelled — the artifact (not the iteration status) is the real success
+        // signal.
+        let attempts = match loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::IssueId.eq(issue.id))
+            .filter(loop_iteration::Column::Stage.eq(Stage::Reflect))
+            .filter(loop_iteration::Column::Status.is_in([
+                IterationStatus::Succeeded,
+                IterationStatus::Failed,
+                IterationStatus::Interrupted,
+                IterationStatus::Cancelled,
+            ]))
+            .count(conn)
+            .await
+        {
+            Ok(n) => n as u32,
+            Err(e) => {
+                tracing::warn!(issue_id = issue.id, error = %e, "reflect: attempt count failed");
+                return;
+            }
+        };
+        if config.max_attempts > 0 && attempts >= config.max_attempts {
+            // Terminal: a dismissible, informational card (idempotent upsert). NOT
+            // "blocked" — a `Done` issue is never mislabeled.
+            let _ = inbox::upsert_inbox(
+                conn,
+                issue.space_id,
+                issue.id,
+                None,
+                InboxKind::ReflectionFailed,
+                &format!("reflect_failed:{}", issue.id),
+                serde_json::json!({ "reason": "reflect_exhausted", "attempts": attempts }),
+            )
+            .await;
+            self.emit_changed(issue.space_id, issue.id, "reflect_exhausted");
+            return;
+        }
+        let folder_id = match space::get_space(conn, issue.space_id).await {
+            Ok(Some(s)) => s.folder_id,
+            _ => {
+                tracing::warn!(issue_id = issue.id, "reflect: space/folder lookup failed");
+                return;
+            }
+        };
+        let spec = crate::loop_engine::driver::resolve_agent_spec(&config, Stage::Reflect);
+        match self
+            .dispatch_iteration(crate::loop_engine::dispatch::DispatchInput {
+                space_id: issue.space_id,
+                issue_id: issue.id,
+                stage: Stage::Reflect,
+                target_artifact_id: None,
+                slot_no: None,
+                attempt: attempts as i32,
+                agent_type: spec.agent,
+                mode_id: spec.mode_id,
+                config_values: spec.config_values,
+                worktree_folder_id: folder_id,
+            })
+            .await
+        {
+            Ok(Some(_)) => tracing::debug!(issue_id = issue.id, "reflect: dispatched"),
+            Ok(None) => tracing::debug!(issue_id = issue.id, "reflect: lease already held"),
+            Err(e) => {
+                tracing::warn!(issue_id = issue.id, error = %e, "reflect: dispatch failed (best-effort)")
+            }
+        }
     }
 
     /// Approve the design gate (route=full): mark every design that is awaiting
@@ -1320,5 +1431,187 @@ mod tests {
         assert!(!pending
             .iter()
             .any(|c| c.subject_key == format!("design:{issue_id}")));
+    }
+
+    // ---- reflect orchestration (P4.4) ----
+
+    /// Claim a reflect iteration and drive it to terminal `Failed` — a spent
+    /// attempt with no artifact (what the exhaustion counter sees).
+    async fn fail_reflect(
+        conn: &sea_orm::DatabaseConnection,
+        space_id: i32,
+        issue_id: i32,
+        token: &str,
+    ) {
+        let it = try_claim_iteration(
+            conn,
+            IterationClaim {
+                space_id,
+                issue_id,
+                stage: Stage::Reflect,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: token.into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cas_iteration_status(conn, it.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        cas_iteration_status(conn, it.id, IterationStatus::Running, IterationStatus::Failed)
+            .await
+            .unwrap();
+    }
+
+    async fn count_reflect_iters(conn: &sea_orm::DatabaseConnection, issue_id: i32) -> usize {
+        loop_iteration::Entity::find()
+            .filter(loop_iteration::Column::IssueId.eq(issue_id))
+            .filter(loop_iteration::Column::Stage.eq(Stage::Reflect))
+            .all(conn)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn reflect_dispatch_is_noop_when_reflection_artifact_exists() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Done)
+            .await
+            .unwrap();
+        // The durable anchor (D12): a reflection already exists for the issue.
+        artifact::create_artifact(
+            &conn,
+            space_id,
+            issue_id,
+            ArtifactKind::Reflection,
+            "Retro",
+            ArtifactStatus::Done,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+
+        engine.dispatch_reflect_best_effort(&issue).await;
+
+        assert_eq!(
+            count_reflect_iters(&conn, issue_id).await,
+            0,
+            "anchor present → no dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflect_dispatch_files_card_at_max_attempts() {
+        let db = fresh_in_memory_db().await;
+        let conn = db.conn.clone();
+        let folder_id = seed_folder(&db, "/tmp/loop-reflect-exhaust").await;
+        let space = space::create_space(&conn, "S", folder_id).await.unwrap();
+        let cfg = IssueConfig {
+            max_attempts: 1,
+            ..IssueConfig::default()
+        };
+        let issue = issue::create_issue(&conn, space.id, "I", "b", IssuePriority::Medium, Some(&cfg))
+            .await
+            .unwrap();
+        let issue_id = issue.row.id;
+        cas_issue_status(&conn, issue_id, IssueStatus::Pending, IssueStatus::Running)
+            .await
+            .unwrap();
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Done)
+            .await
+            .unwrap();
+        // One terminal (failed) reflect attempt — at max_attempts (1), no artifact.
+        fail_reflect(&conn, space.id, issue_id, "reflect-fail-1").await;
+        let engine = LoopEngine::new(
+            db,
+            ConnectionManager::new(),
+            std::path::PathBuf::from("/tmp/loop-reflect-exhaust-data"),
+            EventEmitter::Noop,
+        );
+        let model = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+
+        engine.dispatch_reflect_best_effort(&model).await;
+
+        // A ReflectionFailed card was filed; no new reflect iteration claimed.
+        let pending = inbox::list_inbox(&conn, space.id, Some(InboxStatus::Pending))
+            .await
+            .unwrap();
+        assert!(pending.iter().any(|c| c.kind == InboxKind::ReflectionFailed));
+        assert_eq!(
+            count_reflect_iters(&conn, issue_id).await,
+            1,
+            "exhausted → no further dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflect_settle_is_done_safe_with_exhausted_budget() {
+        let db = fresh_in_memory_db().await;
+        let conn = db.conn.clone();
+        let folder_id = seed_folder(&db, "/tmp/loop-reflect-budget").await;
+        let space = space::create_space(&conn, "S", folder_id).await.unwrap();
+        let issue = issue::create_issue(
+            &conn,
+            space.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        let issue_id = issue.row.id;
+        cas_issue_status(&conn, issue_id, IssueStatus::Pending, IssueStatus::Running)
+            .await
+            .unwrap();
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Done)
+            .await
+            .unwrap();
+        // An already-exceeded token budget on the Done issue.
+        loop_issue::Entity::update_many()
+            .col_expr(loop_issue::Column::TokenBudget, Expr::value(100i64))
+            .col_expr(loop_issue::Column::TokenUsed, Expr::value(200i64))
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .exec(&conn)
+            .await
+            .unwrap();
+        // A running reflect iteration (target = None).
+        let it = try_claim_iteration(
+            &conn,
+            IterationClaim {
+                space_id: space.id,
+                issue_id,
+                stage: Stage::Reflect,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "reflect-budget-tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cas_iteration_status(&conn, it.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+
+        // Settle: no-progress breaker skipped (target None); budget CAS
+        // Running→Paused misses on a Done issue — Ok, no status change.
+        crate::loop_engine::dispatch::settle_iteration(&db, &EventEmitter::Noop, it.id)
+            .await
+            .unwrap();
+
+        let after = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            IssueStatus::Done,
+            "reflect settle never disturbs a Done issue"
+        );
     }
 }

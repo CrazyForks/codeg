@@ -172,8 +172,34 @@ impl LoopEngine {
                 for issue_id in running_ids {
                     self.start_issue(issue_id).await;
                 }
+                // Backstop for memory consolidation (§4.4/§5.5): a `Done` issue that
+                // never produced a reflection (crashed mid-reflect, or before the
+                // merge hook could dispatch) gets a bounded re-dispatch here.
+                // Idempotent + best-effort via the reflection-artifact anchor.
+                self.recover_pending_reflections().await;
             }
             Err(e) => tracing::error!(error = %e, "recover_on_boot failed"),
+        }
+    }
+
+    /// After boot reconcile released interrupted leases, re-dispatch reflect for any
+    /// `Done` issue that never consolidated. Best-effort + bounded inside
+    /// [`LoopEngine::dispatch_reflect_best_effort`]; idempotent via the
+    /// reflection-artifact anchor (D12), so a re-run never double-distills.
+    async fn recover_pending_reflections(self: &Arc<Self>) {
+        let done = match loop_issue::Entity::find()
+            .filter(loop_issue::Column::Status.eq(IssueStatus::Done))
+            .all(&self.db.conn)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "recover: listing done issues failed");
+                return;
+            }
+        };
+        for issue in done {
+            self.dispatch_reflect_best_effort(&issue).await;
         }
     }
 
@@ -399,6 +425,19 @@ impl LoopEngine {
             );
         }
         self.wake(iter.issue_id).await;
+        // Uptime self-retry (§5.3): a reflect turn just settled. Re-evaluate
+        // consolidation — if it produced no reflection artifact and is still under
+        // max_attempts, dispatch_reflect_best_effort re-dispatches (bounded); if an
+        // artifact exists, it is a no-op. This self-heals a failed reflect during
+        // uptime; boot recovery is the crash backstop.
+        if iter.stage == loop_iteration::Stage::Reflect {
+            if let Ok(Some(issue)) = loop_issue::Entity::find_by_id(iter.issue_id)
+                .one(&self.db.conn)
+                .await
+            {
+                self.dispatch_reflect_best_effort(&issue).await;
+            }
+        }
     }
 
     /// Run the §4.3 seven-step dispatch for a single frontier decision. Returns
