@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO="xintaofei/codeg"
 INSTALL_DIR="${CODEG_INSTALL_DIR:-/usr/local/bin}"
+WEB_DIR="${CODEG_WEB_DIR:-/usr/local/share/codeg/web}"
 VERSION=""
 # Stale codeg-server / codeg-mcp binaries elsewhere in PATH are removed by
 # default so the user's `codeg-server` command always runs the freshly
@@ -117,6 +118,66 @@ read_bin_version() {
   rm -f "$tmp"
 }
 
+# ── Privilege model ──
+#
+# Root can write anywhere and must NEVER call `sudo`: minimal root environments
+# (containers, slim images) frequently don't ship sudo, and a blind `sudo mkdir`
+# there aborts the whole script under `set -e` AFTER the binaries already landed
+# — leaving a half-installed tree the version short-circuit then refuses to
+# repair. A non-root user needs sudo only when the destination's nearest
+# existing ancestor isn't writable.
+
+PRIV=""
+IS_ROOT=0
+# Conservative default: if `id -u` somehow fails, assume NON-root (echo 1) so we
+# fall back to writability-probing + sudo rather than wrongly skipping elevation.
+# This is still correct for a real root whose `id` broke: `[ -w ]` on existing
+# system dirs is true for root, so resolve_priv runs directly anyway.
+if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+  IS_ROOT=1
+fi
+
+HAVE_SUDO=0
+if command -v sudo >/dev/null 2>&1; then
+  HAVE_SUDO=1
+fi
+
+# Walk up from $1 to the first ancestor that already exists, so writability can
+# be tested for a not-yet-created path (e.g. /usr/local/share/codeg/web, whose
+# parent /usr/local/share/codeg also doesn't exist on a fresh install).
+nearest_existing_ancestor() {
+  local p="$1"
+  while [ -n "$p" ] && [ "$p" != "/" ] && [ ! -e "$p" ]; do
+    p="$(dirname "$p")"
+  done
+  echo "$p"
+}
+
+# Decide how to create/write into directory $1. Sets global PRIV to "" (run
+# directly) or "sudo". Returns non-zero — without aborting under `set -e`, since
+# callers invoke it via `if` — when elevation is required but sudo is absent.
+resolve_priv() {
+  PRIV=""
+  [ "$IS_ROOT" -eq 1 ] && return 0
+  local anchor
+  anchor="$(nearest_existing_ancestor "$1")"
+  [ -w "$anchor" ] && return 0
+  if [ "$HAVE_SUDO" -eq 1 ]; then
+    PRIV="sudo"
+    return 0
+  fi
+  return 1
+}
+
+# Run "$@", elevating with sudo only when the last resolve_priv call decided so.
+priv_run() {
+  if [ -n "$PRIV" ]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
 # ── Scan PATH for codeg-server binaries that shadow the target install ──
 #
 # A binary "shadows" the install only if it appears in PATH BEFORE the
@@ -188,16 +249,21 @@ fi
 TARGET_VER="${VERSION#v}"
 
 # Only short-circuit when the active binary is up to date AND the destination
-# itself has it AND no other PATH entries shadow it. Otherwise we still need to
-# install / clean up so the user's `codeg-server` command runs the new version.
+# has it AND no other PATH entries shadow it AND the web assets are present.
+# The web-asset check makes the installer self-healing: a prior run that placed
+# the binary but failed before copying web/ (the classic root-without-sudo
+# case) is repaired on re-run instead of exiting "nothing to do" forever.
 if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$TARGET_VER" ] \
    && [ "${#PATH_CONFLICTS[@]}" -eq 0 ] \
-   && [ -x "$DEST_BIN" ]; then
-  echo "codeg-server is already at version ${TARGET_VER}, nothing to do."
+   && [ -x "$DEST_BIN" ] \
+   && [ -f "${WEB_DIR}/index.html" ]; then
+  echo "codeg-server is already at version ${TARGET_VER} with web assets in place, nothing to do."
   exit 0
 fi
 
-if [ -n "$CURRENT_VERSION" ]; then
+if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$TARGET_VER" ]; then
+  echo "codeg-server is already at ${TARGET_VER}; reinstalling to repair the existing install..."
+elif [ -n "$CURRENT_VERSION" ]; then
   echo "Upgrading codeg-server: ${CURRENT_VERSION} -> ${TARGET_VER}..."
 else
   echo "Installing codeg-server ${VERSION} (${PLATFORM}/${ARCH_SUFFIX})..."
@@ -303,23 +369,28 @@ for _name in "${MANAGED_BINS[@]}"; do
   fi
 done
 
-mkdir -p "$INSTALL_DIR"
+# Resolve how to write into INSTALL_DIR, then create it and drop the binaries.
+# Root writes directly; a non-root user uses sudo only when the prefix isn't
+# already writable. Bail out clearly if elevation is needed but sudo is absent,
+# instead of crashing mid-install under `set -e`.
+if ! resolve_priv "$INSTALL_DIR"; then
+  echo "Error: need elevated privileges to install to ${INSTALL_DIR}, but 'sudo' is not installed."
+  echo "       Re-run as root, install sudo, or set CODEG_INSTALL_DIR/CODEG_WEB_DIR to writable"
+  echo "       paths (e.g. \$HOME/.local/bin and \$HOME/.local/share/codeg/web)."
+  exit 1
+fi
+if [ -n "$PRIV" ]; then
+  echo "Need sudo to install to ${INSTALL_DIR}"
+fi
+
+priv_run mkdir -p "$INSTALL_DIR"
 _install_one() {
   local name="$1"
   local src="${TMP_DIR}/${ARTIFACT}/${name}"
   local dst="${INSTALL_DIR}/${name}"
-  if [ -w "$INSTALL_DIR" ]; then
-    cp "$src" "$dst"
-    chmod +x "$dst"
-  else
-    sudo cp "$src" "$dst"
-    sudo chmod +x "$dst"
-  fi
+  priv_run cp "$src" "$dst"
+  priv_run chmod +x "$dst"
 }
-
-if [ ! -w "$INSTALL_DIR" ]; then
-  echo "Need sudo to install to ${INSTALL_DIR}"
-fi
 for _name in "${MANAGED_BINS[@]}"; do
   _install_one "$_name"
 done
@@ -332,17 +403,16 @@ DEST_BIN_REAL="$(canon_path "$DEST_BIN")"
 # ── Install web assets ──
 
 WEB_SRC="${TMP_DIR}/${ARTIFACT}/web"
-WEB_DIR="${CODEG_WEB_DIR:-/usr/local/share/codeg/web}"
 
 if [ -d "$WEB_SRC" ]; then
   echo "Installing web assets to ${WEB_DIR}..."
-  if [ -w "$(dirname "$WEB_DIR")" ] 2>/dev/null; then
-    mkdir -p "$WEB_DIR"
-    cp -r "$WEB_SRC"/* "$WEB_DIR"/
-  else
-    sudo mkdir -p "$WEB_DIR"
-    sudo cp -r "$WEB_SRC"/* "$WEB_DIR"/
+  if ! resolve_priv "$WEB_DIR"; then
+    echo "Error: need elevated privileges to write ${WEB_DIR}, but 'sudo' is not installed."
+    echo "       Re-run as root, install sudo, or set CODEG_WEB_DIR to a writable path."
+    exit 1
   fi
+  priv_run mkdir -p "$WEB_DIR"
+  priv_run cp -r "$WEB_SRC"/* "$WEB_DIR"/
 fi
 
 # ── Remove shadowing binaries from earlier PATH entries ──
