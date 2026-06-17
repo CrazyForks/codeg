@@ -12,7 +12,7 @@
 //! transport / listener layers only ferry the `(token, tool, payload)` triple
 //! here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -852,9 +852,16 @@ fn injected_memory_index(it: &loop_iteration::Model) -> Result<HashMap<String, i
     let Some(obj) = manifest.get("memory_index").and_then(|v| v.as_object()) else {
         return Ok(HashMap::new());
     };
+    // Checked narrowing: an out-of-range / non-integer manifest value resolves to
+    // no entry (so that handle surfaces as `not_found`) rather than wrapping to a
+    // wrong id. In practice the engine only ever writes i32 PK ids here.
     Ok(obj
         .iter()
-        .filter_map(|(k, v)| v.as_i64().map(|id| (k.clone(), id as i32)))
+        .filter_map(|(k, v)| {
+            v.as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+                .map(|id| (k.clone(), id))
+        })
         .collect())
 }
 
@@ -870,19 +877,35 @@ async fn read_memory(
     it: &loop_iteration::Model,
     payload: &Value,
 ) -> Result<Value, LoopError> {
-    let handles: Vec<String> = payload
-        .get("handles")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let Some(arr) = payload.get("handles").and_then(|v| v.as_array()) else {
+        return Err(invalid("loop_read_memory requires a `handles` array"));
+    };
+    // Every entry must be a string (the schema says so); a non-string entry is a
+    // malformed call, rejected rather than silently dropped.
+    let mut handles: Vec<String> = Vec::with_capacity(arr.len());
+    for h in arr {
+        match h.as_str() {
+            Some(s) => handles.push(s.to_string()),
+            None => {
+                return Err(invalid(
+                    "loop_read_memory `handles` must be an array of strings",
+                ))
+            }
+        }
+    }
     if handles.is_empty() {
         return Err(invalid("loop_read_memory requires a non-empty `handles` array"));
     }
     let index = injected_memory_index(it)?;
     // Resolve handles → ids against the stored manifest; unknown → not_found.
+    // Dedupe by first-seen so a repeated handle yields one result, not N copies.
+    let mut seen: HashSet<String> = HashSet::new();
     let mut wanted: Vec<(String, i32)> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
     for h in handles {
+        if !seen.insert(h.clone()) {
+            continue;
+        }
         match index.get(&h) {
             Some(id) => wanted.push((h, *id)),
             None => not_found.push(h),
@@ -1924,6 +1947,34 @@ mod tests {
         // get_for_read re-scopes by it.space_id → no row → not_found.
         assert!(out["memories"].as_array().unwrap().is_empty());
         assert_eq!(out["not_found"], json!(["M1"]));
+    }
+
+    #[tokio::test]
+    async fn read_memory_non_string_handle_is_error() {
+        let (db, space, issue, root) = seed().await;
+        let m1 = mk_memory(&db.conn, space, MemoryKind::Decision, "M", None).await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-bad").await;
+        set_memory_index(&db.conn, iter, json!({ "M1": m1 })).await;
+        // A non-string entry is a malformed call — rejected, never silently dropped.
+        let err =
+            ingest(&db.conn, "tok-bad", "loop_read_memory", &json!({"handles":["M1", 5, null]}))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn read_memory_dedupes_repeated_handles() {
+        let (db, space, issue, root) = seed().await;
+        let m1 = mk_memory(&db.conn, space, MemoryKind::Decision, "Once", None).await;
+        let iter = running_iter(&db.conn, space, issue, Stage::Refine, Some(root), "tok-dup").await;
+        set_memory_index(&db.conn, iter, json!({ "M1": m1 })).await;
+        let out = ingest(&db.conn, "tok-dup", "loop_read_memory", &json!({"handles":["M1","M1"]}))
+            .await
+            .unwrap();
+        // A repeated handle yields exactly one memory and no spurious not_found.
+        assert_eq!(out["memories"].as_array().unwrap().len(), 1);
+        assert!(out["not_found"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
