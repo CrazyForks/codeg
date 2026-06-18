@@ -115,6 +115,13 @@ pub async fn list_spaces(
         .all(conn)
         .await?;
 
+    // D6: roll pending-inbox attention into each summary (one batched query).
+    let attention: HashMap<i32, (i64, i64)> = super::inbox::aggregate_all(conn)
+        .await?
+        .into_iter()
+        .map(|a| (a.space_id, (a.blocking, a.notice)))
+        .collect();
+
     let summaries = spaces
         .into_iter()
         .map(|s| -> Result<LoopSpaceSummary, DbError> {
@@ -132,6 +139,7 @@ pub async fn list_spaces(
                 .count() as i64;
             let last_activity_at = mine.iter().map(|i| i.updated_at).max();
             let default_config = serde_json::from_str(&s.default_config).map_err(config_err)?;
+            let (blocking_count, notice_count) = attention.get(&s.id).copied().unwrap_or((0, 0));
             Ok(LoopSpaceSummary {
                 id: s.id,
                 name: s.name,
@@ -140,6 +148,8 @@ pub async fn list_spaces(
                 detached,
                 issue_count,
                 running_count,
+                blocking_count,
+                notice_count,
                 last_activity_at,
                 created_at: s.created_at,
                 default_config,

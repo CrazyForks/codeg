@@ -10,7 +10,7 @@ use crate::db::entities::loop_inbox_item::InboxStatus;
 use crate::db::entities::loop_issue::{IssuePriority, IssueStatus};
 use crate::db::entities::loop_memory::{MemoryKind, MemoryStatus};
 use crate::models::loops::{
-    IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopDagView, LoopInboxItemRow,
+    IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopAttention, LoopDagView, LoopInboxItemRow,
     LoopIssueDetail, LoopIssueRow, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary,
     LoopValidationRunRow,
 };
@@ -374,6 +374,12 @@ pub async fn list_loop_inbox(
     Ok(Json(
         core::list_loop_inbox_core(&state.db.conn, p.space_id, p.status).await?,
     ))
+}
+
+pub async fn get_loop_attention(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<LoopAttention>, AppCommandError> {
+    Ok(Json(core::get_loop_attention_core(&state.db.conn).await?))
 }
 
 pub async fn dismiss_loop_inbox(

@@ -157,6 +157,14 @@ impl LoopEngine {
                 Expr::value(IterationStatus::Cancelled.to_value()),
             )
             .col_expr(loop_iteration::Column::EndedAt, Expr::value(now))
+            // D11: cancelled-before-settling → `abandoned` — COALESCE keeps any
+            // real outcome already recorded, so the write-once invariant holds at
+            // the write itself, not merely via the active-status filter (Codex r1).
+            .col_expr(
+                loop_iteration::Column::Outcome,
+                Expr::col(loop_iteration::Column::Outcome)
+                    .if_null(loop_iteration::IterationOutcome::Abandoned.to_value()),
+            )
             .filter(loop_iteration::Column::IssueId.eq(issue_id))
             .filter(
                 loop_iteration::Column::Status
@@ -891,6 +899,37 @@ mod tests {
             .await
             .unwrap();
 
+        // A sibling that already SUCCEEDED with a real outcome — cancel must not
+        // clobber it (C2). Its terminal status excludes it from the abandon bulk.
+        let done = try_claim_iteration(
+            &conn,
+            IterationClaim {
+                space_id,
+                issue_id,
+                stage: Stage::Refine,
+                target_artifact_id: None,
+                slot_no: None,
+                capability_token: "done-token".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cas_iteration_status(&conn, done.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        cas_iteration_status(&conn, done.id, IterationStatus::Running, IterationStatus::Succeeded)
+            .await
+            .unwrap();
+        crate::db::service::loop_service::iteration::set_iteration_outcome(
+            &conn,
+            done.id,
+            loop_iteration::IterationOutcome::Succeeded,
+        )
+        .await
+        .unwrap();
+
         engine.cancel_issue(issue_id).await.unwrap();
 
         let issue = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
@@ -905,6 +944,19 @@ mod tests {
             it.status,
             IterationStatus::Cancelled,
             "the in-flight token is invalidated so the host rejects late writes"
+        );
+        // D11: the cancelled in-flight iteration is recorded `abandoned`.
+        assert_eq!(it.outcome, Some(loop_iteration::IterationOutcome::Abandoned));
+        // C2: the succeeded sibling's real outcome is preserved, never overwritten.
+        let done_after = loop_iteration::Entity::find_by_id(done.id)
+            .one(&conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            done_after.outcome,
+            Some(loop_iteration::IterationOutcome::Succeeded),
+            "cancel must not clobber a real outcome (C2)"
         );
     }
 

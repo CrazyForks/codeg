@@ -2164,6 +2164,58 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// D11 regression: a loop iteration's headless Codex rollout begins with a
+    /// `developer` environment message before the real `user` briefing, then an
+    /// assistant reply + tool calls. The turn builder must NOT be stranded by the
+    /// leading developer message — it must still produce turns (so a settled
+    /// iteration's dialog renders agent messages, not an empty transcript). This
+    /// mirrors the record shape observed in real `~/.codex/sessions` loop rollouts.
+    #[test]
+    fn parse_detail_loop_rollout_shape_produces_turns() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-loop-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"loop-1\",\"cwd\":\"/tmp/wt\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.100Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            // Leading developer environment message (NOT a user turn boundary).
+            "{\"timestamp\":\"2026-03-01T10:00:00.200Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context><cwd>/tmp/wt</cwd></environment_context>\"}]}}\n",
+            // The real briefing, sent as a user message — the turn boundary.
+            "{\"timestamp\":\"2026-03-01T10:00:00.300Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"## Briefing\\nImplement the widget.\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Implemented the widget.\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05.001Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Implemented the widget.\"}]}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05.100Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\"{}\",\"call_id\":\"c1\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:05.200Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":\"ok\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "loop-1")
+            .expect("parse detail ok");
+
+        // The whole point: a settled loop rollout is NOT an empty transcript.
+        assert!(
+            !detail.turns.is_empty(),
+            "loop rollout must produce turns despite the leading developer message"
+        );
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("assistant turn present");
+        let rendered = format!("{:?}", assistant.blocks);
+        assert!(
+            rendered.contains("Implemented the widget."),
+            "assistant turn carries the agent's message"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn codex_home_env_overrides_default_home() {
         let resolved = resolve_codex_home_dir_from(

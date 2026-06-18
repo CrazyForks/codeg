@@ -335,6 +335,14 @@ pub async fn fail_iteration_active(conn: &DatabaseConnection, id: i32) -> Result
             Expr::value(IterationStatus::Failed.to_value()),
         )
         .col_expr(loop_iteration::Column::EndedAt, Expr::value(Utc::now()))
+        // D11: a failed-before-settling iteration is `abandoned` — COALESCE keeps
+        // any real outcome already recorded, so the write-once invariant holds at
+        // the write itself, not merely via the active-status filter (Codex r1).
+        .col_expr(
+            loop_iteration::Column::Outcome,
+            Expr::col(loop_iteration::Column::Outcome)
+                .if_null(loop_iteration::IterationOutcome::Abandoned.to_value()),
+        )
         .filter(loop_iteration::Column::Id.eq(id))
         .filter(
             loop_iteration::Column::Status
@@ -351,7 +359,7 @@ mod tests {
     use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus};
     use crate::db::entities::loop_artifact_revision::ActorKind;
     use crate::db::entities::loop_issue::IssuePriority;
-    use crate::db::service::loop_service::{artifact, issue, space};
+    use crate::db::service::loop_service::{artifact, issue, iteration, space};
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::loops::IssueConfig;
 
@@ -548,6 +556,62 @@ mod tests {
         assert!(fail_iteration_active(&db.conn, r.id).await.unwrap());
         // already-terminal → no-op (false)
         assert!(!fail_iteration_active(&db.conn, r.id).await.unwrap());
+    }
+
+    /// COALESCE no-clobber (Codex r1): the abandon write must preserve any real
+    /// outcome already recorded on an active row (the settle→status window, or a
+    /// future agent-declared completion), while still abandoning NULL-outcome rows.
+    #[tokio::test]
+    async fn fail_iteration_active_preserves_a_real_outcome() {
+        use loop_iteration::IterationOutcome;
+        let (db, space_id, issue_id) = seed().await;
+        // A running iteration that has ALREADY recorded a real outcome.
+        let settled =
+            try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Refine, None, None, "s"))
+                .await
+                .unwrap()
+                .unwrap();
+        cas_iteration_status(&db.conn, settled.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+        assert!(iteration::set_iteration_outcome(&db.conn, settled.id, IterationOutcome::Succeeded)
+            .await
+            .unwrap());
+        // A sibling running iteration with no outcome yet.
+        let unsettled =
+            try_claim_iteration(&db.conn, claim(space_id, issue_id, Stage::Design, None, None, "u"))
+                .await
+                .unwrap()
+                .unwrap();
+        cas_iteration_status(&db.conn, unsettled.id, IterationStatus::Queued, IterationStatus::Running)
+            .await
+            .unwrap();
+
+        assert!(fail_iteration_active(&db.conn, settled.id).await.unwrap());
+        assert!(fail_iteration_active(&db.conn, unsettled.id).await.unwrap());
+
+        let s = loop_iteration::Entity::find_by_id(settled.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.status, IterationStatus::Failed);
+        assert_eq!(
+            s.outcome,
+            Some(IterationOutcome::Succeeded),
+            "COALESCE preserves a real outcome on an active row"
+        );
+        let u = loop_iteration::Entity::find_by_id(unsettled.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.status, IterationStatus::Failed);
+        assert_eq!(
+            u.outcome,
+            Some(IterationOutcome::Abandoned),
+            "a NULL-outcome active row still becomes abandoned"
+        );
     }
 
     #[tokio::test]

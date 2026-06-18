@@ -160,13 +160,20 @@ const UP: &[&str] = &[
         context_manifest TEXT,
         created_at TEXT NOT NULL,
         started_at TEXT,
-        ended_at TEXT
+        ended_at TEXT,
+        -- Why an iteration ended (D11). NULL is legal: while the run is in flight,
+        -- or for a settled implement run before its checkpoint has written the
+        -- real outcome. `declared_complete` is a Phase-C value, enumerated now so
+        -- the CHECK/UI need no Phase-C edit.
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded','empty_diff','validation_failed','declared_complete','no_artifacts','abandoned'))
     )",
     "CREATE UNIQUE INDEX uniq_loop_iteration_token ON loop_iteration(capability_token)",
     "CREATE INDEX idx_loop_iteration_issue ON loop_iteration(issue_id)",
     "CREATE INDEX idx_loop_iteration_issue_status ON loop_iteration(issue_id, status)",
     "CREATE INDEX idx_loop_iteration_space ON loop_iteration(space_id)",
     "CREATE INDEX idx_loop_iteration_conv ON loop_iteration(conversation_id)",
+    // D10: the artifact drawer lists every iteration that targeted an artifact.
+    "CREATE INDEX idx_loop_iteration_target ON loop_iteration(target_artifact_id)",
     // Dispatch leases (DB-authoritative double-dispatch guards). Partial unique
     // indexes — SeaORM's Index builder can't express the WHERE clause.
     // Task parallelism (phase 2) drops the old per-issue `uniq_active_write` (one
@@ -253,6 +260,8 @@ const UP: &[&str] = &[
     "CREATE UNIQUE INDEX uniq_inbox_pending ON loop_inbox_item(issue_id, kind, subject_key) \
      WHERE status = 'pending'",
     "CREATE INDEX idx_loop_inbox_space_status ON loop_inbox_item(space_id, status)",
+    // D6: per-issue pending-inbox aggregation (blocking/notice counts on issue rows).
+    "CREATE INDEX idx_loop_inbox_issue_status ON loop_inbox_item(issue_id, status)",
     "CREATE TABLE loop_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         space_id INTEGER NOT NULL REFERENCES loop_space(id) ON DELETE CASCADE,
@@ -371,6 +380,7 @@ mod tests {
             "uniq_loop_gate_decision",
             // Plain lookup indexes.
             "idx_loop_iteration_issue_status",
+            "idx_loop_iteration_target",
             "idx_loop_artifact_produced_by",
             "idx_loop_link_to",
             "idx_loop_criterion_artifact",
@@ -379,6 +389,7 @@ mod tests {
             "idx_loop_validation_run_task",
             "idx_loop_validation_run_iter",
             "idx_loop_inbox_space_status",
+            "idx_loop_inbox_issue_status",
             "idx_loop_memory_lookup",
         ] {
             assert_eq!(count(&conn, "index", index).await, 1, "index {index} missing");

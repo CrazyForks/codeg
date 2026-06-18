@@ -106,6 +106,10 @@ pub fn build_router(
         )
         .route("/list_loop_inbox", post(handlers::loops::list_loop_inbox))
         .route(
+            "/get_loop_attention",
+            post(handlers::loops::get_loop_attention),
+        )
+        .route(
             "/dismiss_loop_inbox",
             post(handlers::loops::dismiss_loop_inbox),
         )

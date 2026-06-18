@@ -36,7 +36,7 @@ use crate::commands::acp::build_session_runtime_env;
 use crate::commands::conversations::get_folder_conversation_core;
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{IssueStatus, PauseReason};
-use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
+use crate::db::entities::loop_iteration::{self, IterationOutcome, IterationStatus, Stage};
 use crate::db::entities::{loop_artifact, loop_issue};
 use crate::db::service::conversation_service::create_loop;
 use crate::db::service::folder_service;
@@ -342,7 +342,7 @@ pub async fn dispatch_iteration(
             Ok(Some(handle))
         }
         Err(e) => {
-            fail_iteration(conn, &input, &iter, &e).await;
+            fail_iteration(conn, &emitter, &input, &iter, &e).await;
             Err(e)
         }
     }
@@ -451,9 +451,12 @@ async fn finish_launch(
 }
 
 /// Best-effort failure cleanup for a claimed-but-not-launched iteration: mark
-/// the lease failed, stamp `ended_at`, and surface a blocked inbox item.
+/// the lease failed, stamp `ended_at`, and surface a blocked inbox item. Emits
+/// `loop://changed` when the card is new/changed so the failure shows live (the
+/// caller's success path emits `dispatched`, but this error path does not).
 async fn fail_iteration(
     conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
     input: &DispatchInput,
     iter: &loop_iteration::Model,
     err: &LoopError,
@@ -462,7 +465,7 @@ async fn fail_iteration(
     // multi-from UPDATE that also stamps `ended_at`, so the row can't wedge in
     // `running` if the process dies between two separate CAS calls.
     let _ = crate::loop_engine::transitions::fail_iteration_active(conn, iter.id).await;
-    let _ = inbox::upsert_inbox(
+    if let Ok(upsert) = inbox::upsert_inbox(
         conn,
         input.space_id,
         input.issue_id,
@@ -474,7 +477,12 @@ async fn fail_iteration(
             "error": err.to_string(),
         }),
     )
-    .await;
+    .await
+    {
+        if upsert.changed() {
+            emit_changed(emitter, input.space_id, input.issue_id, iter.id, "blocked");
+        }
+    }
 }
 
 /// The artifact ids an iteration produced (its `produced_by_iteration_id`
@@ -601,6 +609,24 @@ pub async fn settle_iteration_as(
 
     let made_progress = !produced_artifact_ids.is_empty();
     let abandoned = resolution == SettleResolution::Abandoned;
+
+    // Record the iteration outcome (D11). Implement's real outcome is only known at
+    // its checkpoint (empty_diff / validation_failed / succeeded), so leave it NULL
+    // here and let `gates` fill it; everything else settles its outcome now.
+    // Write-once, so this never clobbers a value the checkpoint already wrote.
+    let settle_outcome = if abandoned {
+        Some(IterationOutcome::Abandoned)
+    } else if iter.stage == Stage::Implement {
+        None
+    } else if made_progress {
+        Some(IterationOutcome::Succeeded)
+    } else {
+        Some(IterationOutcome::NoArtifacts)
+    };
+    if let Some(outcome) = settle_outcome {
+        iteration::set_iteration_outcome(conn, iteration_id, outcome).await?;
+    }
+
     // Bump the target node's rework counter + record a failure signature when the
     // run made no progress, or was abandoned (dead connection) — so redispatch is
     // bounded by the breaker. Implement measures progress by the worktree diff, so
@@ -1164,6 +1190,8 @@ mod tests {
             .unwrap();
         assert_eq!(settled.status, IterationStatus::Succeeded);
         assert!(settled.ended_at.is_some());
+        // D11: a read stage that produced its artifact records `succeeded`.
+        assert_eq!(settled.outcome, Some(IterationOutcome::Succeeded));
     }
 
     #[tokio::test]

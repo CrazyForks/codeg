@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
+use crate::db::entities::loop_iteration::IterationOutcome;
 use crate::db::entities::{loop_artifact, loop_issue, loop_iteration};
 use crate::db::error::DbError;
 use crate::models::loops::LoopIterationRow;
@@ -23,6 +25,7 @@ fn to_iteration_row(
         launched_by: m.launched_by,
         attempt: m.attempt,
         tokens_used: m.tokens_used,
+        outcome: m.outcome,
         created_at: m.created_at,
         started_at: m.started_at,
         ended_at: m.ended_at,
@@ -34,6 +37,25 @@ pub async fn get_iteration(
     id: i32,
 ) -> Result<Option<loop_iteration::Model>, DbError> {
     Ok(loop_iteration::Entity::find_by_id(id).one(conn).await?)
+}
+
+/// Write-once outcome (D11): set `outcome` only while it is still NULL. Returns
+/// `true` iff it wrote. Making the column immutable once set means a stale /
+/// CAS-lost `abandoned` write can never clobber a real `succeeded` / `empty_diff`
+/// / `validation_failed` (Codex r2 C2). The bulk abandon paths additionally filter
+/// on the iteration's active status, so they only touch unsettled (NULL) rows.
+pub async fn set_iteration_outcome(
+    conn: &impl sea_orm::ConnectionTrait,
+    id: i32,
+    outcome: IterationOutcome,
+) -> Result<bool, DbError> {
+    let res = loop_iteration::Entity::update_many()
+        .col_expr(loop_iteration::Column::Outcome, Expr::value(outcome.to_value()))
+        .filter(loop_iteration::Column::Id.eq(id))
+        .filter(loop_iteration::Column::Outcome.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
 }
 
 async fn target_titles(

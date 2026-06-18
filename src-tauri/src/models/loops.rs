@@ -15,7 +15,9 @@ use crate::db::entities::loop_criterion_check::CheckVerdict;
 use crate::db::entities::loop_gate_decision::GateOutcome;
 use crate::db::entities::loop_inbox_item::{InboxKind, InboxStatus};
 use crate::db::entities::loop_issue::{IssuePriority, IssueRoute, IssueStatus, PauseReason};
-use crate::db::entities::loop_iteration::{IterationStatus, LaunchedBy, Stage};
+use crate::db::entities::loop_iteration::{
+    IterationOutcome, IterationStatus, LaunchedBy, Stage,
+};
 use crate::db::entities::loop_link::LinkKind;
 use crate::db::entities::loop_memory::{MemoryKind, MemoryStatus, TrustTier};
 
@@ -209,11 +211,32 @@ pub struct LoopSpaceSummary {
     pub detached: bool,
     pub issue_count: i64,
     pub running_count: i64,
+    /// Pending-inbox attention rolled up across the space's issues (D6/D7).
+    /// `blocking` = approval/blocked/budget/question; `notice` = reflection_failed.
+    pub blocking_count: i64,
+    pub notice_count: i64,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Space default issue config (parsed). Always present — every space stores a
     /// concrete config that inheriting issues resolve against.
     pub default_config: IssueConfig,
+}
+
+/// One space's pending-inbox attention, for the global sidebar badge (D7).
+#[derive(Debug, Clone, Serialize)]
+pub struct LoopSpaceAttention {
+    pub space_id: i32,
+    pub blocking: i64,
+    pub notice: i64,
+}
+
+/// Cross-space attention rollup powering the always-visible "who needs me" badge
+/// (D6/D7). `get_loop_attention` returns it; the sidebar subscribes to refresh it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoopAttention {
+    pub total_blocking: i64,
+    pub total_notice: i64,
+    pub per_space: Vec<LoopSpaceAttention>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -228,6 +251,9 @@ pub struct LoopIssueRow {
     pub route: IssueRoute,
     pub token_used: i64,
     pub token_budget: Option<i64>,
+    /// Pending-inbox attention for this issue (D6/D7), same split as the space.
+    pub blocking_count: i64,
+    pub notice_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -366,6 +392,9 @@ pub struct LoopIterationRow {
     pub launched_by: LaunchedBy,
     pub attempt: i32,
     pub tokens_used: i64,
+    /// Why the run ended (D11). `None` while in flight or for a settled implement
+    /// run before its checkpoint; the UI renders no outcome badge for `None`.
+    pub outcome: Option<IterationOutcome>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -392,6 +421,11 @@ pub struct LoopInboxItemRow {
     pub subject_key: String,
     pub payload: serde_json::Value,
     pub status: InboxStatus,
+    /// The artifact this card concerns, resolved at read time (D9). `None` for
+    /// issue-level cards with no backing artifact (budget, coverage gap, …).
+    pub subject_artifact_id: Option<i32>,
+    /// That artifact's title, so the card is self-contained without a second fetch.
+    pub subject_title: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

@@ -343,6 +343,7 @@ async fn ensure_skip_provenance(
 /// every tick; the card is resolved by `approve_design` / `reject_design`.
 async fn ensure_design_gate_card(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     dag: &LoopDagView,
 ) -> Result<(), LoopError> {
@@ -350,7 +351,10 @@ async fn ensure_design_gate_card(
         a.kind == ArtifactKind::Design && a.status == ArtifactStatus::AwaitingApproval
     });
     if awaiting {
-        inbox::upsert_inbox(
+        // Filed every tick while a design awaits approval; the `{gate}` payload is
+        // identical each time, so only the first filing is Created/changed → emit
+        // once (D6 real-time), no per-tick spam.
+        let upsert = inbox::upsert_inbox(
             &db.conn,
             issue.space_id,
             issue.id,
@@ -360,6 +364,9 @@ async fn ensure_design_gate_card(
             serde_json::json!({ "v": 1, "gate": "design" }),
         )
         .await?;
+        if upsert.changed() {
+            emit_changed(emitter, issue.space_id, issue.id, issue.id, "approval");
+        }
     }
     Ok(())
 }
@@ -743,7 +750,7 @@ pub(crate) async fn tick_once(
     ensure_skip_provenance(db, issue.space_id, &dag, route).await?;
     // Design approval gate (route=full): while a produced design awaits human
     // approval, keep its inbox card filed; the read frontier idles until approved.
-    ensure_design_gate_card(db, &issue, &dag).await?;
+    ensure_design_gate_card(db, emitter, &issue, &dag).await?;
 
     // D12: a rejected design re-emits Design via the frontier below; bound that
     // loop-back so endless rejections terminate at `block + design_rejected`

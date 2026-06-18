@@ -33,7 +33,7 @@ use crate::db::entities::loop_criterion_check::CheckVerdict;
 use crate::db::entities::loop_gate_decision::GateOutcome;
 use crate::db::entities::loop_inbox_item::InboxKind;
 use crate::db::entities::loop_issue::{self, IssueStatus};
-use crate::db::entities::loop_iteration::{self, IterationStatus, Stage};
+use crate::db::entities::loop_iteration::{self, IterationOutcome, IterationStatus, Stage};
 use crate::db::entities::loop_link::LinkKind;
 use crate::db::service::{folder_service, loop_service};
 use crate::db::AppDatabase;
@@ -432,7 +432,9 @@ async fn advance_implement(
         .iter()
         .find(|it| it.status == IterationStatus::Succeeded && it.attempt == task.attempt);
     if let Some(settled) = settled {
-        match finish_implement(db, issue, config, worktree_folder_id, task, settled.id).await? {
+        match finish_implement(db, emitter, issue, config, worktree_folder_id, task, settled.id)
+            .await?
+        {
             // Promoted to in_progress → re-tick to dispatch review.
             ImplementOutcome::Advanced => Ok(StepOutcome::Advanced),
             // Task (and possibly the issue) was blocked → re-tick: a blocked issue
@@ -488,6 +490,7 @@ async fn advance_implement(
 /// outcome decides advance / rework / block.
 async fn finish_implement(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     config: &IssueConfig,
     worktree_folder_id: i32,
@@ -503,14 +506,30 @@ async fn finish_implement(
     let message = format!("loop: implement #{} (issue #{})", task.id, issue.seq_no);
     match worktree::checkpoint(worktree_path, &message).await? {
         Some(_sha) => {
-            validate_after_implement(db, issue, config, worktree_path, task, iteration_id).await
+            validate_after_implement(db, emitter, issue, config, worktree_path, task, iteration_id)
+                .await
         }
         None => {
             // No diff to accept. Discard any stray uncommitted state and record a
             // no-progress rework; the breaker decides retry vs. block.
             worktree::reset_to_head(worktree_path).await?;
-            match record_rework(db, issue, config, task, Some(iteration_id), "empty_diff:implement")
-                .await?
+            // D11: the implement iteration's outcome is decided here at checkpoint.
+            loop_service::iteration::set_iteration_outcome(
+                &db.conn,
+                iteration_id,
+                IterationOutcome::EmptyDiff,
+            )
+            .await?;
+            match record_rework(
+                db,
+                emitter,
+                issue,
+                config,
+                task,
+                Some(iteration_id),
+                "empty_diff:implement",
+            )
+            .await?
             {
                 ReworkOutcome::Retry => Ok(ImplementOutcome::NoProgress),
                 ReworkOutcome::Blocked => Ok(ImplementOutcome::Blocked),
@@ -532,6 +551,7 @@ async fn finish_implement(
 /// `reset_to_head` only clears uncommitted side-effects.
 async fn validate_after_implement(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     config: &IssueConfig,
     worktree_path: &Path,
@@ -541,6 +561,13 @@ async fn validate_after_implement(
     let commands = &config.validation_commands;
     if commands.is_empty() {
         set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::InProgress).await?;
+        // No commands to run → the committed implement is the outcome (D11).
+        loop_service::iteration::set_iteration_outcome(
+            &db.conn,
+            iteration_id,
+            IterationOutcome::Succeeded,
+        )
+        .await?;
         return Ok(ImplementOutcome::Advanced);
     }
 
@@ -563,6 +590,13 @@ async fn validate_after_implement(
     match report.outcome {
         ValidationOutcome::Passed => {
             set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::InProgress).await?;
+            // Validation passed → the implement iteration succeeded (D11).
+            loop_service::iteration::set_iteration_outcome(
+                &db.conn,
+                iteration_id,
+                IterationOutcome::Succeeded,
+            )
+            .await?;
             Ok(ImplementOutcome::Advanced)
         }
         ValidationOutcome::Failed => {
@@ -572,7 +606,13 @@ async fn validate_after_implement(
                 "validation_failed:{}",
                 sig_hash(&format!("{:?}\n{}", report.exit_codes, report.output))
             );
-            match record_rework(db, issue, config, task, Some(iteration_id), &sig).await? {
+            loop_service::iteration::set_iteration_outcome(
+                &db.conn,
+                iteration_id,
+                IterationOutcome::ValidationFailed,
+            )
+            .await?;
+            match record_rework(db, emitter, issue, config, task, Some(iteration_id), &sig).await? {
                 ReworkOutcome::Retry => Ok(ImplementOutcome::NoProgress),
                 ReworkOutcome::Blocked => Ok(ImplementOutcome::Blocked),
             }
@@ -580,6 +620,15 @@ async fn validate_after_implement(
         ValidationOutcome::Unrunnable => {
             set_task_status_cas(db, task.id, ArtifactStatus::Pending, ArtifactStatus::Blocked)
                 .await?;
+            // The checkpoint ran but validation couldn't execute — the implement
+            // did not pass its gate, so record it (keeps the NULL invariant: a
+            // settled+checkpointed implement always has an outcome).
+            loop_service::iteration::set_iteration_outcome(
+                &db.conn,
+                iteration_id,
+                IterationOutcome::ValidationFailed,
+            )
+            .await?;
             // Block the issue too (consistent with the no-progress breaker's
             // `mark_blocked`), so the human `retry` escape hatch — which requires a
             // `blocked` issue — can reach this stall and re-arm the task. Without
@@ -588,7 +637,7 @@ async fn validate_after_implement(
             // dead end.
             cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked)
                 .await?;
-            loop_service::inbox::upsert_inbox(
+            let upsert = loop_service::inbox::upsert_inbox(
                 &db.conn,
                 issue.space_id,
                 issue.id,
@@ -603,6 +652,9 @@ async fn validate_after_implement(
                 }),
             )
             .await?;
+            if upsert.changed() {
+                emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+            }
             Ok(ImplementOutcome::Blocked)
         }
     }
@@ -745,6 +797,7 @@ enum ReworkOutcome {
 /// Returns [`ReworkOutcome::Retry`] otherwise.
 async fn record_rework(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     config: &IssueConfig,
     task: &LoopArtifactRow,
@@ -768,7 +821,7 @@ async fn record_rework(
         } else {
             "repeated_failure"
         };
-        mark_blocked(db, issue, task.id, iteration_id, reason, sig, attempt).await?;
+        mark_blocked(db, emitter, issue, task.id, iteration_id, reason, sig, attempt).await?;
         Ok(ReworkOutcome::Blocked)
     } else {
         Ok(ReworkOutcome::Retry)
@@ -782,6 +835,7 @@ async fn record_rework(
 #[allow(clippy::too_many_arguments)]
 async fn mark_blocked(
     db: &AppDatabase,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     task_id: i32,
     iteration_id: Option<i32>,
@@ -797,7 +851,7 @@ async fn mark_blocked(
     )
     .await?;
     cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
-    loop_service::inbox::upsert_inbox(
+    let upsert = loop_service::inbox::upsert_inbox(
         &db.conn,
         issue.space_id,
         issue.id,
@@ -812,6 +866,11 @@ async fn mark_blocked(
         }),
     )
     .await?;
+    // Surface the card live (D6): emit on a new/changed card, stay silent on a
+    // no-op recurrence so a parked breaker does not spam every tick.
+    if upsert.changed() {
+        emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+    }
     Ok(())
 }
 
@@ -1041,7 +1100,7 @@ async fn drive_reviews(
 async fn drive_review_outcome(
     db: &AppDatabase,
     spawner: &dyn LoopAgentSpawner,
-    _emitter: &EventEmitter,
+    emitter: &EventEmitter,
     issue: &loop_issue::Model,
     config: &IssueConfig,
     worktree_folder_id: i32,
@@ -1072,7 +1131,7 @@ async fn drive_review_outcome(
             let findings =
                 loop_service::artifact::latest_failed_review_findings(&db.conn, task.id).await?;
             let sig = format!("review_rejected:{}", sig_hash(&findings.join("\n---\n")));
-            match record_rework(db, issue, config, task, None, &sig).await? {
+            match record_rework(db, emitter, issue, config, task, None, &sig).await? {
                 ReworkOutcome::Retry => {
                     set_task_status_cas(
                         db,
@@ -1258,6 +1317,15 @@ async fn cancel_active_reviews(
                 .filter(loop_iteration::Column::Id.eq(it.id))
                 .exec(&db.conn)
                 .await?;
+            // D11: a cancelled losing reviewer is `abandoned`. Only after the CAS
+            // wins, and write-once anyway, so a stale call can never clobber a real
+            // outcome (Codex r2 C2).
+            loop_service::iteration::set_iteration_outcome(
+                &db.conn,
+                it.id,
+                IterationOutcome::Abandoned,
+            )
+            .await?;
             if let Some(conv_id) = it.conversation_id {
                 if let Some(conn_id) = spawner.find_loop_connection(conv_id).await {
                     spawner.disconnect_loop_agent(&conn_id).await;
@@ -1407,7 +1475,10 @@ pub(crate) async fn run_finalize(
             // the driver, which only triggers once `integration_passed` holds.
             IntegrationGate::Pass => {
                 if !config.auto_merge {
-                    loop_service::inbox::upsert_inbox(
+                    // First filing emits (the merge gate now needs a human); the
+                    // per-tick recurrence has an identical `{gate}` payload → merge
+                    // is a no-op → Unchanged → no event (no per-tick spam).
+                    let upsert = loop_service::inbox::upsert_inbox(
                         &db.conn,
                         issue.space_id,
                         issue.id,
@@ -1417,6 +1488,9 @@ pub(crate) async fn run_finalize(
                         serde_json::json!({ "v": 1, "gate": "merge" }),
                     )
                     .await?;
+                    if upsert.changed() {
+                        emit_changed(emitter, issue.space_id, issue.id, issue.id, "approval");
+                    }
                 }
                 Ok(StepOutcome::Idle)
             }
@@ -1439,7 +1513,7 @@ pub(crate) async fn run_finalize(
     // fault a human must resolve, not something an agent should build a result on.
     if !worktree::is_clean(worktree_path).await? {
         cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
-        loop_service::inbox::upsert_inbox(
+        let upsert = loop_service::inbox::upsert_inbox(
             &db.conn,
             issue.space_id,
             issue.id,
@@ -1449,6 +1523,9 @@ pub(crate) async fn run_finalize(
             serde_json::json!({ "reason": "worktree_dirty_before_finalize" }),
         )
         .await?;
+        if upsert.changed() {
+            emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+        }
         // Issue is now blocked → re-tick so the driver observes it and stops (a
         // human retry then respawns the driver).
         return Ok(StepOutcome::Advanced);
@@ -2403,11 +2480,33 @@ mod tests {
             .await
             .unwrap();
 
+        // C3 invariant: a settled implement before its checkpoint has NO outcome yet.
+        assert_eq!(
+            loop_iteration::Entity::find_by_id(iter_id)
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            None,
+            "implement outcome stays NULL until the checkpoint runs (C3)"
+        );
+
         // Tick 2: checkpoint finds nothing → rework bump + retry dispatch.
         assert_eq!(
             drive(&h).await,
             StepOutcome::Dispatched,
             "no-progress retries implement"
+        );
+        // D11: the checkpoint recorded the implement's outcome as empty_diff.
+        assert_eq!(
+            loop_iteration::Entity::find_by_id(iter_id)
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Some(IterationOutcome::EmptyDiff)
         );
         let node = task_node(&h, task).await;
         assert_eq!(node.attempt, 1, "rework counter bumped");
@@ -2467,6 +2566,16 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1, "one validation run recorded");
         assert!(runs[0].passed, "run passed");
+        // D11: a validated implement records `succeeded`.
+        assert_eq!(
+            loop_iteration::Entity::find_by_id(iter_id)
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Some(IterationOutcome::Succeeded)
+        );
     }
 
     /// Implement → checkpoint → validation fails → rework (attempt++, re-dispatch).
@@ -2510,6 +2619,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!runs[0].passed, "failing run recorded");
+        // D11: a failed-validation implement records `validation_failed`.
+        assert_eq!(
+            loop_iteration::Entity::find_by_id(iter_id)
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Some(IterationOutcome::ValidationFailed)
+        );
         // The retry is a fresh implement iteration at the new attempt.
         let running = loop_iteration::Entity::find()
             .filter(loop_iteration::Column::Stage.eq(Stage::Implement))

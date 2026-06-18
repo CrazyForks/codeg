@@ -46,6 +46,34 @@ pub enum IterationStatus {
     Cancelled,
 }
 
+/// Why an iteration ended (D11). Settlement/checkpoint write it once; `outcome`
+/// is then immutable (see `set_iteration_outcome`). A NULL outcome is legal — the
+/// run is still in flight, or it is a settled implement run before its checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum IterationOutcome {
+    /// A read-stage run that produced its artifact, or a validated implement.
+    #[sea_orm(string_value = "succeeded")]
+    Succeeded,
+    /// An implement run whose checkpoint found no file changes.
+    #[sea_orm(string_value = "empty_diff")]
+    EmptyDiff,
+    /// An implement run whose deterministic validation failed.
+    #[sea_orm(string_value = "validation_failed")]
+    ValidationFailed,
+    /// Written only in Phase C (agent-declared completion); enumerated now so the
+    /// CHECK/UI need no Phase-C edit.
+    #[sea_orm(string_value = "declared_complete")]
+    DeclaredComplete,
+    /// A read-stage run that settled without producing its expected artifact.
+    #[sea_orm(string_value = "no_artifacts")]
+    NoArtifacts,
+    /// Cancelled / failed / interrupted before settling a real outcome.
+    #[sea_orm(string_value = "abandoned")]
+    Abandoned,
+}
+
 /// Who launched the iteration. Engine-driven by default; `human` covers extra
 /// turns a person injects while observing. (Distinct from `ActorKind`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
@@ -89,6 +117,9 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub started_at: Option<DateTimeUtc>,
     pub ended_at: Option<DateTimeUtc>,
+    /// Why the run ended (D11). Write-once via `set_iteration_outcome`; NULL while
+    /// in flight or for a settled implement run awaiting its checkpoint.
+    pub outcome: Option<IterationOutcome>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

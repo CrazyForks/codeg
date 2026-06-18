@@ -34,6 +34,9 @@ pub fn to_issue_row(m: &loop_issue::Model) -> LoopIssueRow {
         route: m.route,
         token_used: m.token_used,
         token_budget: m.token_budget,
+        // Filled by `list_issues` from a batched aggregate (B2); 0 otherwise.
+        blocking_count: 0,
+        notice_count: 0,
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
@@ -177,11 +180,20 @@ pub async fn list_issues(
             query = query.filter(loop_issue::Column::Status.is_in(statuses));
         }
     }
-    Ok(query
-        .all(conn)
-        .await?
+    let models = query.all(conn).await?;
+    // D6: batch the per-issue pending-inbox attention in one query, no N+1.
+    let issue_ids: Vec<i32> = models.iter().map(|m| m.id).collect();
+    let attention = super::inbox::aggregate_for_issues(conn, &issue_ids).await?;
+    Ok(models
         .iter()
-        .map(to_issue_row)
+        .map(|m| {
+            let mut row = to_issue_row(m);
+            if let Some(&(blocking, notice)) = attention.get(&m.id) {
+                row.blocking_count = blocking;
+                row.notice_count = notice;
+            }
+            row
+        })
         .collect())
 }
 

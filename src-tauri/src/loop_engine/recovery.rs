@@ -52,6 +52,16 @@ pub(crate) async fn reconcile_on_boot(db: &AppDatabase) -> Result<Vec<i32>, Loop
             Expr::value(IterationStatus::Interrupted.to_value()),
         )
         .col_expr(loop_iteration::Column::EndedAt, Expr::value(Utc::now()))
+        // D11: an interrupted-by-restart iteration is `abandoned` — but COALESCE
+        // preserves any outcome already recorded, so the write-once invariant
+        // holds at the write itself (not merely via the active-status filter):
+        // a row that crashed after settling but before its status moved keeps its
+        // real outcome (Codex r1).
+        .col_expr(
+            loop_iteration::Column::Outcome,
+            Expr::col(loop_iteration::Column::Outcome)
+                .if_null(loop_iteration::IterationOutcome::Abandoned.to_value()),
+        )
         .filter(
             loop_iteration::Column::Status
                 .is_in([IterationStatus::Queued, IterationStatus::Running]),

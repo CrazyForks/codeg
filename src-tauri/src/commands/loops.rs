@@ -19,9 +19,9 @@ use crate::loop_engine::transitions::cas_issue_status;
 use crate::loop_engine::worktree;
 use std::path::Path;
 use crate::models::loops::{
-    IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopChanged, LoopDagView, LoopInboxItemRow,
-    LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary, LoopValidationRunRow,
-    LOOP_CHANGED_EVENT,
+    IssueConfig, LoopArtifactDetail, LoopArtifactRow, LoopAttention, LoopChanged, LoopDagView,
+    LoopInboxItemRow, LoopIssueDetail, LoopIterationRow, LoopMemoryRow, LoopSpaceSummary,
+    LoopValidationRunRow, LOOP_CHANGED_EVENT,
 };
 use crate::loop_engine::LoopEngine;
 use crate::web::event_bridge::{emit_event, EventEmitter};
@@ -496,6 +496,21 @@ pub async fn list_loop_inbox_core(
     Ok(inbox::list_inbox(conn, space_id, status).await?)
 }
 
+/// Cross-space pending-inbox attention rollup (D6/D7) — powers the always-visible
+/// "who needs me" sidebar badge. No args: it aggregates every space at once.
+pub async fn get_loop_attention_core(
+    conn: &DatabaseConnection,
+) -> Result<LoopAttention, AppCommandError> {
+    let per_space = inbox::aggregate_all(conn).await?;
+    let total_blocking = per_space.iter().map(|s| s.blocking).sum();
+    let total_notice = per_space.iter().map(|s| s.notice).sum();
+    Ok(LoopAttention {
+        total_blocking,
+        total_notice,
+        per_space,
+    })
+}
+
 /// Dismiss an informational inbox card (the reflect-exhausted notice, §4.4/D11):
 /// mark it handled so it leaves the pending pane. Blocking cards (approval /
 /// blocked / budget) are NOT dismissible here — they clear only via their gate
@@ -886,6 +901,14 @@ pub async fn list_loop_inbox(
     status: Option<InboxStatus>,
 ) -> Result<Vec<LoopInboxItemRow>, AppCommandError> {
     list_loop_inbox_core(&db.conn, space_id, status).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_loop_attention(
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<LoopAttention, AppCommandError> {
+    get_loop_attention_core(&db.conn).await
 }
 
 #[cfg(feature = "tauri-runtime")]
