@@ -3058,6 +3058,7 @@
       "loading": "جارٍ التحميل…",
       "noContent": "لا يوجد محتوى بعد.",
       "revisionCount": "{count, plural, one {# مراجعة} other {# مراجعات}}",
+      "noOpContribution": "بدون تغيير (no-op)",
       "contentHeading": "المحتوى",
       "criteriaHeading": "معايير القبول",
       "revisionsHeading": "سجل المراجعات",
@@ -3097,6 +3098,9 @@
       "retry": "إعادة المحاولة",
       "addBudget": "إضافة ميزانية",
       "stop": "إيقاف",
+      "forceComplete": "وضع علامة مكتمل (بدون تغيير)",
+      "overrideRetry": "إعادة التعيين وإعادة المحاولة",
+      "openSettings": "فتح الإعدادات",
       "addBudgetTitle": "إضافة ميزانية",
       "addBudgetPlaceholder": "رموز إضافية",
       "submitAddBudget": "إضافة",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "الأغلبية",
       "maxAttempts": "أقصى عدد محاولات لكل مهمة",
       "maxAttemptsHint": "0 = بلا حد",
+      "oscillationLimit": "حد التذبذب",
+      "oscillationLimitHint": "عدد تكرارات الفشل نفسه قبل أن يصبح الخروج اليدوي مطلوبًا. 0 = إيقاف",
       "autoMerge": "دمج النتيجة تلقائيًا",
       "autoMergeHint": "الدمج دون موافقة بشرية.",
       "forceRoute": "فرض المسار",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "كانت شجرة العمل تحتوي على تغييرات غير مُلتزمة قبل الإنهاء.",
       "noIntegrationCriteria": "لم تُحدَّد معايير التكامل.",
       "integrationGap": "استمر فشل التحقق من التكامل.",
-      "designRejected": "رُفض التصميم مرّات كثيرة."
+      "designRejected": "رُفض التصميم مرّات كثيرة.",
+      "oscillation": "يتكرر الفشل نفسه — الإعادة العادية لن تُجدي على الأرجح. ضع علامة \"مكتملة\" على المهمة أو أعد التعيين وأجبر إعادة المحاولة."
     },
     "memoryKind": {
       "constitution": "دستور",

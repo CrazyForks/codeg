@@ -3058,6 +3058,7 @@
       "loading": "加载中…",
       "noContent": "暂无内容。",
       "revisionCount": "{count, plural, other {# 次修订}}",
+      "noOpContribution": "空操作（无改动）",
       "contentHeading": "内容",
       "criteriaHeading": "验收标准",
       "revisionsHeading": "修订历史",
@@ -3097,6 +3098,9 @@
       "retry": "重试",
       "addBudget": "追加预算",
       "stop": "停止",
+      "forceComplete": "标记完成（空操作）",
+      "overrideRetry": "重置并强制重试",
+      "openSettings": "打开设置",
       "addBudgetTitle": "追加预算",
       "addBudgetPlaceholder": "追加的 tokens 数",
       "submitAddBudget": "追加",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "多数通过",
       "maxAttempts": "每个任务最大尝试次数",
       "maxAttemptsHint": "0 = 不限",
+      "oscillationLimit": "震荡上限",
+      "oscillationLimitHint": "同一错误重复多少次后需人工干预退出。0 = 关闭",
       "autoMerge": "自动合并成果",
       "autoMergeHint": "无需人工批准即合并。",
       "forceRoute": "强制路线",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "终结前工作树存在未提交的改动。",
       "noIntegrationCriteria": "未定义集成准则。",
       "integrationGap": "集成校验持续失败。",
-      "designRejected": "设计被拒绝次数过多。"
+      "designRejected": "设计被拒绝次数过多。",
+      "oscillation": "同一错误反复出现——普通重试可能无效。请将任务标记为完成，或重置并强制重试。"
     },
     "memoryKind": {
       "constitution": "章程",

@@ -3058,6 +3058,7 @@
       "loading": "Carregando…",
       "noContent": "Ainda não há conteúdo.",
       "revisionCount": "{count, plural, one {# revisão} other {# revisões}}",
+      "noOpContribution": "no-op (sem alterações)",
       "contentHeading": "Conteúdo",
       "criteriaHeading": "Critérios de aceitação",
       "revisionsHeading": "Histórico de revisões",
@@ -3097,6 +3098,9 @@
       "retry": "Tentar novamente",
       "addBudget": "Adicionar orçamento",
       "stop": "Parar",
+      "forceComplete": "Marcar como concluída (no-op)",
+      "overrideRetry": "Redefinir e tentar novamente",
+      "openSettings": "Abrir configurações",
       "addBudgetTitle": "Adicionar orçamento",
       "addBudgetPlaceholder": "Tokens adicionais",
       "submitAddBudget": "Adicionar",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "Maioria",
       "maxAttempts": "Máx. de tentativas por tarefa",
       "maxAttemptsHint": "0 = ilimitado",
+      "oscillationLimit": "Limite de oscilação",
+      "oscillationLimitHint": "Repetições da mesma falha antes de exigir uma saída manual. 0 = desativado",
       "autoMerge": "Mesclar resultado automaticamente",
       "autoMergeHint": "Mesclar sem aprovação humana.",
       "forceRoute": "Forçar rota",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "A árvore de trabalho tinha alterações não confirmadas antes de finalizar.",
       "noIntegrationCriteria": "Nenhum critério de integração foi definido.",
       "integrationGap": "A verificação de integração continuou falhando.",
-      "designRejected": "O design foi rejeitado vezes demais."
+      "designRejected": "O design foi rejeitado vezes demais.",
+      "oscillation": "A mesma falha se repete — uma nova tentativa simples provavelmente não ajudará. Marque a tarefa como concluída ou redefina e force uma nova tentativa."
     },
     "memoryKind": {
       "constitution": "Constituição",

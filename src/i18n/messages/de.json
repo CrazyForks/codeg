@@ -3058,6 +3058,7 @@
       "loading": "Wird geladen…",
       "noContent": "Noch kein Inhalt.",
       "revisionCount": "{count, plural, one {# Revision} other {# Revisionen}}",
+      "noOpContribution": "No-Op (keine Änderung)",
       "contentHeading": "Inhalt",
       "criteriaHeading": "Akzeptanzkriterien",
       "revisionsHeading": "Revisionsverlauf",
@@ -3097,6 +3098,9 @@
       "retry": "Wiederholen",
       "addBudget": "Budget erhöhen",
       "stop": "Stoppen",
+      "forceComplete": "Als erledigt markieren (No-Op)",
+      "overrideRetry": "Zurücksetzen & erneut versuchen",
+      "openSettings": "Einstellungen öffnen",
       "addBudgetTitle": "Budget erhöhen",
       "addBudgetPlaceholder": "Zusätzliche Tokens",
       "submitAddBudget": "Hinzufügen",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "Mehrheit",
       "maxAttempts": "Maximale Versuche pro Aufgabe",
       "maxAttemptsHint": "0 = unbegrenzt",
+      "oscillationLimit": "Oszillationslimit",
+      "oscillationLimitHint": "Wiederholungen desselben Fehlers, bevor ein manueller Abbruch erforderlich ist. 0 = aus",
       "autoMerge": "Ergebnis automatisch zusammenführen",
       "autoMergeHint": "Ohne menschliche Freigabe zusammenführen.",
       "forceRoute": "Route erzwingen",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "Der Arbeitsbaum hatte vor dem Abschluss nicht committete Änderungen.",
       "noIntegrationCriteria": "Es wurden keine Integrationskriterien definiert.",
       "integrationGap": "Die Integrationsprüfung schlug wiederholt fehl.",
-      "designRejected": "Der Entwurf wurde zu oft abgelehnt."
+      "designRejected": "Der Entwurf wurde zu oft abgelehnt.",
+      "oscillation": "Derselbe Fehler tritt wiederholt auf – ein normaler Wiederholungsversuch hilft wahrscheinlich nicht. Markiere die Aufgabe als erledigt oder setze sie zurück und erzwinge einen erneuten Versuch."
     },
     "memoryKind": {
       "constitution": "Verfassung",

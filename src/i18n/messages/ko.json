@@ -3058,6 +3058,7 @@
       "loading": "불러오는 중…",
       "noContent": "아직 내용이 없습니다.",
       "revisionCount": "{count, plural, other {리비전 #개}}",
+      "noOpContribution": "변경 없음(no-op)",
       "contentHeading": "내용",
       "criteriaHeading": "수용 기준",
       "revisionsHeading": "수정 이력",
@@ -3097,6 +3098,9 @@
       "retry": "재시도",
       "addBudget": "예산 추가",
       "stop": "중지",
+      "forceComplete": "완료로 표시(변경 없음)",
+      "overrideRetry": "초기화 후 강제 재시도",
+      "openSettings": "설정 열기",
       "addBudgetTitle": "예산 추가",
       "addBudgetPlaceholder": "추가 토큰 수",
       "submitAddBudget": "추가",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "다수결",
       "maxAttempts": "작업당 최대 시도 횟수",
       "maxAttemptsHint": "0 = 무제한",
+      "oscillationLimit": "진동 한도",
+      "oscillationLimitHint": "동일한 실패가 반복되어 수동 종료가 필요해지기까지의 횟수입니다. 0 = 끄기",
       "autoMerge": "결과 자동 병합",
       "autoMergeHint": "사람 승인 없이 병합합니다.",
       "forceRoute": "경로 강제",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "완료 전 작업 트리에 커밋되지 않은 변경이 있었습니다.",
       "noIntegrationCriteria": "통합 기준이 정의되지 않았습니다.",
       "integrationGap": "통합 검증이 계속 실패했습니다.",
-      "designRejected": "설계가 너무 여러 번 거부되었습니다."
+      "designRejected": "설계가 너무 여러 번 거부되었습니다.",
+      "oscillation": "같은 실패가 계속 반복됩니다. 일반 재시도로는 해결되지 않을 수 있습니다. 작업을 완료로 표시하거나 초기화 후 강제 재시도하세요."
     },
     "memoryKind": {
       "constitution": "헌장",

@@ -3058,6 +3058,7 @@
       "loading": "載入中…",
       "noContent": "暫無內容。",
       "revisionCount": "{count, plural, other {# 次修訂}}",
+      "noOpContribution": "空操作（無變更）",
       "contentHeading": "內容",
       "criteriaHeading": "驗收標準",
       "revisionsHeading": "修訂歷史",
@@ -3097,6 +3098,9 @@
       "retry": "重試",
       "addBudget": "追加預算",
       "stop": "停止",
+      "forceComplete": "標記完成（空操作）",
+      "overrideRetry": "重置並強制重試",
+      "openSettings": "開啟設定",
       "addBudgetTitle": "追加預算",
       "addBudgetPlaceholder": "追加的 tokens 數",
       "submitAddBudget": "追加",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "多數通過",
       "maxAttempts": "每個任務最大嘗試次數",
       "maxAttemptsHint": "0 = 不限",
+      "oscillationLimit": "震盪上限",
+      "oscillationLimitHint": "同一錯誤重複多少次後需人工介入退出。0 = 關閉",
       "autoMerge": "自動合併成果",
       "autoMergeHint": "無需人工核准即合併。",
       "forceRoute": "強制路線",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "完成前工作樹存在未提交的變更。",
       "noIntegrationCriteria": "未定義整合準則。",
       "integrationGap": "整合驗證持續失敗。",
-      "designRejected": "設計被拒絕次數過多。"
+      "designRejected": "設計被拒絕次數過多。",
+      "oscillation": "同一錯誤反覆出現——一般重試可能無效。請將任務標記為完成，或重置並強制重試。"
     },
     "memoryKind": {
       "constitution": "章程",

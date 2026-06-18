@@ -3058,6 +3058,7 @@
       "loading": "読み込み中…",
       "noContent": "まだ内容がありません。",
       "revisionCount": "{count, plural, other {# 件のリビジョン}}",
+      "noOpContribution": "変更なし（no-op）",
       "contentHeading": "内容",
       "criteriaHeading": "受け入れ基準",
       "revisionsHeading": "改訂履歴",
@@ -3097,6 +3098,9 @@
       "retry": "再試行",
       "addBudget": "予算を追加",
       "stop": "停止",
+      "forceComplete": "完了にする（変更なし）",
+      "overrideRetry": "リセットして再試行",
+      "openSettings": "設定を開く",
       "addBudgetTitle": "予算を追加",
       "addBudgetPlaceholder": "追加するトークン数",
       "submitAddBudget": "追加",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "過半数",
       "maxAttempts": "タスクごとの最大試行回数",
       "maxAttemptsHint": "0 = 無制限",
+      "oscillationLimit": "振動上限",
+      "oscillationLimitHint": "同じ失敗が繰り返された場合に手動での終了が必要になるまでの回数。0 = 無効",
       "autoMerge": "結果を自動マージ",
       "autoMergeHint": "人間の承認なしでマージします。",
       "forceRoute": "ルートを強制",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "ファイナライズ前にワークツリーに未コミットの変更がありました。",
       "noIntegrationCriteria": "統合基準が定義されていませんでした。",
       "integrationGap": "統合検証が失敗し続けました。",
-      "designRejected": "設計が何度も却下されました。"
+      "designRejected": "設計が何度も却下されました。",
+      "oscillation": "同じ失敗が繰り返し発生しています。通常の再試行では解決しない可能性があります。タスクを完了にするか、リセットして再試行してください。"
     },
     "memoryKind": {
       "constitution": "憲章",

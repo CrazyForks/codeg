@@ -3058,6 +3058,7 @@
       "loading": "Chargement…",
       "noContent": "Aucun contenu pour le moment.",
       "revisionCount": "{count, plural, one {# révision} other {# révisions}}",
+      "noOpContribution": "no-op (aucune modification)",
       "contentHeading": "Contenu",
       "criteriaHeading": "Critères d'acceptation",
       "revisionsHeading": "Historique des révisions",
@@ -3097,6 +3098,9 @@
       "retry": "Réessayer",
       "addBudget": "Ajouter du budget",
       "stop": "Arrêter",
+      "forceComplete": "Marquer comme terminé (no-op)",
+      "overrideRetry": "Réinitialiser et réessayer",
+      "openSettings": "Ouvrir les paramètres",
       "addBudgetTitle": "Ajouter du budget",
       "addBudgetPlaceholder": "Jetons supplémentaires",
       "submitAddBudget": "Ajouter",
@@ -3138,6 +3142,8 @@
       "ruleMajority": "Majorité",
       "maxAttempts": "Tentatives max par tâche",
       "maxAttemptsHint": "0 = illimité",
+      "oscillationLimit": "Limite d'oscillation",
+      "oscillationLimitHint": "Répétitions de la même erreur avant qu'une sortie manuelle soit requise. 0 = désactivé",
       "autoMerge": "Fusionner le résultat automatiquement",
       "autoMergeHint": "Fusionner sans approbation humaine.",
       "forceRoute": "Forcer l'itinéraire",
@@ -3195,7 +3201,8 @@
       "worktreeDirty": "L'arbre de travail comportait des modifications non validées avant la finalisation.",
       "noIntegrationCriteria": "Aucun critère d'intégration n'a été défini.",
       "integrationGap": "La vérification d'intégration a continué d'échouer.",
-      "designRejected": "La conception a été rejetée trop de fois."
+      "designRejected": "La conception a été rejetée trop de fois.",
+      "oscillation": "La même erreur se répète — une simple relance ne suffira probablement pas. Marquez la tâche comme terminée ou réinitialisez et forcez une relance."
     },
     "memoryKind": {
       "constitution": "Constitution",
