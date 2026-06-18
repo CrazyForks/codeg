@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::agent::AgentType;
-use crate::db::entities::loop_artifact::{ArtifactKind, ArtifactStatus, ReviewVerdict};
+use crate::db::entities::loop_artifact::{
+    ArtifactKind, ArtifactStatus, ContributionKind, ReviewVerdict,
+};
 use crate::db::entities::loop_artifact_revision::ActorKind;
 use crate::db::entities::loop_criterion::CriterionKind;
 use crate::db::entities::loop_criterion_check::CheckVerdict;
@@ -109,6 +111,12 @@ impl StageAgents {
     }
 }
 
+/// Serde default for [`IssueConfig::oscillation_limit`] (D14). Tolerates older
+/// stored configs that predate the field, and is the baseline when none is set.
+fn default_oscillation_limit() -> u32 {
+    2
+}
+
 /// Per-issue Loop Contract knobs (stored JSON-encoded in `loop_issue.config`,
 /// or in `loop_space.default_config` for the space default).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +134,13 @@ pub struct IssueConfig {
     pub review_pass_rule: ReviewPassRule,
     /// Node rework cap before the no-progress breaker trips.
     pub max_attempts: u32,
+    /// D14: consecutive same-signature blocked epochs before a task is promoted
+    /// from an ordinary retryable `no_progress` card to an `oscillation` card (a
+    /// deterministic failure plain retry can't fix — needs an explicit human exit).
+    /// `0` = off (no oscillation breaker), honoring "no artificial limits". Defaults
+    /// to 2; `#[serde(default)]` keeps configs stored before this field readable.
+    #[serde(default = "default_oscillation_limit")]
+    pub oscillation_limit: u32,
     /// When false (default), result merge requires human approval.
     pub auto_merge: bool,
     /// Human override of the triage-decided route, if any.
@@ -165,6 +180,7 @@ impl Default for IssueConfig {
             reviewers: vec![ReviewerEntry::Inherit(ReviewerInherit { inherit: true })],
             review_pass_rule: ReviewPassRule::Unanimous,
             max_attempts: 6,
+            oscillation_limit: 2,
             auto_merge: false,
             force_route: None,
             iteration_timeout_secs: None,
@@ -283,6 +299,8 @@ pub struct LoopArtifactRow {
     pub produced_by_iteration_id: Option<i32>,
     pub verdict: Option<ReviewVerdict>,
     pub attempt: i32,
+    /// D12: delta vs agent-declared no-op for a Done task (drives the drawer badge).
+    pub contribution_kind: ContributionKind,
     pub sort: i32,
     pub updated_at: DateTime<Utc>,
 }

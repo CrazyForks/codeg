@@ -22,9 +22,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chrono::Utc;
+use regex::Regex;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -49,7 +51,8 @@ use crate::loop_engine::dispatch::{
 use crate::loop_engine::driver::resolve_agent_spec;
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::transitions::{
-    cas_artifact_status, cas_issue_status, cas_iteration_status, cas_task_done_with_freeze,
+    self, cas_artifact_status, cas_issue_status, cas_iteration_status,
+    cas_task_done_with_contribution, TaskContribution,
 };
 use crate::loop_engine::validation::{self, ValidationOutcome};
 use crate::loop_engine::worktree;
@@ -510,29 +513,54 @@ async fn finish_implement(
                 .await
         }
         None => {
-            // No diff to accept. Discard any stray uncommitted state and record a
-            // no-progress rework; the breaker decides retry vs. block.
+            // No diff to accept. Discard any stray uncommitted state either way.
             worktree::reset_to_head(worktree_path).await?;
-            // D11: the implement iteration's outcome is decided here at checkpoint.
-            loop_service::iteration::set_iteration_outcome(
-                &db.conn,
-                iteration_id,
-                IterationOutcome::EmptyDiff,
-            )
-            .await?;
-            match record_rework(
-                db,
-                emitter,
-                issue,
-                config,
-                task,
-                Some(iteration_id),
-                "empty_diff:implement",
-            )
-            .await?
-            {
-                ReworkOutcome::Retry => Ok(ImplementOutcome::NoProgress),
-                ReworkOutcome::Blocked => Ok(ImplementOutcome::Blocked),
+            // D12: did the agent explicitly declare the task already satisfied
+            // (loop_task_complete)? If so this empty result is intentional — route
+            // to review (the review gate still verifies the criteria against HEAD),
+            // NOT a no-progress rework.
+            let declared = loop_service::iteration::get_iteration(&db.conn, iteration_id)
+                .await?
+                .and_then(|it| it.agent_completion_reason)
+                .filter(|r| !r.trim().is_empty());
+            if declared.is_some() {
+                set_task_status_cas(
+                    db,
+                    task.id,
+                    ArtifactStatus::Pending,
+                    ArtifactStatus::InProgress,
+                )
+                .await?;
+                loop_service::iteration::set_iteration_outcome(
+                    &db.conn,
+                    iteration_id,
+                    IterationOutcome::DeclaredComplete,
+                )
+                .await?;
+                Ok(ImplementOutcome::Advanced)
+            } else {
+                // D11: a genuine empty diff is no progress; record it and let the
+                // breaker decide retry vs. block.
+                loop_service::iteration::set_iteration_outcome(
+                    &db.conn,
+                    iteration_id,
+                    IterationOutcome::EmptyDiff,
+                )
+                .await?;
+                match record_rework(
+                    db,
+                    emitter,
+                    issue,
+                    config,
+                    task,
+                    Some(iteration_id),
+                    "empty_diff:implement",
+                )
+                .await?
+                {
+                    ReworkOutcome::Retry => Ok(ImplementOutcome::NoProgress),
+                    ReworkOutcome::Blocked => Ok(ImplementOutcome::Blocked),
+                }
             }
         }
     }
@@ -568,6 +596,8 @@ async fn validate_after_implement(
             IterationOutcome::Succeeded,
         )
         .await?;
+        // D14: a committed checkpoint advancing to review is real forward progress.
+        transitions::clear_oscillation(&db.conn, task.id).await?;
         return Ok(ImplementOutcome::Advanced);
     }
 
@@ -597,6 +627,8 @@ async fn validate_after_implement(
                 IterationOutcome::Succeeded,
             )
             .await?;
+            // D14: passing validation is real forward progress on the task.
+            transitions::clear_oscillation(&db.conn, task.id).await?;
             Ok(ImplementOutcome::Advanced)
         }
         ValidationOutcome::Failed => {
@@ -604,7 +636,11 @@ async fn validate_after_implement(
             // again" from a genuinely new one.
             let sig = format!(
                 "validation_failed:{}",
-                sig_hash(&format!("{:?}\n{}", report.exit_codes, report.output))
+                sig_hash(&format!(
+                    "{:?}\n{}",
+                    report.exit_codes,
+                    normalize_failure_output(&report.output)
+                ))
             );
             loop_service::iteration::set_iteration_outcome(
                 &db.conn,
@@ -742,19 +778,43 @@ async fn set_task_status_cas(
 
 /// Read the task's accepted tip — HEAD of the worktree it ran in (the task branch
 /// in parallel mode, the issue branch in serial mode) — and atomically mark the
-/// task `Done` while freezing that commit as its `fan_in_commit`. The single CAS
-/// (see [`cas_task_done_with_freeze`]) guarantees no "Done but unfrozen" window
-/// the fan-in could observe. Returns whether the CAS applied.
+/// task `Done` with its contribution kind (D12). In parallel mode the kind is
+/// `NoOp` when HEAD == the pinned integration base (the agent declared the task
+/// already satisfied; no commit) and `Delta` otherwise (freezing HEAD as
+/// `fan_in_commit`); serial tasks always record `Delta` (the column is unused for
+/// serial fan-in). The single CAS guarantees no "Done but unfrozen" window the
+/// fan-in could observe. On Done, clears the task's oscillation epoch (D14).
+/// Returns whether the CAS applied.
 async fn freeze_and_done(
     db: &AppDatabase,
+    issue: &loop_issue::Model,
     worktree_folder_id: i32,
     task_id: i32,
 ) -> Result<bool, LoopError> {
     let folder = folder_service::get_folder_by_id(&db.conn, worktree_folder_id)
         .await?
         .ok_or_else(|| LoopError::NotFound(format!("worktree folder {worktree_folder_id}")))?;
-    let sha = worktree::head_commit(Path::new(&folder.path)).await?;
-    cas_task_done_with_freeze(&db.conn, task_id, &sha).await
+    let head = worktree::head_commit(Path::new(&folder.path)).await?;
+    // Base stability holds because the parallel fan-in runs strictly after ALL
+    // tasks are Done (the run_finalize gate): at this task's done the issue tip is
+    // unmoved and every predecessor's frozen commit is fixed, so re-resolving the
+    // base here matches what `ensure_task_worktree` branched from.
+    let contribution = if issue.execution_mode.as_deref() == Some("parallel") {
+        let base = worktree::task_base_oid(&db.conn, issue, task_id).await?;
+        if head == base {
+            TaskContribution::NoOp
+        } else {
+            TaskContribution::Delta(head)
+        }
+    } else {
+        TaskContribution::Delta(head)
+    };
+    let applied = cas_task_done_with_contribution(&db.conn, task_id, contribution).await?;
+    if applied {
+        // D14: reaching Done is real forward progress — clear the oscillation epoch.
+        transitions::clear_oscillation(&db.conn, task_id).await?;
+    }
+    Ok(applied)
 }
 
 async fn bump_rework(db: &AppDatabase, task_id: i32, sig: &str) -> Result<(), LoopError> {
@@ -821,7 +881,8 @@ async fn record_rework(
         } else {
             "repeated_failure"
         };
-        mark_blocked(db, emitter, issue, task.id, iteration_id, reason, sig, attempt).await?;
+        mark_blocked(db, emitter, issue, config, task.id, iteration_id, reason, sig, attempt)
+            .await?;
         Ok(ReworkOutcome::Blocked)
     } else {
         Ok(ReworkOutcome::Retry)
@@ -830,20 +891,27 @@ async fn record_rework(
 
 /// Block a stalled node: set the task `blocked`, CAS the issue `running →
 /// blocked` (so the driver stops on its next tick), and file a `blocked` inbox
-/// card keyed on the task (deduped on `no_progress:{task}`). A human resolves it
-/// via the inbox (M2.2 Task 2.7).
+/// card keyed on the task. D14: when the same failure recurs across enough block
+/// epochs (`oscillation_limit`), promote the ordinary `no_progress` card to an
+/// `oscillation` card — a deterministic failure a plain retry can't fix, needing
+/// an explicit human exit. A human resolves it via the inbox.
 #[allow(clippy::too_many_arguments)]
 async fn mark_blocked(
     db: &AppDatabase,
     emitter: &EventEmitter,
     issue: &loop_issue::Model,
+    config: &IssueConfig,
     task_id: i32,
     iteration_id: Option<i32>,
     reason: &str,
     sig: &str,
     attempt: i32,
 ) -> Result<(), LoopError> {
-    crate::loop_engine::transitions::cas_artifact_status_from(
+    // Whether THIS call actually blocked the node — a genuine new block epoch. An
+    // idempotent replay (task already blocked) must NOT inflate the oscillation
+    // count. The issue CAS is independent (it may miss when a sibling already
+    // blocked the issue) and must NOT gate the task's own epoch.
+    let blocked_now = crate::loop_engine::transitions::cas_artifact_status_from(
         &db.conn,
         task_id,
         &[ArtifactStatus::Pending, ArtifactStatus::InProgress],
@@ -851,6 +919,60 @@ async fn mark_blocked(
     )
     .await?;
     cas_issue_status(&db.conn, issue.id, IssueStatus::Running, IssueStatus::Blocked).await?;
+
+    // D14: step the epoch only on a genuine new block; on a replay read the
+    // existing count without stepping.
+    let limit = config.oscillation_limit as i32;
+    let osc = if blocked_now {
+        transitions::step_oscillation(&db.conn, task_id, sig).await?
+    } else {
+        loop_artifact::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await?
+            .map(|m| m.oscillation_count)
+            .unwrap_or(0)
+    };
+
+    if limit > 0 && osc >= limit {
+        // Deterministic failure → promote. Upsert the oscillation card FIRST so a
+        // crash before the resolve still leaves an actionable card (never zero
+        // cards); a stale `no_progress` card briefly coexisting is harmless — retry
+        // exclusion keys on the artifact's `oscillation_count`, not on the card.
+        let upsert = loop_service::inbox::upsert_inbox(
+            &db.conn,
+            issue.space_id,
+            issue.id,
+            iteration_id,
+            InboxKind::Blocked,
+            &format!("oscillation:{task_id}"),
+            serde_json::json!({
+                "task_artifact_id": task_id,
+                "reason": "oscillation",
+                "failure_sig": sig,
+                "count": osc,
+                "attempt": attempt,
+            }),
+        )
+        .await?;
+        if upsert.changed() {
+            emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+        }
+        // Supersede the ordinary task-level blocker cards (NOT `oscillation:`, which
+        // clears only via override / force-complete).
+        loop_service::inbox::resolve_task_blocker_cards(
+            &db.conn,
+            issue.id,
+            task_id,
+            &["no_progress", "validation_blocked", "infra_failure"],
+            serde_json::json!({ "action": "superseded_by_oscillation" }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Below the limit (or limit=0, breaker off): ordinary retryable no_progress
+    // card. Surface it live (D6): emit on a new/changed card, stay silent on a
+    // no-op recurrence so a parked breaker does not spam every tick.
     let upsert = loop_service::inbox::upsert_inbox(
         &db.conn,
         issue.space_id,
@@ -866,8 +988,6 @@ async fn mark_blocked(
         }),
     )
     .await?;
-    // Surface the card live (D6): emit on a new/changed card, stay silent on a
-    // no-op recurrence so a parked breaker does not spam every tick.
     if upsert.changed() {
         emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
     }
@@ -908,6 +1028,49 @@ async fn block_task_infra(
     .await?;
     emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
     Ok(())
+}
+
+/// ISO-8601 timestamps (`2026-06-18T12:34:56.789Z`, with or without fractional
+/// seconds / timezone) — differ run-to-run for the same failure.
+static TS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?").unwrap()
+});
+/// Absolute / temp / worktree paths (each run gets a fresh temp dir, so the path
+/// segment that follows `tmp`/`temp`/`loop-worktrees`/`var/folders` is volatile).
+static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(/[\w.\-]+)*/(tmp|temp|loop-worktrees|var/folders)/[\w./\-]+").unwrap()
+});
+/// Full-length git object ids (40 hex = SHA-1, 64 hex = SHA-256). Deliberately
+/// NOT 7–39 char hex: those collide with real, distinguishing failure content —
+/// asserted addresses, expected/got hashes, generated ids — that must stay
+/// distinct so two genuinely different failures keep different signatures.
+static OID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b|\b[0-9a-f]{64}\b").unwrap());
+/// Elapsed-time tokens (`12ms`, `1.3s`, `400µs`, `7ns`).
+static DUR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d+(\.\d+)?(ms|s|µs|ns)\b").unwrap());
+
+/// Strip volatile substrings from validation output before fingerprinting, so the
+/// oscillation breaker (D14) can recognise "the same failure again" across
+/// retries. Removes ISO timestamps, absolute/temp/worktree paths, full-length git
+/// oids, and durations — the parts that differ run-to-run for an otherwise
+/// identical failure — while leaving the failure's distinguishing content (error
+/// messages, assertion expected/got values, short hex) untouched, so genuinely
+/// different failures still hash differently. Operates line-by-line and trims
+/// trailing whitespace (another run-to-run wobble).
+fn normalize_failure_output(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        // Order matters: paths before oids so a temp dir's hex tail goes with the
+        // path rather than being independently rewritten.
+        let l = TS_RE.replace_all(line, "<ts>");
+        let l = TMP_PATH_RE.replace_all(&l, "<path>");
+        let l = OID_RE.replace_all(&l, "<oid>");
+        let l = DUR_RE.replace_all(&l, "<dur>");
+        out.push_str(l.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// Stable 64-bit FNV-1a fingerprint (hex) of a failure's specifics, so the
@@ -1111,7 +1274,7 @@ async fn drive_review_outcome(
     match outcome {
         GateOutcome::Pass => {
             cancel_active_reviews(db, spawner, iters).await?;
-            if freeze_and_done(db, worktree_folder_id, task.id).await? {
+            if freeze_and_done(db, issue, worktree_folder_id, task.id).await? {
                 Ok(StepOutcome::Advanced)
             } else {
                 Ok(StepOutcome::Idle)
@@ -1119,6 +1282,10 @@ async fn drive_review_outcome(
         }
         GateOutcome::Fail => {
             cancel_active_reviews(db, spawner, iters).await?;
+            // D12: review rejected — drop any declared-completion claim for this
+            // task so the next empty implement attempt is treated as genuine
+            // no-progress, not silently routed back to review on a stale claim.
+            loop_service::iteration::clear_declared_completion(&db.conn, issue.id, task.id).await?;
             // Defensive: clear any reviewer side-effects before re-implementing.
             let folder = folder_service::get_folder_by_id(&db.conn, worktree_folder_id)
                 .await?
@@ -1828,6 +1995,54 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command as StdCommand;
 
+    /// Build the validation signature the way `validate_after_implement` does, so
+    /// the tests exercise the real fingerprint pipeline (normalize → hash).
+    fn validation_sig(exit_codes: &[i32], output: &str) -> String {
+        format!(
+            "validation_failed:{}",
+            sig_hash(&format!(
+                "{exit_codes:?}\n{}",
+                normalize_failure_output(output)
+            ))
+        )
+    }
+
+    #[test]
+    fn normalize_collapses_volatile_substrings_to_one_sig() {
+        // Two runs of the SAME failure: only timestamp, temp/worktree path, full
+        // git oid, and duration differ. They must fingerprint identically (D14 —
+        // otherwise the oscillation breaker never recognises a repeat).
+        let run_a = "\
+2026-06-18T12:34:56.789Z FAIL tests::auth at /var/folders/xy/abc123/loop-worktrees/issue-1/src/auth.rs
+assertion failed: expected Ok got Err at commit 0123456789abcdef0123456789abcdef01234567
+test result: FAILED. 1 failed in 12.4s";
+        let run_b = "\
+2026-06-19T01:02:03Z FAIL tests::auth at /var/folders/zz/def999/loop-worktrees/issue-1/src/auth.rs
+assertion failed: expected Ok got Err at commit fedcba9876543210fedcba9876543210fedcba98
+test result: FAILED. 1 failed in 0.9s";
+        assert_eq!(
+            validation_sig(&[1], run_a),
+            validation_sig(&[1], run_b),
+            "same failure with only volatile parts differing must share a sig"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_genuinely_different_failures_distinct() {
+        let base = "assertion failed at tests::math\nexpected 0xdeadbeef got 0xcafef00d";
+        // Different exit code → different sig.
+        assert_ne!(validation_sig(&[1], base), validation_sig(&[2], base));
+        // Different assertion expected/got values (short hex must NOT be stripped).
+        let other_values = "assertion failed at tests::math\nexpected 0x12345678 got 0x000000ff";
+        assert_ne!(validation_sig(&[1], base), validation_sig(&[1], other_values));
+        // Different error message.
+        let other_msg = "panic: index out of bounds\nexpected 0xdeadbeef got 0xcafef00d";
+        assert_ne!(validation_sig(&[1], base), validation_sig(&[1], other_msg));
+        // Different test name.
+        let other_test = "assertion failed at tests::geometry\nexpected 0xdeadbeef got 0xcafef00d";
+        assert_ne!(validation_sig(&[1], base), validation_sig(&[1], other_test));
+    }
+
     /// Minimal spawner: the "agent" is simulated by the test mutating the
     /// worktree directly, so the stub only needs to hand back a connection id.
     struct StubSpawner;
@@ -2050,6 +2265,7 @@ mod tests {
             produced_by_iteration_id: None,
             verdict: None,
             attempt: 0,
+            contribution_kind: loop_artifact::ContributionKind::Delta,
             sort: id,
             updated_at: Utc::now(),
         }
@@ -2193,9 +2409,13 @@ mod tests {
         cas_artifact_status(&h.db.conn, a, ArtifactStatus::Pending, ArtifactStatus::InProgress)
             .await
             .unwrap();
-        crate::loop_engine::transitions::cas_task_done_with_freeze(&h.db.conn, a, &"dead".repeat(10))
-            .await
-            .unwrap();
+        crate::loop_engine::transitions::cas_task_done_with_contribution(
+            &h.db.conn,
+            a,
+            crate::loop_engine::transitions::TaskContribution::Delta("dead".repeat(10)),
+        )
+        .await
+        .unwrap();
         assert_eq!(task_node(&h, a).await.status, ArtifactStatus::Done);
 
         let mut retries: HashMap<i32, u32> = HashMap::new();
@@ -2524,6 +2744,160 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(running.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn implement_declared_complete_routes_to_review_without_rework() {
+        let h = setup().await;
+        let task = add_task(&h, "Task 1").await;
+
+        assert_eq!(drive(&h).await, StepOutcome::Dispatched);
+        let iter_id = running_implement_id(&h).await;
+        // Agent makes NO change but declares the task already satisfied (D12).
+        settle_iteration(&h.db, &EventEmitter::Noop, iter_id)
+            .await
+            .unwrap();
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::AgentCompletionReason,
+                Expr::value("dependency #2 already delivered this"),
+            )
+            .filter(loop_iteration::Column::Id.eq(iter_id))
+            .exec(&h.db.conn)
+            .await
+            .unwrap();
+
+        // Checkpoint: empty diff BUT declared → route to review, NOT a no-progress
+        // rework. (The driver advances the now-in_progress task into its review
+        // round in the same tick.)
+        let _ = drive(&h).await;
+
+        let node = task_node(&h, task).await;
+        assert_eq!(
+            node.status,
+            ArtifactStatus::InProgress,
+            "declared no-op routes to review, not blocked/pending"
+        );
+        assert_eq!(node.attempt, 0, "a declared no-op is NOT a rework — attempt unchanged");
+        assert_eq!(
+            loop_iteration::Entity::find_by_id(iter_id)
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Some(IterationOutcome::DeclaredComplete),
+        );
+        assert!(
+            task_model(&h, task).await.last_failure_sig.is_none(),
+            "no empty_diff failure is recorded for a declared no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn oscillation_breaker_promotes_after_repeated_block_epochs() {
+        use crate::db::entities::loop_inbox_item::{self, InboxStatus};
+
+        async fn card_status(h: &Harness, subject: &str) -> Option<InboxStatus> {
+            loop_inbox_item::Entity::find()
+                .filter(loop_inbox_item::Column::IssueId.eq(h.issue_id))
+                .filter(loop_inbox_item::Column::SubjectKey.eq(subject.to_string()))
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .map(|c| c.status)
+        }
+        async fn rearm(h: &Harness, task: i32) {
+            cas_artifact_status(&h.db.conn, task, ArtifactStatus::Blocked, ArtifactStatus::Pending)
+                .await
+                .unwrap();
+        }
+
+        let h = setup().await;
+        let task = add_task(&h, "T").await;
+        let cfg = IssueConfig { oscillation_limit: 2, ..IssueConfig::default() };
+        let issue = load_issue(&h).await;
+        let np = format!("no_progress:{task}");
+        let osc = format!("oscillation:{task}");
+
+        // Epoch 1: first block → ordinary no_progress card, count=1, no promotion.
+        mark_blocked(&h.db, &EventEmitter::Noop, &issue, &cfg, task, None, "repeated_failure", "S", 1)
+            .await
+            .unwrap();
+        assert_eq!(task_model(&h, task).await.oscillation_count, 1);
+        assert_eq!(card_status(&h, &np).await, Some(InboxStatus::Pending));
+        assert_eq!(card_status(&h, &osc).await, None, "no oscillation card below limit");
+
+        // Epoch 2 (same sig, after a re-arm): count hits the limit → promote.
+        rearm(&h, task).await;
+        mark_blocked(&h.db, &EventEmitter::Noop, &issue, &cfg, task, None, "repeated_failure", "S", 2)
+            .await
+            .unwrap();
+        assert_eq!(task_model(&h, task).await.oscillation_count, 2);
+        assert_eq!(
+            card_status(&h, &osc).await,
+            Some(InboxStatus::Pending),
+            "promoted to an oscillation card"
+        );
+        assert_eq!(
+            card_status(&h, &np).await,
+            Some(InboxStatus::Handled),
+            "the ordinary no_progress card is superseded"
+        );
+
+        // Replay WITHOUT a re-arm (task already blocked) must NOT inflate the count.
+        mark_blocked(&h.db, &EventEmitter::Noop, &issue, &cfg, task, None, "repeated_failure", "S", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            task_model(&h, task).await.oscillation_count,
+            2,
+            "an idempotent replay does not step the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn oscillation_breaker_off_when_limit_zero() {
+        use crate::db::entities::loop_inbox_item::{self, InboxStatus};
+        let h = setup().await;
+        let task = add_task(&h, "T").await;
+        let cfg = IssueConfig { oscillation_limit: 0, ..IssueConfig::default() };
+        let issue = load_issue(&h).await;
+
+        // Many same-sig blocks with the breaker off → never an oscillation card.
+        for attempt in 1..=4 {
+            cas_artifact_status(&h.db.conn, task, ArtifactStatus::Blocked, ArtifactStatus::Pending)
+                .await
+                .ok();
+            mark_blocked(
+                &h.db, &EventEmitter::Noop, &issue, &cfg, task, None, "repeated_failure", "S",
+                attempt,
+            )
+            .await
+            .unwrap();
+        }
+        let osc = loop_inbox_item::Entity::find()
+            .filter(loop_inbox_item::Column::IssueId.eq(h.issue_id))
+            .filter(loop_inbox_item::Column::SubjectKey.eq(format!("oscillation:{task}")))
+            .one(&h.db.conn)
+            .await
+            .unwrap();
+        assert!(osc.is_none(), "limit=0 disables the oscillation breaker");
+        assert!(
+            card_status_pending(&h, &format!("no_progress:{task}")).await,
+            "ordinary no_progress card still filed"
+        );
+        // local helper kept inline to avoid a module-level addition
+        async fn card_status_pending(h: &Harness, subject: &str) -> bool {
+            loop_inbox_item::Entity::find()
+                .filter(loop_inbox_item::Column::IssueId.eq(h.issue_id))
+                .filter(loop_inbox_item::Column::SubjectKey.eq(subject.to_string()))
+                .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+                .one(&h.db.conn)
+                .await
+                .unwrap()
+                .is_some()
+        }
     }
 
     // ---- Task 2.2: deterministic validation after implement ----

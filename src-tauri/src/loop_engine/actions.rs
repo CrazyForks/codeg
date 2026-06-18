@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveEnum, ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus};
 use crate::db::entities::loop_artifact_revision::ActorKind;
@@ -39,7 +39,10 @@ use crate::db::service::loop_service::{artifact, inbox, issue, space};
 use crate::models::loops::{LoopChanged, LOOP_CHANGED_EVENT};
 use crate::web::event_bridge::emit_event;
 
-use crate::loop_engine::transitions::{cas_artifact_status, cas_issue_status};
+use crate::loop_engine::config_resolver::effective_config;
+use crate::loop_engine::transitions::{
+    cas_artifact_status, cas_issue_status, cas_task_force_done_no_op, clear_oscillation,
+};
 use crate::loop_engine::worktree::{self, MergeOutcome};
 use crate::loop_engine::{LoopEngine, LoopError};
 
@@ -619,12 +622,12 @@ impl LoopEngine {
     /// and puts the issue back to `running` under a fresh driver. Conflict when
     /// the issue is not `blocked`.
     ///
-    /// Each blocked task is reset `blocked → pending` with its failure signature
-    /// cleared, so the repeated-failure breaker won't trip on the first new run.
-    /// `attempt` is intentionally *kept*: a blocked task already sits one past its
-    /// last iteration, so the next dispatch is fresh — and each retry grants one
-    /// more attempt against `max_attempts` (raise it in per-issue settings for a
-    /// larger budget). Issue-level blocks (dirty finalize, merge fault/reject)
+    /// Each non-oscillating blocked task is reset `blocked → pending` with its
+    /// failure signature cleared AND its `attempt` reset to 0 (D13) — a deliberate
+    /// fresh budget against `max_attempts` per retry. Oscillating tasks (a
+    /// deterministic repeat) are EXCLUDED — they need an explicit override/force
+    /// exit, not a plain retry — and their `oscillation_*` columns are preserved as
+    /// a cross-retry probe. Issue-level blocks (dirty finalize, merge fault/reject)
     /// have no blocked task; retry simply re-drives so the engine re-evaluates.
     pub async fn retry_issue(self: &Arc<Self>, issue_id: i32) -> Result<(), LoopError> {
         let conn = &self.db.conn;
@@ -638,33 +641,229 @@ impl LoopEngine {
             self.emit_changed(issue.space_id, issue_id, "retry_unavailable");
             return Err(LoopError::Conflict);
         }
-        loop_artifact::Entity::update_many()
+        // D13: the re-arm set excludes OSCILLATING tasks (a deterministic failure
+        // that plain retry can't fix — those need an explicit override/force exit).
+        let config = effective_config(conn, &issue).await?;
+        let limit = config.oscillation_limit as i32;
+        let blocked: Vec<loop_artifact::Model> = loop_artifact::Entity::find()
+            .filter(loop_artifact::Column::IssueId.eq(issue_id))
+            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Task))
+            .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Blocked))
+            .all(conn)
+            .await?;
+        let is_oscillating = |t: &loop_artifact::Model| {
+            limit > 0 && t.oscillation_count >= limit && t.recent_failure_sig.is_some()
+        };
+        let rearm: Vec<i32> = blocked
+            .iter()
+            .filter(|t| !is_oscillating(t))
+            .map(|t| t.id)
+            .collect();
+        // An issue-level block (triage_no_route / dependency / finalize_dirty /
+        // merge_*) has NO blocked task — a plain retry must still re-drive it. Reject
+        // ONLY when blocked tasks exist AND every one is oscillating (use override).
+        if !blocked.is_empty() && rearm.is_empty() {
+            self.emit_changed(issue.space_id, issue_id, "retry_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        // ── ONE transaction: issue anchor + task re-arm + card resolve commit
+        // together, so the driver's atomic re-park (C9) can never observe a
+        // half-applied "issue=running + task still blocked" state. SQLite serializes
+        // this txn against C9's UPDATE, which then sees only pre- or post-mutation
+        // state.
+        let txn = conn.begin().await?;
+        // Serialization gate: CAS issue blocked→running. A concurrent retry's loser
+        // sees 0 rows → rollback + Conflict, having mutated nothing.
+        if !cas_issue_status(&txn, issue_id, IssueStatus::Blocked, IssueStatus::Running).await? {
+            txn.rollback().await?;
+            return Err(LoopError::Conflict);
+        }
+        // Re-arm with a `status = Blocked` CAS filter so a task a concurrent
+        // force-complete moved Blocked→Done is NOT clobbered back to pending; reset
+        // the attempt budget (D13) but KEEP the oscillation columns (cross-retry
+        // probe — only override/force/real-progress clear them).
+        if !rearm.is_empty() {
+            loop_artifact::Entity::update_many()
+                .col_expr(
+                    loop_artifact::Column::Status,
+                    Expr::value(ArtifactStatus::Pending.to_value()),
+                )
+                .col_expr(loop_artifact::Column::Attempt, Expr::value(0))
+                .col_expr(
+                    loop_artifact::Column::LastFailureSig,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
+                .filter(loop_artifact::Column::Id.is_in(rearm.clone()))
+                .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Blocked))
+                .exec(&txn)
+                .await?;
+        }
+        // Resolve every pending Blocked card EXCEPT task-level `oscillation:` (those
+        // clear only via override/force) — issue-level blocks + the re-armed tasks'
+        // ordinary blockers, in one broad sweep.
+        inbox::resolve_blocked_cards_except_oscillation(
+            &txn,
+            issue_id,
+            serde_json::json!({ "action": "retry" }),
+        )
+        .await?;
+        txn.commit().await?;
+        self.emit_changed(issue.space_id, issue_id, "retried");
+        self.start_issue(issue_id).await;
+        Ok(())
+    }
+
+    /// D15: human force-complete of a blocked, empty-diff task — accept it as a
+    /// no-op so a wedged issue can finish. Cause-guarded to the `empty_diff:implement`
+    /// family ONLY (a validation/infra/abandoned cause is rejected: its reset tree
+    /// also looks clean, so accepting it would pass off unimplemented work as done).
+    /// A parallel task whose branch carries a committed delta is refused (the no-op
+    /// would discard it). Anchors the issue `running`, marks the task Done(no_op),
+    /// clears its oscillation epoch, resolves its blocker cards — all in one
+    /// transaction — then lets the driver re-evaluate (finalize / re-park).
+    pub async fn force_complete_task(self: &Arc<Self>, task_id: i32) -> Result<(), LoopError> {
+        let conn = &self.db.conn;
+        let task = loop_artifact::Entity::find_by_id(task_id)
+            .one(conn)
+            .await?
+            .filter(|a| a.kind == ArtifactKind::Task)
+            .ok_or_else(|| LoopError::NotFound(format!("task {task_id}")))?;
+        if task.status != ArtifactStatus::Blocked {
+            self.emit_changed(task.space_id, task.issue_id, "force_complete_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        // Cause guard (D15): gate on the CURRENT pending blocker card's failure_sig,
+        // not the artifact's `recent/last_failure_sig` columns (which validation /
+        // infra block paths leave stale). Only the `empty_diff:implement` family is
+        // no-op-compatible; a task re-blocked for a real validation/infra failure is
+        // rejected — and this holds in serial mode too, where the parallel
+        // branch-at-base defence below does not run.
+        let blocker_sig = inbox::task_blocker_failure_sig(conn, task.issue_id, task_id).await?;
+        if !matches!(blocker_sig.as_deref(), Some(s) if s.starts_with("empty_diff:implement")) {
+            self.emit_changed(task.space_id, task.issue_id, "force_complete_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        let issue = issue::get_issue(conn, task.issue_id)
+            .await?
+            .ok_or_else(|| LoopError::NotFound(format!("issue {}", task.issue_id)))?;
+        // Defence-in-depth (reads only, BEFORE the txn): never no-op away a real
+        // committed delta. If the parallel task branch advanced past its base, refuse.
+        if issue.execution_mode.as_deref() == Some("parallel") {
+            if let Some(false) = worktree::task_branch_at_base(conn, &issue, task_id).await? {
+                return Err(LoopError::Conflict);
+            }
+        }
+        // ── ONE transaction: anchor + done CAS + clear + resolve, so C9's re-park
+        // can never observe "issue=running + task still blocked" mid-action.
+        let txn = conn.begin().await?;
+        if let Err(e) = ensure_running_for_exit(&txn, &issue).await {
+            txn.rollback().await?;
+            return Err(e);
+        }
+        // Re-validate the cause INSIDE the serialized window (Codex r2). The pre-txn
+        // guard above is only a fast-fail: a concurrent retry could have re-armed and
+        // re-blocked this task for a DIFFERENT cause (validation/infra), or with a real
+        // branch delta, between that read and the CAS — which only checks `status =
+        // blocked`. Re-read the pending blocker card's failure_sig now that the write
+        // lock is held; only the empty_diff family stays no-op-eligible. A retry that
+        // re-armed the task resolves its old card, so a vanished card → None → reject.
+        let live_sig = inbox::task_blocker_failure_sig(&txn, task.issue_id, task_id).await?;
+        if !matches!(live_sig.as_deref(), Some(s) if s.starts_with("empty_diff:implement")) {
+            txn.rollback().await?;
+            self.emit_changed(task.space_id, task.issue_id, "force_complete_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        if !cas_task_force_done_no_op(&txn, task_id).await? {
+            txn.rollback().await?;
+            return Err(LoopError::Conflict);
+        }
+        clear_oscillation(&txn, task_id).await?;
+        inbox::resolve_task_blocker_cards(
+            &txn,
+            issue.id,
+            task_id,
+            &["no_progress", "validation_blocked", "infra_failure", "oscillation"],
+            serde_json::json!({ "action": "force_complete", "actor": "human" }),
+        )
+        .await?;
+        txn.commit().await?;
+        self.emit_changed(issue.space_id, issue.id, "force_completed");
+        // Issue is running → its driver re-evaluates (finalize / re-park). Never
+        // self-finalize here — the driver owns frontier / fan-in / re-park.
+        self.start_issue(issue.id).await;
+        Ok(())
+    }
+
+    /// D17: human override of an oscillation breaker — clear the epoch and re-arm
+    /// the task for a fresh attempt budget (distinct from a plain retry, which
+    /// deliberately EXCLUDES oscillating tasks). Anchors the issue `running`,
+    /// re-arms the task (pending, attempt 0, oscillation cleared), resolves ALL its
+    /// blocker cards (including `oscillation:`) — one transaction — then re-drives.
+    pub async fn override_oscillation(self: &Arc<Self>, task_id: i32) -> Result<(), LoopError> {
+        let conn = &self.db.conn;
+        let task = loop_artifact::Entity::find_by_id(task_id)
+            .one(conn)
+            .await?
+            .filter(|a| a.kind == ArtifactKind::Task)
+            .ok_or_else(|| LoopError::NotFound(format!("task {task_id}")))?;
+        if task.status != ArtifactStatus::Blocked {
+            self.emit_changed(task.space_id, task.issue_id, "override_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        // D17 precondition (Codex r2): override is for breaker-promoted tasks ONLY —
+        // require a pending `oscillation:` card, so this endpoint can't be used as a
+        // generic blocked-task reset (which is exactly what `retry` deliberately
+        // EXCLUDES). The UI only offers it on oscillation cards; enforce it server-side.
+        if !inbox::has_pending_oscillation_card(conn, task.issue_id, task_id).await? {
+            self.emit_changed(task.space_id, task.issue_id, "override_unavailable");
+            return Err(LoopError::Conflict);
+        }
+        let issue = issue::get_issue(conn, task.issue_id)
+            .await?
+            .ok_or_else(|| LoopError::NotFound(format!("issue {}", task.issue_id)))?;
+        let txn = conn.begin().await?;
+        if let Err(e) = ensure_running_for_exit(&txn, &issue).await {
+            txn.rollback().await?;
+            return Err(e);
+        }
+        // Gate = re-arm CAS filtered on status='blocked' (double-click's 2nd call
+        // affects 0 rows → rollback + Conflict). Reset epoch + attempt + sigs.
+        let res = loop_artifact::Entity::update_many()
             .col_expr(
                 loop_artifact::Column::Status,
                 Expr::value(ArtifactStatus::Pending.to_value()),
             )
+            .col_expr(loop_artifact::Column::Attempt, Expr::value(0))
             .col_expr(
                 loop_artifact::Column::LastFailureSig,
                 Expr::value(Option::<String>::None),
             )
+            .col_expr(loop_artifact::Column::OscillationCount, Expr::value(0))
+            .col_expr(
+                loop_artifact::Column::RecentFailureSig,
+                Expr::value(Option::<String>::None),
+            )
             .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
-            .filter(loop_artifact::Column::IssueId.eq(issue_id))
-            .filter(loop_artifact::Column::Kind.eq(ArtifactKind::Task))
+            .filter(loop_artifact::Column::Id.eq(task_id))
             .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Blocked))
-            .exec(conn)
+            .exec(&txn)
             .await?;
-        resolve_cards_of_kind(
-            conn,
-            issue_id,
-            InboxKind::Blocked,
-            serde_json::json!({ "action": "retry" }),
-        )
-        .await?;
-        if !cas_issue_status(conn, issue_id, IssueStatus::Blocked, IssueStatus::Running).await? {
+        if res.rows_affected != 1 {
+            txn.rollback().await?;
             return Err(LoopError::Conflict);
         }
-        self.emit_changed(issue.space_id, issue_id, "retried");
-        self.start_issue(issue_id).await;
+        inbox::resolve_task_blocker_cards(
+            &txn,
+            issue.id,
+            task_id,
+            &["no_progress", "validation_blocked", "infra_failure", "oscillation"],
+            serde_json::json!({ "action": "override_oscillation", "actor": "human" }),
+        )
+        .await?;
+        txn.commit().await?;
+        self.emit_changed(issue.space_id, issue.id, "oscillation_override");
+        self.start_issue(issue.id).await;
         Ok(())
     }
 
@@ -757,6 +956,39 @@ async fn resolve_approval_card(
 /// Mark every pending inbox card of `kind` for an issue handled. A blocked issue
 /// may carry more than one card (e.g. several `no_progress:{task}` keys), so the
 /// retry / add-budget escape hatches clear them all in one resolution.
+/// Anchor an issue `running` before a human exit action mutates its tasks (D15/D17),
+/// so a post-commit crash is boot-restartable and the driver re-evaluates. Takes
+/// `&impl ConnectionTrait` to run inside the exit-action transaction.
+///
+/// Authoritative re-anchor (Codex r3): it does NOT trust the caller's (possibly
+/// stale) `issue.status`. One guarded write sets `running` for any issue currently
+/// `running` OR `blocked`. This both (a) re-anchors an issue a concurrent driver
+/// re-parked `running → blocked` after the caller read it, and (b) acquires the
+/// issue-row write lock here — BEFORE the live blocker-card read and task CAS that
+/// follow in the same transaction — so a re-park can no longer flip the issue
+/// between those reads and the commit (which would otherwise strand an all-done
+/// issue `blocked` with no actionable card). `updated_at` always changes, so a
+/// still-`running` issue still counts as one affected row; a terminal / paused issue
+/// matches zero rows → `Conflict`.
+async fn ensure_running_for_exit(
+    conn: &impl sea_orm::ConnectionTrait,
+    issue: &loop_issue::Model,
+) -> Result<(), LoopError> {
+    use IssueStatus::*;
+    let res = loop_issue::Entity::update_many()
+        .col_expr(loop_issue::Column::Status, Expr::value(Running.to_value()))
+        .col_expr(loop_issue::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_issue::Column::Id.eq(issue.id))
+        .filter(loop_issue::Column::Status.is_in([Running, Blocked]))
+        .exec(conn)
+        .await?;
+    if res.rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(LoopError::Conflict)
+    }
+}
+
 async fn resolve_cards_of_kind(
     conn: &sea_orm::DatabaseConnection,
     issue_id: i32,
@@ -1103,6 +1335,352 @@ mod tests {
         // Retrying an issue that is no longer blocked is a conflict.
         assert!(matches!(
             engine.retry_issue(issue_id).await,
+            Err(LoopError::Conflict)
+        ));
+    }
+
+    /// Helpers for the D13 oscillation-aware retry tests.
+    async fn mk_blocked_task(
+        conn: &sea_orm::DatabaseConnection,
+        space_id: i32,
+        issue_id: i32,
+        title: &str,
+    ) -> i32 {
+        artifact::create_artifact(
+            conn, space_id, issue_id, ArtifactKind::Task, title,
+            ArtifactStatus::Blocked, ActorKind::Agent, None,
+        )
+        .await
+        .unwrap()
+        .id
+    }
+    async fn set_oscillating(conn: &sea_orm::DatabaseConnection, task: i32, count: i32) {
+        loop_artifact::Entity::update_many()
+            .col_expr(loop_artifact::Column::OscillationCount, Expr::value(count))
+            .col_expr(
+                loop_artifact::Column::RecentFailureSig,
+                Expr::value("validation_failed:zzz".to_string()),
+            )
+            .filter(loop_artifact::Column::Id.eq(task))
+            .exec(conn)
+            .await
+            .unwrap();
+    }
+    async fn card_pending(conn: &sea_orm::DatabaseConnection, issue_id: i32, subject: &str) -> bool {
+        loop_inbox_item::Entity::find()
+            .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+            .filter(loop_inbox_item::Column::SubjectKey.eq(subject.to_string()))
+            .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+            .one(conn)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn retry_excludes_oscillating_tasks_and_keeps_their_card() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        // One ordinary blocked task + one oscillating (count >= default limit 2).
+        let ordinary = mk_blocked_task(&conn, space_id, issue_id, "ord").await;
+        let osc = mk_blocked_task(&conn, space_id, issue_id, "osc").await;
+        set_oscillating(&conn, osc, 2).await;
+        for (t, prefix) in [(ordinary, "no_progress"), (osc, "oscillation")] {
+            inbox::upsert_inbox(
+                &conn, space_id, issue_id, None, InboxKind::Blocked,
+                &format!("{prefix}:{t}"), serde_json::json!({ "reason": prefix }),
+            )
+            .await
+            .unwrap();
+        }
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        engine.retry_issue(issue_id).await.unwrap();
+        engine.stop_issue(issue_id).await;
+
+        let ord = loop_artifact::Entity::find_by_id(ordinary).one(&conn).await.unwrap().unwrap();
+        assert_eq!(ord.status, ArtifactStatus::Pending, "ordinary task re-armed");
+        assert_eq!(ord.attempt, 0, "attempt budget reset");
+        let x = loop_artifact::Entity::find_by_id(osc).one(&conn).await.unwrap().unwrap();
+        assert_eq!(x.status, ArtifactStatus::Blocked, "oscillating task NOT re-armed");
+        assert_eq!(x.oscillation_count, 2, "oscillation columns preserved across retry");
+        assert!(!card_pending(&conn, issue_id, &format!("no_progress:{ordinary}")).await);
+        assert!(
+            card_pending(&conn, issue_id, &format!("oscillation:{osc}")).await,
+            "oscillation card survives a plain retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_all_oscillating_is_conflict() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let osc = mk_blocked_task(&conn, space_id, issue_id, "osc").await;
+        set_oscillating(&conn, osc, 2).await;
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.retry_issue(issue_id).await,
+            Err(LoopError::Conflict)
+        ));
+        let x = loop_artifact::Entity::find_by_id(osc).one(&conn).await.unwrap().unwrap();
+        assert_eq!(x.status, ArtifactStatus::Blocked, "issue untouched on conflict");
+    }
+
+    #[tokio::test]
+    async fn retry_issue_level_block_redrives() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        // No blocked task — an issue-level block (e.g. finalize dirty).
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            "finalize_dirty:issue", serde_json::json!({ "reason": "finalize_dirty" }),
+        )
+        .await
+        .unwrap();
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        engine.retry_issue(issue_id).await.unwrap();
+        engine.stop_issue(issue_id).await;
+
+        assert_eq!(
+            issue::get_issue(&conn, issue_id).await.unwrap().unwrap().status,
+            IssueStatus::Running,
+            "issue-level block still re-drives on retry"
+        );
+        assert!(!card_pending(&conn, issue_id, "finalize_dirty:issue").await);
+    }
+
+    #[tokio::test]
+    async fn force_complete_only_for_empty_diff_cause() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let task = mk_blocked_task(&conn, space_id, issue_id, "t").await;
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        // Wrong cause (validation failure) → rejected even though the tree looks
+        // clean. The guard reads the pending blocker CARD's `failure_sig` (mirroring
+        // how the engine files blocks), NOT the artifact column.
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("validation_blocked:{task}"),
+            serde_json::json!({ "failure_sig": "validation_failed:abc" }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            engine.force_complete_task(task).await,
+            Err(LoopError::Conflict)
+        ));
+        assert_eq!(
+            loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap().status,
+            ArtifactStatus::Blocked
+        );
+
+        // Re-blocked for a genuine empty diff: resolve the stale validation card and
+        // file the `no_progress` card the empty-diff path files (carrying
+        // `failure_sig`). Now force-complete accepts it as a no-op.
+        inbox::resolve_task_blocker_cards(
+            &conn, issue_id, task, &["validation_blocked"], serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("no_progress:{task}"),
+            serde_json::json!({ "failure_sig": "empty_diff:implement", "reason": "max_attempts" }),
+        )
+        .await
+        .unwrap();
+        engine.force_complete_task(task).await.unwrap();
+        engine.stop_issue(issue_id).await;
+
+        let t = loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap();
+        assert_eq!(t.status, ArtifactStatus::Done);
+        assert_eq!(
+            t.contribution_kind,
+            crate::db::entities::loop_artifact::ContributionKind::NoOp
+        );
+        assert!(t.fan_in_commit.is_none(), "force-complete records a no-op (NULL commit)");
+        assert_eq!(
+            issue::get_issue(&conn, issue_id).await.unwrap().unwrap().status,
+            IssueStatus::Running
+        );
+        assert!(!card_pending(&conn, issue_id, &format!("no_progress:{task}")).await);
+    }
+
+    #[tokio::test]
+    async fn force_complete_rejects_terminal_issue() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let task = mk_blocked_task(&conn, space_id, issue_id, "t").await;
+        // A valid empty-diff blocker card so the cause guard passes — the rejection
+        // must come from the terminal-issue check, not the cause guard.
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("no_progress:{task}"),
+            serde_json::json!({ "failure_sig": "empty_diff:implement" }),
+        )
+        .await
+        .unwrap();
+        // Issue is cancelled → ensure_running_for_exit refuses.
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Status,
+                Expr::value(IssueStatus::Cancelled.to_value()),
+            )
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .exec(&conn)
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.force_complete_task(task).await,
+            Err(LoopError::Conflict)
+        ));
+        assert_eq!(
+            loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap().status,
+            ArtifactStatus::Blocked,
+            "task untouched when the issue can't be anchored"
+        );
+    }
+
+    #[tokio::test]
+    async fn override_oscillation_rearms_and_clears_cards() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let task = mk_blocked_task(&conn, space_id, issue_id, "t").await;
+        set_oscillating(&conn, task, 2).await;
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("oscillation:{task}"), serde_json::json!({ "reason": "oscillation" }),
+        )
+        .await
+        .unwrap();
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        engine.override_oscillation(task).await.unwrap();
+        engine.stop_issue(issue_id).await;
+
+        let t = loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap();
+        assert_eq!(t.status, ArtifactStatus::Pending, "task re-armed");
+        assert_eq!(t.attempt, 0);
+        assert_eq!(t.oscillation_count, 0, "oscillation epoch cleared");
+        assert!(t.recent_failure_sig.is_none());
+        assert_eq!(
+            issue::get_issue(&conn, issue_id).await.unwrap().unwrap().status,
+            IssueStatus::Running
+        );
+        assert!(
+            !card_pending(&conn, issue_id, &format!("oscillation:{task}")).await,
+            "oscillation card resolved by the override"
+        );
+    }
+
+    /// D17 precondition (Codex r2): override is for breaker-promoted tasks ONLY. A
+    /// blocked task with no pending `oscillation:` card (here an ordinary no_progress
+    /// block) is rejected, so the endpoint can never be a generic blocked-task reset.
+    #[tokio::test]
+    async fn override_rejects_non_oscillating_blocked_task() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let task = mk_blocked_task(&conn, space_id, issue_id, "t").await;
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("no_progress:{task}"),
+            serde_json::json!({ "failure_sig": "empty_diff:implement" }),
+        )
+        .await
+        .unwrap();
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.override_oscillation(task).await,
+            Err(LoopError::Conflict)
+        ));
+        assert_eq!(
+            loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap().status,
+            ArtifactStatus::Blocked,
+            "task untouched without a pending oscillation card"
+        );
+    }
+
+    /// Codex r2: the force-complete cause guard is re-validated inside the txn. If a
+    /// concurrent retry resolved the blocker card (re-arming the task), the pending
+    /// card vanishes — force-complete must reject rather than no-op a task whose block
+    /// is no longer a live empty diff. (A true mid-txn race isn't deterministically
+    /// injectable in this harness; this exercises the resolved-card guarded state the
+    /// in-txn re-read enforces.)
+    #[tokio::test]
+    async fn force_complete_rejects_when_blocker_card_resolved() {
+        let (engine, conn, space_id, issue_id) = setup().await;
+        let task = mk_blocked_task(&conn, space_id, issue_id, "t").await;
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+        inbox::upsert_inbox(
+            &conn, space_id, issue_id, None, InboxKind::Blocked,
+            &format!("no_progress:{task}"),
+            serde_json::json!({ "failure_sig": "empty_diff:implement" }),
+        )
+        .await
+        .unwrap();
+        // A concurrent retry would resolve the blocker card while re-arming the task.
+        inbox::resolve_task_blocker_cards(
+            &conn, issue_id, task, &["no_progress"], serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            engine.force_complete_task(task).await,
+            Err(LoopError::Conflict)
+        ));
+        assert_eq!(
+            loop_artifact::Entity::find_by_id(task).one(&conn).await.unwrap().unwrap().status,
+            ArtifactStatus::Blocked,
+            "a vanished blocker card blocks force-complete"
+        );
+    }
+
+    /// Codex r3: an exit action entered with a STALE `running` issue model must still
+    /// re-anchor from the LIVE DB state. A concurrent driver re-park could have flipped
+    /// the row `running → blocked` after the caller read it; the old helper trusted the
+    /// model and returned Ok without writing, which would strand an all-done issue
+    /// `blocked` with no actionable card. The helper now re-anchors authoritatively.
+    #[tokio::test]
+    async fn ensure_running_for_exit_reanchors_stale_running_model() {
+        let (_engine, conn, _space_id, issue_id) = setup().await;
+        // A model captured while the issue was running ...
+        let stale = issue::get_issue(&conn, issue_id).await.unwrap().unwrap();
+        assert_eq!(stale.status, IssueStatus::Running);
+        // ... while the live row was re-parked to blocked by a driver.
+        cas_issue_status(&conn, issue_id, IssueStatus::Running, IssueStatus::Blocked)
+            .await
+            .unwrap();
+
+        ensure_running_for_exit(&conn, &stale).await.unwrap();
+        assert_eq!(
+            issue::get_issue(&conn, issue_id).await.unwrap().unwrap().status,
+            IssueStatus::Running,
+            "re-anchored from the live blocked row, not the stale running model"
+        );
+
+        // A terminal issue is refused even when the stale model still says running.
+        loop_issue::Entity::update_many()
+            .col_expr(
+                loop_issue::Column::Status,
+                Expr::value(IssueStatus::Cancelled.to_value()),
+            )
+            .filter(loop_issue::Column::Id.eq(issue_id))
+            .exec(&conn)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ensure_running_for_exit(&conn, &stale).await,
             Err(LoopError::Conflict)
         ));
     }

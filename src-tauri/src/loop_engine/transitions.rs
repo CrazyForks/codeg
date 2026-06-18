@@ -7,8 +7,8 @@
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveEnum, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    SqlErr,
+    ActiveEnum, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend,
+    EntityTrait, QueryFilter, Set, SqlErr, Statement,
 };
 
 use crate::db::entities::loop_artifact::{self, ArtifactStatus};
@@ -87,6 +87,10 @@ pub(crate) fn is_legal_artifact(from: ArtifactStatus, to: ArtifactStatus) -> boo
             | (Pending, Superseded)
             | (Blocked, InProgress)
             | (Blocked, Pending)
+            // D15: human force-complete of a blocked, empty-diff task marks it Done
+            // (as a no-op) so the issue can finish — the only path to Done from
+            // Blocked, gated by `force_complete_task`'s cause guard.
+            | (Blocked, Done)
             | (Pending, Cancelled)
             | (InProgress, Cancelled)
     )
@@ -96,7 +100,7 @@ pub(crate) fn is_legal_artifact(from: ArtifactStatus, to: ArtifactStatus) -> boo
 /// Returns `true` on success, `false` on a miss (the caller maps that to
 /// [`LoopError::Conflict`]).
 pub async fn cas_issue_status(
-    conn: &DatabaseConnection,
+    conn: &impl ConnectionTrait,
     id: i32,
     expected: IssueStatus,
     new: IssueStatus,
@@ -114,6 +118,44 @@ pub async fn cas_issue_status(
         .exec(conn)
         .await?;
     Ok(res.rows_affected == 1)
+}
+
+/// D13/r4: re-park a wedged issue in ONE atomic statement — flip running→blocked
+/// iff the FRESH DB state shows it genuinely cannot progress: no in-flight
+/// iteration, no task the driver could pick up (none `pending`/`in_progress`), AND
+/// at least one `blocked` task (the wedge a human exit must reach). The
+/// EXISTS / NOT EXISTS are evaluated atomically WITH the status flip, so a
+/// concurrent exit that re-armed a task (→ pending) or completed the last blocked
+/// one makes the WHERE false and the UPDATE a no-op — closing the TOCTOU a
+/// read-then-CAS would open. Returns whether it re-parked.
+///
+/// Raw SQL because the query builder can't express `EXISTS` subqueries in an
+/// `UPDATE … WHERE`. The status string literals match the entity
+/// `DeriveActiveEnum` values pinned by the `m20260613_000001` CHECK constraints
+/// (verified); the re-park DB test exercises every predicate branch.
+pub async fn cas_issue_repark_if_wedged(
+    conn: &impl ConnectionTrait,
+    issue_id: i32,
+) -> Result<bool, LoopError> {
+    let sql = r#"
+        UPDATE loop_issue SET status = 'blocked', updated_at = ?1
+        WHERE id = ?2 AND status = 'running'
+          AND EXISTS (SELECT 1 FROM loop_artifact
+                      WHERE issue_id = ?2 AND kind = 'task' AND status = 'blocked')
+          AND NOT EXISTS (SELECT 1 FROM loop_artifact
+                          WHERE issue_id = ?2 AND kind = 'task'
+                            AND status IN ('pending','in_progress'))
+          AND NOT EXISTS (SELECT 1 FROM loop_iteration
+                          WHERE issue_id = ?2 AND status IN ('queued','running'))
+    "#;
+    let res = conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [Utc::now().into(), issue_id.into()],
+        ))
+        .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// CAS an artifact's status.
@@ -160,32 +202,136 @@ pub async fn cas_artifact_status_from(
     Ok(res.rows_affected == 1)
 }
 
-/// Atomically mark a task `Done` AND freeze its integration commit in a single
-/// CAS (`status='done', fan_in_commit=<sha> WHERE id=? AND status='in_progress'`).
-/// Establishes the invariant **"a Done task always carries a non-null
-/// fan_in_commit"** — there is no observable "Done but unfrozen" intermediate the
-/// parallel fan-in could trip over. Returns whether the CAS applied (a miss means
-/// the task was no longer `in_progress` — a stale snapshot, not an error).
-pub async fn cas_task_done_with_freeze(
+/// A task's accepted contribution, coupling the kind to its commit so the
+/// invariant `no_op ⇔ fan_in_commit IS NULL` is unrepresentable to violate
+/// (Codex r1 — no `(Delta, None)` / `(NoOp, Some)` pairs). `Delta` always carries
+/// its frozen commit; `NoOp` never does.
+pub enum TaskContribution {
+    /// A real diff, frozen at this commit SHA.
+    Delta(String),
+    /// Agent-declared / force-completed no-op — no commit beyond the base.
+    NoOp,
+}
+
+/// D12: atomically mark a task `Done` with its contribution in a single CAS
+/// (`status='done', contribution_kind=?, fan_in_commit=? WHERE id=? AND
+/// status='in_progress'`). The [`TaskContribution`] enum couples kind+commit, so
+/// the write always upholds `no_op ⇔ fan_in_commit IS NULL`. Also upholds **a Done
+/// task is observed atomically** (no "Done but unfrozen" window the parallel fan-in
+/// could trip over). Returns whether the CAS applied (a miss means the task was no
+/// longer `in_progress` — a stale snapshot, not an error).
+pub async fn cas_task_done_with_contribution(
     conn: &DatabaseConnection,
     task_id: i32,
-    fan_in_commit: &str,
+    contribution: TaskContribution,
 ) -> Result<bool, LoopError> {
+    let (kind, commit) = match &contribution {
+        TaskContribution::Delta(sha) => {
+            (loop_artifact::ContributionKind::Delta, Some(sha.clone()))
+        }
+        TaskContribution::NoOp => (loop_artifact::ContributionKind::NoOp, None),
+    };
     let res = loop_artifact::Entity::update_many()
         .col_expr(
             loop_artifact::Column::Status,
             Expr::value(ArtifactStatus::Done.to_value()),
         )
         .col_expr(
-            loop_artifact::Column::FanInCommit,
-            Expr::value(fan_in_commit.to_string()),
+            loop_artifact::Column::ContributionKind,
+            Expr::value(kind.to_value()),
         )
+        .col_expr(loop_artifact::Column::FanInCommit, Expr::value(commit))
         .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
         .filter(loop_artifact::Column::Id.eq(task_id))
         .filter(loop_artifact::Column::Status.eq(ArtifactStatus::InProgress))
         .exec(conn)
         .await?;
     Ok(res.rows_affected == 1)
+}
+
+/// D15: human force-complete of a blocked task → mark it Done as a no-op
+/// (`contribution_kind='no_op'`, `fan_in_commit=NULL`) iff it is still `Blocked`.
+/// Goes through the legality gate (`(Blocked, Done)` is the human-exit edge) and
+/// returns whether the CAS applied (a miss = no longer blocked → caller Conflicts).
+/// The fan-in treats it like any agent-declared no-op (skipped, provenance-linked).
+pub async fn cas_task_force_done_no_op(
+    conn: &impl ConnectionTrait,
+    task_id: i32,
+) -> Result<bool, LoopError> {
+    if !is_legal_artifact(ArtifactStatus::Blocked, ArtifactStatus::Done) {
+        return Err(LoopError::IllegalTransition);
+    }
+    let res = loop_artifact::Entity::update_many()
+        .col_expr(
+            loop_artifact::Column::Status,
+            Expr::value(ArtifactStatus::Done.to_value()),
+        )
+        .col_expr(
+            loop_artifact::Column::ContributionKind,
+            Expr::value(loop_artifact::ContributionKind::NoOp.to_value()),
+        )
+        .col_expr(
+            loop_artifact::Column::FanInCommit,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(loop_artifact::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(loop_artifact::Column::Id.eq(task_id))
+        .filter(loop_artifact::Column::Status.eq(ArtifactStatus::Blocked))
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected == 1)
+}
+
+/// D14: step a task's `block_sig`-keyed oscillation epoch. Reads the current
+/// epoch, then increments (same sig as the last block — a deterministic repeat) or
+/// resets to 1 (a new sig — a genuinely different failure), and writes the new
+/// `(count, sig)`. Returns the new count; the caller decides promotion at the
+/// limit. Call ONLY when a genuine NEW block lands (the task CAS actually applied),
+/// so an idempotent replay never inflates the count.
+pub async fn step_oscillation(
+    conn: &impl ConnectionTrait,
+    task_id: i32,
+    block_sig: &str,
+) -> Result<i32, LoopError> {
+    let cur = loop_artifact::Entity::find_by_id(task_id).one(conn).await?;
+    let (same, prev) = match cur {
+        Some(m) => (
+            m.recent_failure_sig.as_deref() == Some(block_sig),
+            m.oscillation_count,
+        ),
+        None => (false, 0),
+    };
+    let next = if same { prev + 1 } else { 1 };
+    loop_artifact::Entity::update_many()
+        .col_expr(loop_artifact::Column::OscillationCount, Expr::value(next))
+        .col_expr(
+            loop_artifact::Column::RecentFailureSig,
+            Expr::value(block_sig.to_string()),
+        )
+        .filter(loop_artifact::Column::Id.eq(task_id))
+        .exec(conn)
+        .await?;
+    Ok(next)
+}
+
+/// D14: clear a task's oscillation epoch counters on real forward progress
+/// (validation pass / task done) or a human override. Idempotent. Takes
+/// `&impl ConnectionTrait` so it runs both directly and inside the exit-action
+/// transactions (C10).
+pub async fn clear_oscillation(
+    conn: &impl ConnectionTrait,
+    task_id: i32,
+) -> Result<(), LoopError> {
+    loop_artifact::Entity::update_many()
+        .col_expr(loop_artifact::Column::OscillationCount, Expr::value(0))
+        .col_expr(
+            loop_artifact::Column::RecentFailureSig,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(loop_artifact::Column::Id.eq(task_id))
+        .exec(conn)
+        .await?;
+    Ok(())
 }
 
 /// Claim the parallel fan-in **session lock** by writing the manifest exactly
@@ -434,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_task_done_with_freeze_sets_both_atomically() {
+    async fn cas_task_done_with_contribution_delta_sets_both_atomically() {
         let (db, space_id, issue_id) = seed().await;
         let task = artifact::create_artifact(
             &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
@@ -443,16 +589,21 @@ mod tests {
         .await
         .unwrap();
 
-        // From InProgress: applies, setting status=Done AND fan_in_commit together.
-        assert!(cas_task_done_with_freeze(&db.conn, task.id, "deadbeef")
-            .await
-            .unwrap());
+        // From InProgress: applies, setting status=Done AND contribution+commit.
+        assert!(cas_task_done_with_contribution(
+            &db.conn,
+            task.id,
+            TaskContribution::Delta("deadbeef".into()),
+        )
+        .await
+        .unwrap());
         let row = loop_artifact::Entity::find_by_id(task.id)
             .one(&db.conn)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(row.status, ArtifactStatus::Done);
+        assert_eq!(row.contribution_kind, loop_artifact::ContributionKind::Delta);
         assert_eq!(
             row.fan_in_commit.as_deref(),
             Some("deadbeef"),
@@ -460,9 +611,13 @@ mod tests {
         );
 
         // A second call (now Done, not InProgress) is a CAS miss — no overwrite.
-        assert!(!cas_task_done_with_freeze(&db.conn, task.id, "other")
-            .await
-            .unwrap());
+        assert!(!cas_task_done_with_contribution(
+            &db.conn,
+            task.id,
+            TaskContribution::Delta("other".into()),
+        )
+        .await
+        .unwrap());
         let row = loop_artifact::Entity::find_by_id(task.id)
             .one(&db.conn)
             .await
@@ -472,16 +627,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_task_done_with_freeze_misses_when_not_in_progress() {
+    async fn cas_task_done_with_contribution_no_op_leaves_commit_null() {
         let (db, space_id, issue_id) = seed().await;
-        // A Pending task is not yet eligible → CAS misses, no partial freeze.
         let task = artifact::create_artifact(
             &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
-            ArtifactStatus::Pending, ActorKind::Agent, None,
+            ArtifactStatus::InProgress, ActorKind::Agent, None,
         )
         .await
         .unwrap();
-        assert!(!cas_task_done_with_freeze(&db.conn, task.id, "abc")
+        // NoOp: Done with NULL fan_in_commit (the no_op ⇔ NULL invariant).
+        assert!(cas_task_done_with_contribution(&db.conn, task.id, TaskContribution::NoOp)
             .await
             .unwrap());
         let row = loop_artifact::Entity::find_by_id(task.id)
@@ -489,8 +644,144 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(row.status, ArtifactStatus::Done);
+        assert_eq!(row.contribution_kind, loop_artifact::ContributionKind::NoOp);
+        assert!(row.fan_in_commit.is_none(), "no_op ⟹ fan_in_commit IS NULL");
+    }
+
+    #[tokio::test]
+    async fn cas_task_done_with_contribution_misses_when_not_in_progress() {
+        let (db, space_id, issue_id) = seed().await;
+        // A Pending task is not yet eligible → CAS misses, no partial write.
+        let task = artifact::create_artifact(
+            &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
+            ArtifactStatus::Pending, ActorKind::Agent, None,
+        )
+        .await
+        .unwrap();
+        assert!(!cas_task_done_with_contribution(
+            &db.conn,
+            task.id,
+            TaskContribution::Delta("abc".into()),
+        )
+        .await
+        .unwrap());
+        let row = loop_artifact::Entity::find_by_id(task.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, ArtifactStatus::Pending);
-        assert!(row.fan_in_commit.is_none(), "no freeze on a CAS miss");
+        assert!(row.fan_in_commit.is_none(), "no write on a CAS miss");
+    }
+
+    #[tokio::test]
+    async fn repark_if_wedged_only_when_genuinely_stuck() {
+        let (db, space_id, issue_id) = seed().await;
+        let conn = &db.conn;
+
+        async fn set_running(conn: &DatabaseConnection, issue_id: i32) {
+            loop_issue::Entity::update_many()
+                .col_expr(
+                    loop_issue::Column::Status,
+                    Expr::value(IssueStatus::Running.to_value()),
+                )
+                .filter(loop_issue::Column::Id.eq(issue_id))
+                .exec(conn)
+                .await
+                .unwrap();
+        }
+        async fn status(conn: &DatabaseConnection, issue_id: i32) -> IssueStatus {
+            loop_issue::Entity::find_by_id(issue_id)
+                .one(conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        }
+        async fn set_task(conn: &DatabaseConnection, id: i32, s: ArtifactStatus) {
+            loop_artifact::Entity::update_many()
+                .col_expr(loop_artifact::Column::Status, Expr::value(s.to_value()))
+                .filter(loop_artifact::Column::Id.eq(id))
+                .exec(conn)
+                .await
+                .unwrap();
+        }
+        let mk = |status: ArtifactStatus| {
+            artifact::create_artifact(
+                conn, space_id, issue_id, ArtifactKind::Task, "T", status, ActorKind::Agent, None,
+            )
+        };
+
+        // A pending task present → driver could still pick it up → NO re-park.
+        set_running(conn, issue_id).await;
+        let blocked = mk(ArtifactStatus::Blocked).await.unwrap().id;
+        let pending = mk(ArtifactStatus::Pending).await.unwrap().id;
+        assert!(!cas_issue_repark_if_wedged(conn, issue_id).await.unwrap());
+        assert_eq!(status(conn, issue_id).await, IssueStatus::Running);
+
+        // Remove the pending task (→ done): now only a blocked task remains, no
+        // in-flight iteration → genuinely wedged → RE-PARK.
+        set_task(conn, pending, ArtifactStatus::Done).await;
+        assert!(cas_issue_repark_if_wedged(conn, issue_id).await.unwrap());
+        assert_eq!(status(conn, issue_id).await, IssueStatus::Blocked);
+
+        // A non-running issue is never re-parked (idempotent on the blocked result).
+        assert!(!cas_issue_repark_if_wedged(conn, issue_id).await.unwrap());
+
+        // An in-flight iteration blocks re-park even with a blocked task.
+        set_running(conn, issue_id).await;
+        let _it = try_claim_iteration(
+            conn,
+            claim(space_id, issue_id, Stage::Triage, None, None, "wedge-it"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!cas_issue_repark_if_wedged(conn, issue_id).await.unwrap());
+        assert_eq!(status(conn, issue_id).await, IssueStatus::Running);
+
+        // Settle the iteration and clear the blocked task (→ done): no blocked task
+        // → nothing to re-park to (all-done is the finalize path) → NO re-park.
+        // (Set the iteration terminal directly — test setup, not a real transition.)
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::Status,
+                Expr::value(IterationStatus::Succeeded.to_value()),
+            )
+            .filter(loop_iteration::Column::Id.eq(_it.id))
+            .exec(conn)
+            .await
+            .unwrap();
+        set_task(conn, blocked, ArtifactStatus::Done).await;
+        assert!(!cas_issue_repark_if_wedged(conn, issue_id).await.unwrap());
+        assert_eq!(status(conn, issue_id).await, IssueStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn step_oscillation_increments_same_sig_resets_new_and_clears() {
+        let (db, space_id, issue_id) = seed().await;
+        let task = artifact::create_artifact(
+            &db.conn, space_id, issue_id, ArtifactKind::Task, "T",
+            ArtifactStatus::Blocked, ActorKind::Agent, None,
+        )
+        .await
+        .unwrap();
+
+        // Same sig increments the epoch; a new sig resets it to 1.
+        assert_eq!(step_oscillation(&db.conn, task.id, "A").await.unwrap(), 1);
+        assert_eq!(step_oscillation(&db.conn, task.id, "A").await.unwrap(), 2);
+        assert_eq!(step_oscillation(&db.conn, task.id, "B").await.unwrap(), 1);
+
+        // clear_oscillation zeroes the count and drops the sig.
+        clear_oscillation(&db.conn, task.id).await.unwrap();
+        let row = loop_artifact::Entity::find_by_id(task.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.oscillation_count, 0);
+        assert!(row.recent_failure_sig.is_none());
     }
 
     #[tokio::test]

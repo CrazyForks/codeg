@@ -79,6 +79,14 @@ pub fn build_router(
         .route("/cancel_loop_issue", post(handlers::loops::cancel_loop_issue))
         .route("/retry_loop_issue", post(handlers::loops::retry_loop_issue))
         .route(
+            "/force_complete_loop_task",
+            post(handlers::loops::force_complete_loop_task),
+        )
+        .route(
+            "/override_loop_oscillation",
+            post(handlers::loops::override_loop_oscillation),
+        )
+        .route(
             "/add_loop_issue_budget",
             post(handlers::loops::add_loop_issue_budget),
         )

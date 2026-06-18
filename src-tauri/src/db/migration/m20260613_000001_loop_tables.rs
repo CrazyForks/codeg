@@ -80,11 +80,26 @@ const UP: &[&str] = &[
         fan_in_commit TEXT,
         sort INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        -- C-phase (D12): whether a Done task contributed a real diff (`delta`, with a
+        -- frozen fan_in_commit) or was an agent-declared no-op (`no_op`, fan_in_commit
+        -- NULL). Only meaningful for parallel fan-in participants; serial tasks always
+        -- record 'delta'. The invariant `no_op ⇔ fan_in_commit IS NULL` is upheld at
+        -- the write (cas_task_done_with_contribution).
+        contribution_kind TEXT NOT NULL DEFAULT 'delta'
+            CHECK (contribution_kind IN ('delta','no_op')),
+        -- C-phase (D14): oscillation breaker epoch counters, keyed per task. Stepped
+        -- only when a genuine new block lands (mark_blocked, blocked_now); reset on
+        -- real forward progress / override / force-complete.
+        oscillation_count INTEGER NOT NULL DEFAULT 0 CHECK (oscillation_count >= 0),
+        recent_failure_sig TEXT
     )",
     "CREATE INDEX idx_loop_artifact_issue_kind ON loop_artifact(issue_id, kind)",
     "CREATE INDEX idx_loop_artifact_space ON loop_artifact(space_id)",
     "CREATE INDEX idx_loop_artifact_produced_by ON loop_artifact(produced_by_iteration_id)",
+    // C-phase (D13/D14): re-park and oscillation-set queries scan a single issue's
+    // tasks by status (the active blocked set, plus pending/in_progress presence).
+    "CREATE INDEX idx_loop_artifact_issue_status ON loop_artifact(issue_id, status)",
     // At most one LIVE result artifact per issue (the engine-synthesized capstone).
     // Excludes superseded/cancelled so an integration loop-back can supersede a
     // failed result and a fresh finalize can produce a new one (§3.6 / P2.4).
@@ -165,7 +180,12 @@ const UP: &[&str] = &[
         -- or for a settled implement run before its checkpoint has written the
         -- real outcome. `declared_complete` is a Phase-C value, enumerated now so
         -- the CHECK/UI need no Phase-C edit.
-        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded','empty_diff','validation_failed','declared_complete','no_artifacts','abandoned'))
+        outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded','empty_diff','validation_failed','declared_complete','no_artifacts','abandoned')),
+        -- C-phase (D12): the implement agent's free-text reason when it declares the
+        -- task already satisfied (loop_task_complete), else NULL. Truncated to
+        -- MAX_CONTENT at the write; read by finish_implement (route to review) and the
+        -- review briefing (verify-against-HEAD note).
+        agent_completion_reason TEXT
     )",
     "CREATE UNIQUE INDEX uniq_loop_iteration_token ON loop_iteration(capability_token)",
     "CREATE INDEX idx_loop_iteration_issue ON loop_iteration(issue_id)",

@@ -342,6 +342,30 @@ pub async fn retry_loop_issue_core(
     Ok(())
 }
 
+/// D15: force-complete a blocked, empty-diff task as a no-op (the engine emits the
+/// change). `task_id` is the task artifact id.
+pub async fn force_complete_loop_task_core(
+    _conn: &DatabaseConnection,
+    _emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    task_id: i32,
+) -> Result<(), AppCommandError> {
+    engine.force_complete_task(task_id).await?;
+    Ok(())
+}
+
+/// D17: override an oscillation breaker and re-arm the task (the engine emits the
+/// change). `task_id` is the task artifact id.
+pub async fn override_loop_oscillation_core(
+    _conn: &DatabaseConnection,
+    _emitter: &EventEmitter,
+    engine: &Arc<LoopEngine>,
+    task_id: i32,
+) -> Result<(), AppCommandError> {
+    engine.override_oscillation(task_id).await?;
+    Ok(())
+}
+
 /// Add `additional` tokens to a budget-paused issue's budget and resume it (the
 /// engine emits the change).
 pub async fn add_loop_issue_budget_core(
@@ -786,6 +810,28 @@ pub async fn retry_loop_issue(
     id: i32,
 ) -> Result<(), AppCommandError> {
     retry_loop_issue_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn force_complete_loop_task(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    task_id: i32,
+) -> Result<(), AppCommandError> {
+    force_complete_loop_task_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), task_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn override_loop_oscillation(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    engine: tauri::State<'_, Arc<LoopEngine>>,
+    task_id: i32,
+) -> Result<(), AppCommandError> {
+    override_loop_oscillation_core(&db.conn, &EventEmitter::Tauri(app), engine.inner(), task_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]

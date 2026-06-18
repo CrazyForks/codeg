@@ -72,7 +72,17 @@ struct FanInManifest {
     /// The issue branch tip at claim time — the integrate branch's base AND the
     /// CAS `expected_old` for the landing.
     issue_base_oid: String,
+    /// D12: stable epoch anchor — the active task set at claim time, sorted. Resume
+    /// validates "fan-in set complete" against THIS exact set, never live DB state.
+    /// `#[serde(default)]` tolerates a pre-D12 (v1) manifest that lacked it.
+    #[serde(default)]
+    active_task_ids: Vec<i32>,
+    /// Delta tasks (carry a frozen commit) — the topological merge order.
     ordered: Vec<FanInEntry>,
+    /// D12: no-op tasks (agent-declared satisfied; no commit) — recorded for
+    /// provenance, skipped by the merge. `ordered ∪ skipped == active_task_ids`.
+    #[serde(default)]
+    skipped_no_op_task_ids: Vec<i32>,
 }
 
 impl FanInManifest {
@@ -83,14 +93,69 @@ impl FanInManifest {
             .collect()
     }
 
-    fn task_ids(&self) -> Vec<i32> {
-        self.ordered.iter().map(|e| e.task_id).collect()
+    /// All member task ids — delta (merged) ∪ no-op (skipped). The provenance set
+    /// the result capstone links `ResultsFrom`, so no-op tasks are not dropped from
+    /// the lineage (D12).
+    fn all_member_task_ids(&self) -> Vec<i32> {
+        self.ordered
+            .iter()
+            .map(|e| e.task_id)
+            .chain(self.skipped_no_op_task_ids.iter().copied())
+            .collect()
     }
 }
 
 fn parse_manifest(json: &str) -> Result<FanInManifest, LoopError> {
-    serde_json::from_str(json)
-        .map_err(|e| LoopError::InvalidInput(format!("fan-in manifest decode: {e}")))
+    let m: FanInManifest = serde_json::from_str(json)
+        .map_err(|e| LoopError::InvalidInput(format!("fan-in manifest decode: {e}")))?;
+    // D12 (Codex r1): validate the v2 partition on resume too, not only at build —
+    // `ordered ∪ skipped_no_op_task_ids == active_task_ids`. A v1 manifest (no
+    // `active_task_ids`, pre-D12) skips the check. Guards against a corrupted /
+    // hand-edited manifest stranding a task on replay.
+    if !m.active_task_ids.is_empty() {
+        let mut covered: Vec<i32> = m
+            .ordered
+            .iter()
+            .map(|e| e.task_id)
+            .chain(m.skipped_no_op_task_ids.iter().copied())
+            .collect();
+        covered.sort_unstable();
+        let mut active = m.active_task_ids.clone();
+        active.sort_unstable();
+        if covered != active {
+            return Err(LoopError::Git(
+                "fan-in manifest partition does not cover the active task set (resume)".into(),
+            ));
+        }
+    }
+    Ok(m)
+}
+
+/// The all-no_op fast-path decision (D12, Codex r2). An all-no_op manifest
+/// (`ordered` empty) means no task contributed a commit, so the integration MUST be
+/// exactly the issue base. This is decided BEFORE the landed-recovery check, whose
+/// `all_frozen_ancestors` predicate is vacuously true for an empty `ordered` and
+/// would otherwise mistake any moved tip for "already landed".
+#[derive(Debug, PartialEq, Eq)]
+enum NoOpGate {
+    /// Empty manifest and the branch is at base → finish (idempotent).
+    FinishAtBase,
+    /// Empty manifest but the branch advanced past base → anomalous; block, never
+    /// synthesize a result against an unreviewed tip.
+    BlockMovedTip,
+    /// Has frozen commits → not an all-no_op session; fall through to normal flow.
+    NotAllNoOp,
+}
+
+fn no_op_gate(manifest: &FanInManifest, issue_tip: &str) -> NoOpGate {
+    if !manifest.ordered.is_empty() {
+        return NoOpGate::NotAllNoOp;
+    }
+    if issue_tip == manifest.issue_base_oid {
+        NoOpGate::FinishAtBase
+    } else {
+        NoOpGate::BlockMovedTip
+    }
 }
 
 /// Drive a parallel issue's result-stage fan-in for one tick. Returns
@@ -148,7 +213,9 @@ pub(crate) async fn run_parallel_finalize(
             }
         }
     };
-    let task_ids = manifest.task_ids();
+    // Provenance set = ALL members (delta + no-op), so the result capstone links
+    // every contributing task, not just the merged ones (D12).
+    let task_ids = manifest.all_member_task_ids();
 
     // Ensure the integrate worktree (attach-first preserves in-progress merges).
     let integrate = worktree::ensure_integrate_worktree(
@@ -160,12 +227,46 @@ pub(crate) async fn run_parallel_finalize(
     .await?;
     let integrate_path = integrate.worktree_path.clone();
 
+    let issue_tip = worktree::resolve_oid(repo_path, &format!("refs/heads/{issue_branch}")).await?;
+
+    // [D12] All-no_op fast path, decided BEFORE the landed-recovery check below:
+    // `all_frozen_ancestors` is vacuously true for an empty `ordered`, so a moved tip
+    // would otherwise be mistaken for "already landed" and synthesize a result against
+    // an unreviewed tip (Codex r2). `finish_landed` is idempotent and the capstone
+    // still links every no-op member for provenance.
+    match no_op_gate(&manifest, &issue_tip) {
+        NoOpGate::FinishAtBase => {
+            return finish_landed(
+                db,
+                emitter,
+                issue,
+                &task_ids,
+                &manifest_json,
+                repo_path,
+                &integrate_path,
+                issue_worktree_folder_id,
+            )
+            .await;
+        }
+        NoOpGate::BlockMovedTip => {
+            return block_fan_in(
+                db,
+                emitter,
+                issue,
+                "fan_in_all_no_op_unexpected_tip",
+                "every task declared a no-op but the issue branch advanced past its base",
+            )
+            .await;
+        }
+        NoOpGate::NotAllNoOp => {}
+    }
+
     // [recovery] Already landed? A prior land advanced the issue branch but we
     // crashed before synthesizing the result / clearing the session. The issue
-    // branch then contains every frozen commit. Repair-and-finish idempotently —
-    // crucially WITHOUT re-running the merge/validation, so flaky re-validation can
-    // never block work that already landed.
-    let issue_tip = worktree::resolve_oid(repo_path, &format!("refs/heads/{issue_branch}")).await?;
+    // branch then contains every frozen commit (and `ordered` is non-empty, so this
+    // check is not vacuous). Repair-and-finish idempotently — crucially WITHOUT
+    // re-running the merge/validation, so flaky re-validation can never block work
+    // that already landed.
     if issue_tip != manifest.issue_base_oid
         && all_frozen_ancestors(repo_path, &issue_tip, &manifest).await?
     {
@@ -397,22 +498,55 @@ async fn build_manifest(
     // a topological order keeps the merge sequence and any conflict blame sane.)
     tasks.sort_by(|a, b| a.sort.cmp(&b.sort).then(a.id.cmp(&b.id)));
 
+    // D12: partition Done tasks by contribution. Delta tasks (carry a frozen
+    // commit) form the merge order; no-op tasks (declared satisfied, NULL commit)
+    // are recorded for provenance and skipped by the merge.
     let mut ordered = Vec::with_capacity(tasks.len());
-    for t in tasks {
-        // `fan_in_commit` lives on the raw row, not the DAG DTO.
+    let mut skipped_no_op_task_ids = Vec::new();
+    for t in &tasks {
+        // `fan_in_commit` / `contribution_kind` live on the raw row, not the DTO.
         let row = loop_artifact::Entity::find_by_id(t.id)
             .one(&db.conn)
             .await?
             .ok_or_else(|| LoopError::NotFound(format!("task {}", t.id)))?;
-        let sha = row.fan_in_commit.ok_or_else(|| {
-            LoopError::Git(format!("done task {} has no frozen commit (invariant)", t.id))
-        })?;
-        ordered.push(FanInEntry { task_id: t.id, sha });
+        match row.contribution_kind {
+            loop_artifact::ContributionKind::Delta => {
+                let sha = row.fan_in_commit.ok_or_else(|| {
+                    LoopError::Git(format!(
+                        "delta task {} has no frozen commit (invariant)",
+                        t.id
+                    ))
+                })?;
+                ordered.push(FanInEntry { task_id: t.id, sha });
+            }
+            loop_artifact::ContributionKind::NoOp => skipped_no_op_task_ids.push(t.id),
+        }
     }
+
+    // Stable epoch anchor (r4 I4): the active task set at claim time, sorted. Every
+    // active task is Done here (the run_finalize gate), so this is exactly the
+    // partition's union — assert the partition is total so a future bug that drops a
+    // task from both buckets fails loudly rather than silently losing it.
+    let mut active_task_ids: Vec<i32> = tasks.iter().map(|t| t.id).collect();
+    active_task_ids.sort_unstable();
+    let mut covered: Vec<i32> = ordered
+        .iter()
+        .map(|e| e.task_id)
+        .chain(skipped_no_op_task_ids.iter().copied())
+        .collect();
+    covered.sort_unstable();
+    if covered != active_task_ids {
+        return Err(LoopError::Git(
+            "fan-in manifest partition does not cover the active task set (invariant)".into(),
+        ));
+    }
+
     Ok(FanInManifest {
-        v: 1,
+        v: 2,
         issue_base_oid,
+        active_task_ids,
         ordered,
+        skipped_no_op_task_ids,
     })
 }
 
@@ -600,4 +734,103 @@ async fn issue_has_inflight(db: &AppDatabase, issue_id: i32) -> Result<bool, Loo
         .one(&db.conn)
         .await?
         .is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D12: the provenance set is delta (merged) ∪ no-op (skipped) — every member,
+    /// so the result capstone never drops a no-op task from the lineage.
+    #[test]
+    fn all_member_task_ids_unions_delta_and_no_op() {
+        let m = FanInManifest {
+            v: 2,
+            issue_base_oid: "base".into(),
+            active_task_ids: vec![1, 2, 3, 4],
+            ordered: vec![
+                FanInEntry { task_id: 1, sha: "a".into() },
+                FanInEntry { task_id: 3, sha: "c".into() },
+            ],
+            skipped_no_op_task_ids: vec![2, 4],
+        };
+        let mut members = m.all_member_task_ids();
+        members.sort_unstable();
+        assert_eq!(members, vec![1, 2, 3, 4]);
+        // The merge order (ordered_pairs) carries ONLY delta commits.
+        assert_eq!(
+            m.ordered_pairs(),
+            vec![(1, "a".to_string()), (3, "c".to_string())]
+        );
+    }
+
+    /// A v2 manifest round-trips through the stored-JSON encode/parse path.
+    #[test]
+    fn manifest_v2_round_trips() {
+        let m = FanInManifest {
+            v: 2,
+            issue_base_oid: "deadbeef".into(),
+            active_task_ids: vec![5, 7],
+            ordered: vec![FanInEntry { task_id: 5, sha: "s5".into() }],
+            skipped_no_op_task_ids: vec![7],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back = parse_manifest(&json).unwrap();
+        assert_eq!(back.v, 2);
+        assert_eq!(back.active_task_ids, vec![5, 7]);
+        assert_eq!(back.skipped_no_op_task_ids, vec![7]);
+        assert_eq!(back.all_member_task_ids(), vec![5, 7]);
+    }
+
+    /// A pre-D12 (v1) manifest with no no-op fields still parses — the new fields
+    /// default to empty, so an all-delta manifest behaves exactly as before.
+    #[test]
+    fn manifest_v1_shape_parses_with_empty_defaults() {
+        let v1 = r#"{"v":1,"issue_base_oid":"base","ordered":[{"task_id":1,"sha":"a"}]}"#;
+        let m = parse_manifest(v1).unwrap();
+        assert!(m.active_task_ids.is_empty());
+        assert!(m.skipped_no_op_task_ids.is_empty());
+        assert_eq!(m.all_member_task_ids(), vec![1]);
+    }
+
+    /// Codex r1 regression: parse_manifest validates the v2 partition on resume.
+    /// A manifest whose `ordered ∪ skipped_no_op_task_ids` does not equal
+    /// `active_task_ids` (here task 9 is stranded by corruption / hand-edit) is
+    /// rejected rather than silently dropping that task from the merge.
+    #[test]
+    fn manifest_v2_partition_mismatch_rejected_on_parse() {
+        let bad = r#"{"v":2,"issue_base_oid":"base","active_task_ids":[5,7,9],"ordered":[{"task_id":5,"sha":"s5"}],"skipped_no_op_task_ids":[7]}"#;
+        let err = parse_manifest(bad).unwrap_err();
+        assert!(
+            matches!(err, LoopError::Git(_)),
+            "partition mismatch should be rejected, got {err:?}"
+        );
+    }
+
+    /// Codex r2: the all-no_op gate (decided before the landed-recovery check) finishes
+    /// ONLY when `tip == base`; a moved tip blocks rather than synthesizing a result
+    /// against an unreviewed tip, and a manifest with any frozen commit is not all-no_op.
+    #[test]
+    fn no_op_gate_finishes_only_at_base() {
+        let all_no_op = FanInManifest {
+            v: 2,
+            issue_base_oid: "base".into(),
+            active_task_ids: vec![1, 2],
+            ordered: vec![],
+            skipped_no_op_task_ids: vec![1, 2],
+        };
+        assert_eq!(no_op_gate(&all_no_op, "base"), NoOpGate::FinishAtBase);
+        assert_eq!(no_op_gate(&all_no_op, "moved"), NoOpGate::BlockMovedTip);
+
+        // A manifest with a frozen commit is never the all-no_op path, regardless of tip.
+        let has_delta = FanInManifest {
+            v: 2,
+            issue_base_oid: "base".into(),
+            active_task_ids: vec![1, 2],
+            ordered: vec![FanInEntry { task_id: 1, sha: "a".into() }],
+            skipped_no_op_task_ids: vec![2],
+        };
+        assert_eq!(no_op_gate(&has_delta, "base"), NoOpGate::NotAllNoOp);
+        assert_eq!(no_op_gate(&has_delta, "moved"), NoOpGate::NotAllNoOp);
+    }
 }

@@ -31,6 +31,7 @@ pub fn to_artifact_row(m: &loop_artifact::Model, issue_seq: i32) -> LoopArtifact
         produced_by_iteration_id: m.produced_by_iteration_id,
         verdict: m.verdict,
         attempt: m.attempt,
+        contribution_kind: m.contribution_kind,
         sort: m.sort,
         updated_at: m.updated_at,
     }

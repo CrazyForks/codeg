@@ -59,6 +59,20 @@ pub enum ReviewVerdict {
     Fail,
 }
 
+/// Whether a Done task contributed a real diff (its frozen `fan_in_commit`) or was
+/// an agent-declared no-op (already satisfied; `fan_in_commit IS NULL`). Only
+/// meaningful for parallel fan-in participants (D12); serial tasks always record
+/// `Delta` (the column is not read for serial issues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
+#[serde(rename_all = "snake_case")]
+pub enum ContributionKind {
+    #[sea_orm(string_value = "delta")]
+    Delta,
+    #[sea_orm(string_value = "no_op")]
+    NoOp,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "loop_artifact")]
 pub struct Model {
@@ -84,6 +98,14 @@ pub struct Model {
     pub sort: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// D12: real-diff (`Delta`) vs agent-declared no-op (`NoOp`) for a Done task.
+    /// Defaults to `Delta`; `no_op ⇔ fan_in_commit IS NULL` (parallel fan-in).
+    pub contribution_kind: ContributionKind,
+    /// D14: oscillation breaker epoch counter (consecutive same-signature blocks).
+    pub oscillation_count: i32,
+    /// D14: the `block_sig` of the current oscillation epoch (NULL when not blocked
+    /// in an epoch). Stepped/reset together with `oscillation_count`.
+    pub recent_failure_sig: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

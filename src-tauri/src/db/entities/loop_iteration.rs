@@ -120,6 +120,10 @@ pub struct Model {
     /// Why the run ended (D11). Write-once via `set_iteration_outcome`; NULL while
     /// in flight or for a settled implement run awaiting its checkpoint.
     pub outcome: Option<IterationOutcome>,
+    /// D12: the implement agent's free-text reason when it declares the task already
+    /// satisfied (`loop_task_complete`), else NULL. Truncated at the write; read by
+    /// `finish_implement` (route to review) and the review briefing.
+    pub agent_completion_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

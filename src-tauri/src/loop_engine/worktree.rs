@@ -19,6 +19,7 @@ use sea_orm::{
 };
 
 use crate::db::entities::loop_artifact;
+use crate::db::entities::loop_issue;
 use crate::db::entities::loop_link::{self, LinkKind};
 use crate::db::service::{folder_service, loop_service};
 use crate::loop_engine::{validation, LoopError};
@@ -244,15 +245,84 @@ async fn task_base_ref(
             .ok_or_else(|| {
                 LoopError::NotFound(format!("predecessor task {}", link.to_artifact_id))
             })?;
-        let sha = pred.fan_in_commit.ok_or_else(|| {
-            LoopError::Git(format!(
-                "predecessor task {} has no frozen commit yet",
-                pred.id
-            ))
-        })?;
-        return Ok(sha);
+        // D12: a `NoOp` predecessor produced NO commit (its HEAD == its own
+        // integration base, `fan_in_commit IS NULL` by invariant). This task must
+        // branch from the SAME base the no-op predecessor used — recurse up the
+        // single-predecessor chain to the first `Delta`'s frozen commit (or the
+        // issue branch tip at the chain root). A `Delta` predecessor MUST carry a
+        // frozen commit; a NULL there is an invariant breach, never silently
+        // treated as a no-op. Recursion is bounded: `depends_on` is a single,
+        // strictly-backward predecessor (acyclic by the ingest guard).
+        match pred.contribution_kind {
+            loop_artifact::ContributionKind::NoOp => {
+                return Box::pin(task_base_ref(conn, space_id, issue_seq, pred.id)).await;
+            }
+            loop_artifact::ContributionKind::Delta => {
+                let sha = pred.fan_in_commit.ok_or_else(|| {
+                    LoopError::Git(format!(
+                        "delta predecessor task {} has no frozen commit yet",
+                        pred.id
+                    ))
+                })?;
+                return Ok(sha);
+            }
+        }
     }
     Ok(format!("loop/{space_id}/issue-{issue_seq}"))
+}
+
+/// D12: resolve the OID a parallel task's worktree branched from (its pinned
+/// integration base) WITHOUT creating or rebuilding a worktree — read-only.
+/// `freeze_and_done` uses it to discriminate a no-op task (HEAD == base, no
+/// commit) from a delta (HEAD advanced); force-complete uses it for a
+/// defence-in-depth clean-tree check. Honours the no-op-predecessor recursion in
+/// [`task_base_ref`], so the base is stable across the task's lifetime (fan-in
+/// runs strictly after all tasks are Done, so neither the issue tip nor a
+/// predecessor's frozen commit moves between create and done).
+pub async fn task_base_oid(
+    conn: &DatabaseConnection,
+    issue: &loop_issue::Model,
+    task_id: i32,
+) -> Result<String, LoopError> {
+    let space = loop_service::space::get_space(conn, issue.space_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("space {}", issue.space_id)))?;
+    let repo = folder_service::get_folder_by_id(conn, space.folder_id)
+        .await?
+        .ok_or(LoopError::Detached)?;
+    let repo_path = PathBuf::from(&repo.path);
+    let base_ref = task_base_ref(conn, issue.space_id, issue.seq_no, task_id).await?;
+    resolve_oid(&repo_path, &base_ref).await
+}
+
+/// D15 defence (read-only): whether a parallel task's branch HEAD still equals its
+/// pinned integration base — i.e. the task carries NO committed delta, so a human
+/// force-complete-as-no-op would discard nothing. `None` when the task branch does
+/// not resolve (it never built one), so the caller skips the check and relies on
+/// the empty-diff cause guard. Checks the branch ref directly (no worktree folder
+/// needed), so it holds even if the on-disk worktree was pruned.
+pub async fn task_branch_at_base(
+    conn: &DatabaseConnection,
+    issue: &loop_issue::Model,
+    task_id: i32,
+) -> Result<Option<bool>, LoopError> {
+    let space = loop_service::space::get_space(conn, issue.space_id)
+        .await?
+        .ok_or_else(|| LoopError::NotFound(format!("space {}", issue.space_id)))?;
+    let repo = folder_service::get_folder_by_id(conn, space.folder_id)
+        .await?
+        .ok_or(LoopError::Detached)?;
+    let repo_path = PathBuf::from(&repo.path);
+    let branch = format!(
+        "loop/{}/issue-{}-task-{}",
+        issue.space_id, issue.seq_no, task_id
+    );
+    // Branch absent (never built) → can't verify; let the cause guard stand.
+    let Ok(head) = resolve_oid(&repo_path, &format!("refs/heads/{branch}")).await else {
+        return Ok(None);
+    };
+    let base = task_base_oid(conn, issue, task_id).await?;
+    Ok(Some(head == base))
 }
 
 /// Create (or re-attach) a per-task worktree + branch for **parallel-mode** task
@@ -976,6 +1046,87 @@ mod tests {
         .await
         .unwrap();
         (db, repo, data, issue.row.id, space.id, issue.row.seq_no)
+    }
+
+    async fn mk_done_task(
+        conn: &DatabaseConnection,
+        space_id: i32,
+        issue_id: i32,
+        title: &str,
+    ) -> i32 {
+        loop_service::artifact::create_artifact(
+            conn,
+            space_id,
+            issue_id,
+            loop_artifact::ArtifactKind::Task,
+            title,
+            loop_artifact::ArtifactStatus::Done,
+            crate::db::entities::loop_artifact_revision::ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn set_contribution(
+        conn: &DatabaseConnection,
+        id: i32,
+        kind: loop_artifact::ContributionKind,
+        commit: Option<String>,
+    ) {
+        let mut am = loop_artifact::Entity::find_by_id(id)
+            .one(conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        am.contribution_kind = Set(kind);
+        am.fan_in_commit = Set(commit);
+        am.update(conn).await.unwrap();
+    }
+
+    async fn dep_link(conn: &DatabaseConnection, space_id: i32, from: i32, to: i32) {
+        // DependsOn: from = successor, to = predecessor.
+        loop_service::link::create_link(conn, space_id, from, to, LinkKind::DependsOn, None)
+            .await
+            .unwrap();
+    }
+
+    /// D12: `task_base_ref` recurses through no-op predecessors to the first delta's
+    /// frozen commit (or the issue branch tip at the chain root), and still errors
+    /// when a delta predecessor lacks a frozen commit (invariant breach).
+    #[tokio::test]
+    async fn task_base_ref_recurses_through_no_op_predecessors() {
+        let (db, _repo, _data, issue_id, space_id, seq) = setup().await;
+        let conn = &db.conn;
+        let commit_a = "a".repeat(40);
+
+        // Chain A(delta, frozen) ← B(no_op) ← C: C's base is A's frozen commit.
+        let a = mk_done_task(conn, space_id, issue_id, "A").await;
+        let b = mk_done_task(conn, space_id, issue_id, "B").await;
+        let c = mk_done_task(conn, space_id, issue_id, "C").await;
+        set_contribution(conn, a, loop_artifact::ContributionKind::Delta, Some(commit_a.clone())).await;
+        set_contribution(conn, b, loop_artifact::ContributionKind::NoOp, None).await;
+        dep_link(conn, space_id, b, a).await;
+        dep_link(conn, space_id, c, b).await;
+        assert_eq!(task_base_ref(conn, space_id, seq, c).await.unwrap(), commit_a);
+
+        // A no-op chain rooted at a task with no predecessor resolves to the issue tip.
+        let d = mk_done_task(conn, space_id, issue_id, "D").await;
+        let e = mk_done_task(conn, space_id, issue_id, "E").await;
+        set_contribution(conn, d, loop_artifact::ContributionKind::NoOp, None).await;
+        dep_link(conn, space_id, e, d).await;
+        assert_eq!(
+            task_base_ref(conn, space_id, seq, e).await.unwrap(),
+            format!("loop/{space_id}/issue-{seq}")
+        );
+
+        // A delta predecessor with NO frozen commit is an invariant breach → error.
+        let f = mk_done_task(conn, space_id, issue_id, "F").await; // delta (default), commit NULL
+        let g = mk_done_task(conn, space_id, issue_id, "G").await;
+        dep_link(conn, space_id, g, f).await;
+        assert!(task_base_ref(conn, space_id, seq, g).await.is_err());
     }
 
     #[tokio::test]

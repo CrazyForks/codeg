@@ -39,6 +39,56 @@ pub async fn get_iteration(
     Ok(loop_iteration::Entity::find_by_id(id).one(conn).await?)
 }
 
+/// D12: the reason from the most recent implement iteration of `task_id` that
+/// declared the task already complete (via `loop_task_complete`) AND routed there
+/// as a genuine no-op, if any. The review briefing surfaces it so the reviewer
+/// verifies the acceptance criteria against the current worktree HEAD rather than
+/// expecting a fresh checkpoint commit to inspect.
+///
+/// Gated on `outcome = declared_complete` (Codex r1): an agent that calls
+/// `loop_task_complete` but ALSO makes a real diff settles with
+/// `outcome = succeeded` (the non-empty checkpoint path), so its reason must NOT
+/// surface the misleading "no checkpoint commit" note. Only the actual empty-diff
+/// declared path records `declared_complete`.
+pub async fn latest_declared_completion_reason(
+    conn: &impl sea_orm::ConnectionTrait,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<Option<String>, DbError> {
+    Ok(loop_iteration::Entity::find()
+        .filter(loop_iteration::Column::IssueId.eq(issue_id))
+        .filter(loop_iteration::Column::TargetArtifactId.eq(task_id))
+        .filter(loop_iteration::Column::Stage.eq(loop_iteration::Stage::Implement))
+        .filter(loop_iteration::Column::Outcome.eq(IterationOutcome::DeclaredComplete))
+        .filter(loop_iteration::Column::AgentCompletionReason.is_not_null())
+        .order_by_desc(loop_iteration::Column::Id)
+        .one(conn)
+        .await?
+        .and_then(|m| m.agent_completion_reason))
+}
+
+/// D12: clear the declared-completion reason on ALL of a task's implement
+/// iterations. Called when review REJECTS a declared no-op, so a stale claim can
+/// never route a future empty attempt straight to review again (the next empty
+/// diff must be treated as genuine no-progress).
+pub async fn clear_declared_completion(
+    conn: &impl sea_orm::ConnectionTrait,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<(), DbError> {
+    loop_iteration::Entity::update_many()
+        .col_expr(
+            loop_iteration::Column::AgentCompletionReason,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(loop_iteration::Column::IssueId.eq(issue_id))
+        .filter(loop_iteration::Column::TargetArtifactId.eq(task_id))
+        .filter(loop_iteration::Column::Stage.eq(loop_iteration::Stage::Implement))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
 /// Write-once outcome (D11): set `outcome` only while it is still NULL. Returns
 /// `true` iff it wrote. Making the column immutable once set means a stale /
 /// CAS-lost `abandoned` write can never clobber a real `succeeded` / `empty_diff`
@@ -276,5 +326,165 @@ mod tests {
         assert_eq!(live[0].target_artifact_id, Some(task.id));
         assert_eq!(live[0].target_title.as_deref(), Some("T"));
         assert_eq!(live[0].status, IterationStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn declared_completion_reason_round_trip_and_clear() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/repo").await;
+        let sp = space::create_space(&db.conn, "S", folder).await.unwrap();
+        let iss = issue::create_issue(
+            &db.conn,
+            sp.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        let task = artifact::create_artifact(
+            &db.conn,
+            sp.id,
+            iss.row.id,
+            ArtifactKind::Task,
+            "T",
+            ArtifactStatus::InProgress,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // No declaration yet.
+        assert_eq!(
+            latest_declared_completion_reason(&db.conn, iss.row.id, task.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // An implement iteration declares completion. The declared no-op
+        // settlement path (gates::finish_implement) records BOTH the reason and
+        // `outcome = declared_complete` — mirror that here so the surfacing query
+        // (which gates on the outcome, Codex r1) matches production.
+        let it = try_claim_iteration(
+            &db.conn,
+            IterationClaim {
+                space_id: sp.id,
+                issue_id: iss.row.id,
+                stage: Stage::Implement,
+                target_artifact_id: Some(task.id),
+                slot_no: None,
+                capability_token: "tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::AgentCompletionReason,
+                Expr::value("already satisfied"),
+            )
+            .filter(loop_iteration::Column::Id.eq(it.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        assert!(set_iteration_outcome(&db.conn, it.id, IterationOutcome::DeclaredComplete)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            latest_declared_completion_reason(&db.conn, iss.row.id, task.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("already satisfied")
+        );
+
+        // Review rejection clears it → a future empty attempt is genuine no-progress.
+        clear_declared_completion(&db.conn, iss.row.id, task.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest_declared_completion_reason(&db.conn, iss.row.id, task.id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Codex r1 regression: an agent that calls `loop_task_complete` but ALSO
+    /// makes a real diff settles with `outcome = succeeded` (the non-empty
+    /// checkpoint path), not `declared_complete`. Its stale reason must NOT be
+    /// surfaced — otherwise the review briefing would wrongly tell the reviewer
+    /// "no checkpoint commit to inspect" for an iteration that did produce one.
+    #[tokio::test]
+    async fn declared_reason_not_surfaced_after_real_diff() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/repo").await;
+        let sp = space::create_space(&db.conn, "S", folder).await.unwrap();
+        let iss = issue::create_issue(
+            &db.conn,
+            sp.id,
+            "I",
+            "b",
+            IssuePriority::Medium,
+            Some(&IssueConfig::default()),
+        )
+        .await
+        .unwrap();
+        let task = artifact::create_artifact(
+            &db.conn,
+            sp.id,
+            iss.row.id,
+            ArtifactKind::Task,
+            "T",
+            ArtifactStatus::InProgress,
+            ActorKind::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let it = try_claim_iteration(
+            &db.conn,
+            IterationClaim {
+                space_id: sp.id,
+                issue_id: iss.row.id,
+                stage: Stage::Implement,
+                target_artifact_id: Some(task.id),
+                slot_no: None,
+                capability_token: "tok".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Reason recorded (the agent called loop_task_complete) ...
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::AgentCompletionReason,
+                Expr::value("thought it was done"),
+            )
+            .filter(loop_iteration::Column::Id.eq(it.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        // ... but the checkpoint found a real diff, so it settled `succeeded`.
+        assert!(set_iteration_outcome(&db.conn, it.id, IterationOutcome::Succeeded)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            latest_declared_completion_reason(&db.conn, iss.row.id, task.id)
+                .await
+                .unwrap(),
+            None,
+            "a real-diff iteration's reason must not surface as a declared no-op"
+        );
     }
 }

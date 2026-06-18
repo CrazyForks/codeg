@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 
 use crate::db::entities::loop_artifact::{self, ArtifactKind, ArtifactStatus};
@@ -446,7 +446,7 @@ pub async fn get_inbox(
 /// pending card to handled, `false` if it was already handled (idempotent) — so
 /// callers emit `loop://changed` (the badge dropping) only on a real change.
 pub async fn handle_inbox(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl ConnectionTrait,
     id: i32,
     resolution: serde_json::Value,
 ) -> Result<bool, DbError> {
@@ -465,4 +465,116 @@ pub async fn handle_inbox(
     active.handled_at = Set(Some(Utc::now()));
     active.update(conn).await?;
     Ok(true)
+}
+
+/// Resolve a single task's pending blocker cards by task-level `subject_key`
+/// (`{prefix}:{task_id}` for each prefix in `subjects` — `no_progress` /
+/// `validation_blocked` / `infra_failure` / `oscillation`). Used by the
+/// oscillation promotion and `retry` (both EXCLUDING `oscillation`, which clears
+/// only via an explicit human exit) and by force-complete / override (INCLUDING
+/// `oscillation`). Returns how many cards it actually handled (callers may emit on
+/// `> 0`). Takes `&impl ConnectionTrait` so it runs both directly and inside the
+/// exit-action transactions (C8/C10).
+pub async fn resolve_task_blocker_cards(
+    conn: &impl ConnectionTrait,
+    issue_id: i32,
+    task_id: i32,
+    subjects: &[&str],
+    resolution: serde_json::Value,
+) -> Result<u64, DbError> {
+    let keys: Vec<String> = subjects.iter().map(|p| format!("{p}:{task_id}")).collect();
+    let cards = loop_inbox_item::Entity::find()
+        .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+        .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+        .filter(loop_inbox_item::Column::SubjectKey.is_in(keys))
+        .all(conn)
+        .await?;
+    let mut n = 0;
+    for c in cards {
+        if handle_inbox(conn, c.id, resolution.clone()).await? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// D15: the `failure_sig` of a task's MOST RECENT pending blocker card — the
+/// authoritative CURRENT block reason (Codex r1). Force-complete gates on THIS,
+/// not the artifact's `recent/last_failure_sig` columns, which non-no-progress
+/// block paths (validation-unrunnable, infra) leave stale: a task re-blocked for
+/// validation after an earlier empty-diff must NOT pass the empty-diff guard.
+/// Returns None when there is no pending blocker card or it carries no
+/// `failure_sig` (e.g. a validation/infra card).
+pub async fn task_blocker_failure_sig(
+    conn: &impl ConnectionTrait,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<Option<String>, DbError> {
+    let keys: Vec<String> = ["no_progress", "validation_blocked", "infra_failure", "oscillation"]
+        .iter()
+        .map(|p| format!("{p}:{task_id}"))
+        .collect();
+    let card = loop_inbox_item::Entity::find()
+        .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+        .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+        .filter(loop_inbox_item::Column::SubjectKey.is_in(keys))
+        .order_by_desc(loop_inbox_item::Column::Id)
+        .one(conn)
+        .await?;
+    Ok(card.and_then(|c| {
+        serde_json::from_str::<serde_json::Value>(&c.payload)
+            .ok()
+            .and_then(|p| {
+                p.get("failure_sig")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+    }))
+}
+
+/// D17: whether the task currently has a pending `oscillation:{task_id}` card — the
+/// precondition for `override_oscillation`. Distinguishes a genuinely breaker-promoted
+/// task from any other blocked task, so the override endpoint can reject a generic
+/// blocked-task reset (the UI only ever offers override on oscillation cards).
+pub async fn has_pending_oscillation_card(
+    conn: &impl ConnectionTrait,
+    issue_id: i32,
+    task_id: i32,
+) -> Result<bool, DbError> {
+    Ok(loop_inbox_item::Entity::find()
+        .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+        .filter(loop_inbox_item::Column::SubjectKey.eq(format!("oscillation:{task_id}")))
+        .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+        .one(conn)
+        .await?
+        .is_some())
+}
+
+/// D13: resolve ALL of an issue's pending `Blocked`-kind cards EXCEPT task-level
+/// `oscillation:` cards (those clear only via override / force-complete). This is
+/// the broad `retry` sweep — every issue-level block (dirty finalize, merge fault,
+/// dependency, ...) plus the re-armed tasks' ordinary blockers — without
+/// enumerating subjects, so it never drifts as new block reasons are added.
+/// Returns how many it handled.
+pub async fn resolve_blocked_cards_except_oscillation(
+    conn: &impl ConnectionTrait,
+    issue_id: i32,
+    resolution: serde_json::Value,
+) -> Result<u64, DbError> {
+    let cards = loop_inbox_item::Entity::find()
+        .filter(loop_inbox_item::Column::IssueId.eq(issue_id))
+        .filter(loop_inbox_item::Column::Kind.eq(InboxKind::Blocked))
+        .filter(loop_inbox_item::Column::Status.eq(InboxStatus::Pending))
+        .all(conn)
+        .await?;
+    let mut n = 0;
+    for c in cards {
+        if c.subject_key.starts_with("oscillation:") {
+            continue;
+        }
+        if handle_inbox(conn, c.id, resolution.clone()).await? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }

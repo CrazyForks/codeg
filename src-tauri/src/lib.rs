@@ -1051,6 +1051,8 @@ mod tauri_app {
                 loops_commands::resume_loop_issue,
                 loops_commands::cancel_loop_issue,
                 loops_commands::retry_loop_issue,
+                loops_commands::force_complete_loop_task,
+                loops_commands::override_loop_oscillation,
                 loops_commands::add_loop_issue_budget,
                 loops_commands::approve_loop_merge,
                 loops_commands::reject_loop_merge,

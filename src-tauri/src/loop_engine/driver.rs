@@ -45,7 +45,7 @@ use crate::loop_engine::dispatch::{
 };
 use crate::loop_engine::error::LoopError;
 use crate::loop_engine::gates;
-use crate::loop_engine::transitions::cas_issue_status;
+use crate::loop_engine::transitions::{cas_issue_repark_if_wedged, cas_issue_status};
 use crate::loop_engine::LoopEngine;
 
 /// Liveness oracle for the reconcile backstop — implemented by `ConnectionManager`
@@ -872,6 +872,20 @@ pub(crate) async fn tick_once(
     if config.auto_merge && gates::integration_passed(&db.conn, &dag).await? {
         return Ok(TickOutcome::AutoMerge);
     }
+
+    // Global re-park invariant (D13/r4 I2): we reached the end of the tick — read
+    // frontier empty, write pipeline + finalize idle, auto-merge did not fire. If
+    // the issue is genuinely wedged (atomic fresh check: a blocked task, nothing
+    // pending/in_progress, no in-flight iteration), park it `blocked` so a human
+    // exit (retry / override / force-complete — all require a blocked issue) can
+    // reach it, instead of parking `running` with no completion path. The single
+    // conditional UPDATE closes the race with a concurrent exit (a re-armed task or
+    // a completed last-blocked one makes the WHERE false). On re-park, re-tick: the
+    // top-of-tick guard then sees `blocked` and Stops cleanly.
+    if cas_issue_repark_if_wedged(conn, issue_id).await? {
+        emit_changed(emitter, issue.space_id, issue.id, issue.id, "blocked");
+        return Ok(TickOutcome::Advanced);
+    }
     Ok(TickOutcome::Idle)
 }
 
@@ -1125,7 +1139,7 @@ mod tests {
     use super::*;
     use crate::acp::error::AcpError;
     use sea_orm::ActiveEnum; // for `IssueStatus::*.to_value()` in test helpers
-    use crate::db::entities::loop_artifact::ArtifactKind;
+    use crate::db::entities::loop_artifact::{ArtifactKind, ContributionKind};
     use crate::db::entities::loop_inbox_item::{self, InboxStatus};
     use crate::db::entities::loop_issue::IssuePriority;
     use crate::db::service::loop_service::{issue, space};
@@ -1155,6 +1169,7 @@ mod tests {
             produced_by_iteration_id: None,
             verdict: None,
             attempt: 0,
+            contribution_kind: ContributionKind::Delta,
             sort: id,
             updated_at: Utc::now(),
         }
@@ -2305,6 +2320,7 @@ mod tests {
             produced_by_iteration_id: None,
             verdict: None,
             attempt: 0,
+            contribution_kind: ContributionKind::Delta,
             sort: 0,
             updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };
@@ -2383,6 +2399,7 @@ mod tests {
             produced_by_iteration_id: None,
             verdict: None,
             attempt: 0,
+            contribution_kind: ContributionKind::Delta,
             sort: 0,
             updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };

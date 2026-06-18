@@ -138,7 +138,12 @@ fn stage_instruction(stage: Stage) -> &'static str {
         Stage::Implement => {
             "Implement the task in the provided worktree. Make the change, keep it \
              scoped to this task, and ensure the acceptance criteria are met. The \
-             engine commits your work — you do not need to commit."
+             engine commits your work — you do not need to commit. If, after \
+             inspecting the worktree, you find EVERY acceptance criterion is ALREADY \
+             satisfied and no change is needed (for example a dependency task already \
+             delivered it), do NOT end your turn with an empty result — call \
+             `loop_task_complete` with a concrete reason so the engine sends the task \
+             to review instead of treating the empty diff as a stuck failure."
         }
         Stage::Review => {
             "Review the implementation against the acceptance-criteria checklist \
@@ -207,7 +212,9 @@ fn tool_contract(stage: Stage) -> &'static str {
         }
         Stage::Implement => {
             "Do not call a submit tool — the engine detects and commits your \
-             worktree changes. If you are blocked, call `loop_report_blocked`."
+             worktree changes. If the task is already fully satisfied and needs no \
+             change, call `loop_task_complete` with a `reason` (do not just end \
+             empty). If you are blocked, call `loop_report_blocked`."
         }
         Stage::Review => {
             "Call `loop_submit_review` exactly once. Put one entry in `checks` for \
@@ -902,6 +909,24 @@ pub async fn assemble_briefing(
             ));
             components.push(json!({ "section": "review_context", "base": base }));
         }
+        // D12: if the implementer declared this task already satisfied (no change
+        // needed), tell the reviewer there is no fresh checkpoint commit to inspect
+        // — verify the acceptance criteria against the integrated HEAD instead.
+        if let Some(target) = target_artifact_id {
+            if let Some(reason) =
+                loop_service::iteration::latest_declared_completion_reason(conn, issue.id, target)
+                    .await?
+            {
+                sections.push(format!(
+                    "# Implementer declared this task already complete\nThe implementer made NO \
+                     change, declaring the task already satisfied: \"{}\". There is no new \
+                     checkpoint commit to inspect — verify the acceptance criteria hold against \
+                     the current worktree HEAD (its dependencies' integrated state).",
+                    reason.trim()
+                ));
+                components.push(json!({ "section": "declared_complete" }));
+            }
+        }
         if let Some(target) = target_artifact_id {
             if let Some(run) = loop_service::validation::latest_for_task(conn, target).await? {
                 sections.push(format!(
@@ -1012,8 +1037,12 @@ mod tests {
     use crate::db::entities::loop_artifact_revision::ActorKind;
     use crate::db::entities::loop_criterion::CriterionKind;
     use crate::db::entities::loop_issue::IssuePriority;
+    use crate::db::entities::loop_iteration;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::loop_engine::transitions::{try_claim_iteration, IterationClaim};
     use crate::models::loops::IssueConfig;
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     /// Seed space + issue (auto-creates the kind=issue root artifact). Returns
     /// `(db, space_id, issue_model, root_artifact_id)`.
@@ -1225,6 +1254,75 @@ mod tests {
             t.contains("Alpha") && t.contains("Beta") && t.contains("Gamma"),
             "design must see every requirement, not just one"
         );
+    }
+
+    #[tokio::test]
+    async fn implement_offers_task_complete_and_review_surfaces_declared() {
+        let (db, space, issue, root) = seed().await;
+        let req = add_node(
+            &db, space, issue.id, ArtifactKind::Requirement, "R1", "req", &["AC holds"], root,
+        )
+        .await;
+        let task =
+            add_node(&db, space, issue.id, ArtifactKind::Task, "T1", "do it", &[], req).await;
+
+        // Implement briefing tells the agent about loop_task_complete (D12 contract).
+        let impl_out = assemble_briefing(&db.conn, &issue, Stage::Implement, Some(task))
+            .await
+            .unwrap();
+        assert!(
+            impl_out.text.contains("loop_task_complete"),
+            "implement briefing must mention the declaration tool"
+        );
+
+        // Review briefing WITHOUT a declared completion → no declared section.
+        let before = assemble_briefing(&db.conn, &issue, Stage::Review, Some(task))
+            .await
+            .unwrap();
+        assert!(!before.text.contains("declared this task already complete"));
+
+        // Record a declared-complete implement iteration for this task.
+        let it = try_claim_iteration(
+            &db.conn,
+            IterationClaim {
+                space_id: space,
+                issue_id: issue.id,
+                stage: Stage::Implement,
+                target_artifact_id: Some(task),
+                slot_no: None,
+                capability_token: "brief-decl".into(),
+                attempt: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        loop_iteration::Entity::update_many()
+            .col_expr(
+                loop_iteration::Column::AgentCompletionReason,
+                Expr::value("dependency already shipped it"),
+            )
+            .filter(loop_iteration::Column::Id.eq(it.id))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        // The declared no-op settlement records `outcome = declared_complete`; the
+        // briefing's surfacing query gates on it (Codex r1), so mirror production.
+        loop_service::iteration::set_iteration_outcome(
+            &db.conn,
+            it.id,
+            crate::db::entities::loop_iteration::IterationOutcome::DeclaredComplete,
+        )
+        .await
+        .unwrap();
+
+        // Review briefing now surfaces it with the verify-against-HEAD note.
+        let after = assemble_briefing(&db.conn, &issue, Stage::Review, Some(task))
+            .await
+            .unwrap();
+        assert!(after.text.contains("declared this task already complete"));
+        assert!(after.text.contains("dependency already shipped it"));
+        assert!(after.text.contains("current worktree HEAD"));
     }
 
     #[tokio::test]

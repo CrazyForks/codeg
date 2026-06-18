@@ -227,6 +227,40 @@ pub async fn retry_loop_issue(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskIdParam {
+    pub task_id: i32,
+}
+
+pub async fn force_complete_loop_task(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<TaskIdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::force_complete_loop_task_core(
+        &state.db.conn,
+        &state.emitter,
+        &state.loop_engine,
+        p.task_id,
+    )
+    .await?;
+    Ok(Json(()))
+}
+
+pub async fn override_loop_oscillation(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(p): Json<TaskIdParam>,
+) -> Result<Json<()>, AppCommandError> {
+    core::override_loop_oscillation_core(
+        &state.db.conn,
+        &state.emitter,
+        &state.loop_engine,
+        p.task_id,
+    )
+    .await?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AddBudgetParams {
     pub id: i32,
     pub additional: i64,

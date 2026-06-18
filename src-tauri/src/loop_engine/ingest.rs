@@ -262,6 +262,7 @@ pub async fn ingest(
         "loop_submit_artifacts" => submit_artifacts(conn, &it, payload).await,
         "loop_submit_review" => submit_review(conn, &it, payload).await,
         "loop_report_blocked" => report_blocked(conn, &it, payload).await,
+        "loop_task_complete" => task_complete(conn, &it, payload).await,
         "loop_record_memory" => record_memory(conn, &it, payload).await,
         "loop_read_memory" => read_memory(conn, &it, payload).await,
         "loop_submit_reflection" => submit_reflection(conn, &it, payload).await,
@@ -982,6 +983,46 @@ async fn report_blocked(
     Ok(json!({ "ok": true }))
 }
 
+/// D12: the implement agent declares the task already satisfied (a dependency
+/// delivered the work / nothing to change) instead of ending its turn with an
+/// empty diff. Records the free-text reason on the iteration; the checkpoint path
+/// (`finish_implement`) reads it to route the task to review with
+/// `outcome=declared_complete` rather than treating the empty diff as a stuck
+/// no-progress failure. The review gate still verifies the acceptance criteria
+/// against the current worktree HEAD.
+async fn task_complete(
+    conn: &DatabaseConnection,
+    it: &loop_iteration::Model,
+    payload: &Value,
+) -> Result<Value, LoopError> {
+    // Stage allow-table: only an implement iteration may declare task completion.
+    if it.stage != Stage::Implement {
+        return Err(invalid("loop_task_complete is only valid during implement"));
+    }
+    // Implement iterations are task-scoped; a missing target means this token does
+    // not back a task — reject rather than record an orphan claim.
+    if it.target_artifact_id.is_none() {
+        return Err(invalid(
+            "loop_task_complete requires a task-scoped implement iteration",
+        ));
+    }
+    let reason = payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("loop_task_complete requires a non-empty `reason`"))?;
+    loop_iteration::Entity::update_many()
+        .col_expr(
+            loop_iteration::Column::AgentCompletionReason,
+            sea_orm::sea_query::Expr::value(truncate(reason)),
+        )
+        .filter(loop_iteration::Column::Id.eq(it.id))
+        .exec(conn)
+        .await?;
+    Ok(json!({ "ok": true }))
+}
+
 async fn record_memory(
     conn: &DatabaseConnection,
     it: &loop_iteration::Model,
@@ -1361,6 +1402,51 @@ mod tests {
         let err = ingest(&db.conn, "tok-refine", "loop_submit_route", &json!({"route":"full"}))
             .await
             .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn task_complete_records_reason_only_during_implement() {
+        let (db, space, issue, root) = seed().await;
+
+        // Implement iteration → records the declared reason, returns ok.
+        let it_id =
+            running_iter(&db.conn, space, issue, Stage::Implement, Some(root), "tok-impl").await;
+        let out = ingest(
+            &db.conn,
+            "tok-impl",
+            "loop_task_complete",
+            &json!({ "reason": "page already renders the component from task #2" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["ok"], json!(true));
+        let it = loop_service::iteration::get_iteration(&db.conn, it_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            it.agent_completion_reason.as_deref(),
+            Some("page already renders the component from task #2")
+        );
+
+        // Empty/whitespace reason → rejected (reuse the same running implement
+        // iteration; no orphan claim is recorded).
+        let err = ingest(&db.conn, "tok-impl", "loop_task_complete", &json!({ "reason": "  " }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoopError::InvalidInput(_)));
+
+        // A non-implement stage (review) may not declare task completion.
+        let _ = running_iter(&db.conn, space, issue, Stage::Review, Some(root), "tok-rev").await;
+        let err = ingest(
+            &db.conn,
+            "tok-rev",
+            "loop_task_complete",
+            &json!({ "reason": "nothing to do" }),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LoopError::InvalidInput(_)));
     }
 

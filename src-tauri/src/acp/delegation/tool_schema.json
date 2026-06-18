@@ -235,6 +235,20 @@
     }
   },
   {
+    "name": "loop_task_complete",
+    "description": "Loop engineering — during IMPLEMENT only: declare this task already complete with NO code change needed (its acceptance criteria are already satisfied — e.g. a dependency task already delivered the work). Call this INSTEAD of ending your turn with no edits, so the engine routes the task to review rather than treating the empty result as a stuck no-progress failure. Provide a concrete reason.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "Why no change is needed (e.g. 'app/page.tsx already renders <TankBattleGame/> from task #12')."
+        }
+      }
+    }
+  },
+  {
     "name": "loop_record_memory",
     "description": "Loop engineering — record a durable lesson for this space that future iterations should know. Use sparingly for genuinely reusable knowledge (a constraint discovered, a decision made, a pitfall to avoid), not per-task notes.",
     "inputSchema": {
