@@ -4,8 +4,10 @@ import { useCallback, useMemo, useSyncExternalStore } from "react"
 
 import {
   loopNavToSearch,
+  navClearFocus,
   navCloseArtifact,
   navCloseSpace,
+  navFocusArtifact,
   navGotoIssue,
   navOpenArtifact,
   navOpenSpace,
@@ -81,6 +83,11 @@ export function useLoopNav() {
       closeArtifact: () => apply(navCloseArtifact),
       openSettings: () => apply((n) => navSetSettings(n, true)),
       closeSettings: () => apply((n) => navSetSettings(n, false)),
+      // Locate an artifact in the graph from anywhere (inbox, a related-card
+      // action): jump to its issue, open its drawer, and ask the graph to pulse.
+      focusArtifact: (spaceId: number, issueId: number, artifactId: number) =>
+        apply((n) => navFocusArtifact(n, spaceId, issueId, artifactId)),
+      clearFocus: () => apply(navClearFocus),
     }),
     [apply]
   )

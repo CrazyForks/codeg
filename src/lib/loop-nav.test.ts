@@ -2,8 +2,12 @@ import { describe, it, expect } from "vitest"
 import {
   DEFAULT_LOOP_NAV,
   loopNavToSearch,
+  navClearFocus,
+  navCloseArtifact,
   navCloseSpace,
+  navFocusArtifact,
   navGotoIssue,
+  navOpenArtifact,
   navOpenSpace,
   navSelectIssue,
   navSetTab,
@@ -26,6 +30,7 @@ describe("loop-nav model", () => {
       tab: "issues",
       artifact: 12,
       settings: true,
+      focus: null,
     })
   })
 
@@ -44,6 +49,7 @@ describe("loop-nav model", () => {
       tab: "inbox",
       artifact: null,
       settings: false,
+      focus: null,
     }
     expect(parseLoopNav(loopNavToSearch(nav, ""))).toEqual(nav)
   })
@@ -94,6 +100,7 @@ describe("loop-nav transitions (cascade invariants)", () => {
     tab: "issues",
     artifact: 12,
     settings: true,
+    focus: null,
   }
 
   it("opening a different space clears issue/artifact/settings", () => {
@@ -137,11 +144,51 @@ describe("loop-nav transitions (cascade invariants)", () => {
       tab: "issues",
       artifact: null,
       settings: false,
+      focus: null,
     })
   })
 
   it("leaving the issues tab drops the settings flag", () => {
     expect(navSetTab(seeded, "inbox").settings).toBe(false)
     expect(navSetTab(seeded, "issues").settings).toBe(true)
+  })
+
+  it("focusArtifact jumps to the issue, opens the drawer, and sets focus", () => {
+    expect(navFocusArtifact(DEFAULT_LOOP_NAV, 3, 8, 21)).toEqual({
+      loops: true,
+      space: 3,
+      issue: 8,
+      tab: "issues",
+      artifact: 21,
+      settings: false,
+      focus: 21,
+    })
+  })
+
+  it("clearFocus consumes a pending focus (no-op when already null)", () => {
+    const focused = navFocusArtifact(DEFAULT_LOOP_NAV, 3, 8, 21)
+    expect(navClearFocus(focused).focus).toBeNull()
+    expect(navClearFocus(DEFAULT_LOOP_NAV)).toBe(DEFAULT_LOOP_NAV)
+  })
+
+  it("a focus is dropped when it leaves the issues tab or loses its issue", () => {
+    const focused = navFocusArtifact(DEFAULT_LOOP_NAV, 3, 8, 21)
+    expect(navSetTab(focused, "inbox").focus).toBeNull()
+    // Round-trips through the URL but normalizes away once off the issues tab.
+    expect(parseLoopNav("?loops=1&space=3&tab=inbox&focus=21").focus).toBeNull()
+    expect(
+      parseLoopNav("?loops=1&space=3&issue=8&tab=issues&focus=21").focus
+    ).toBe(21)
+  })
+
+  it("opening or closing an artifact by hand drops a pending focus", () => {
+    const focused = navFocusArtifact(DEFAULT_LOOP_NAV, 3, 8, 21)
+    expect(focused.focus).toBe(21)
+    // A deliberate open of a different artifact supersedes the locate request.
+    const opened = navOpenArtifact(focused, 99)
+    expect(opened.artifact).toBe(99)
+    expect(opened.focus).toBeNull()
+    // Closing the drawer also drops a still-unconsumed focus.
+    expect(navCloseArtifact(focused).focus).toBeNull()
   })
 })

@@ -65,6 +65,8 @@ function makeIssue(over: Partial<LoopIssueDetail> = {}): LoopIssueDetail {
     route: "full",
     token_used: 0,
     token_budget: 50000,
+    blocking_count: 0,
+    notice_count: 0,
     created_at: "2026-06-14T00:00:00Z",
     updated_at: "2026-06-14T00:00:00Z",
     description: "",

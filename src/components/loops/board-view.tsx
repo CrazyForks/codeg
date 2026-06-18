@@ -2,13 +2,17 @@
 
 import { useMemo } from "react"
 import { useTranslations } from "next-intl"
+import { TriangleAlert } from "lucide-react"
 
+import type { AttentionKey } from "@/lib/loop-attention"
 import type {
   LoopArtifactKind,
   LoopArtifactRow,
+  LoopInboxItemRow,
   LoopIterationRow,
   LoopStage,
 } from "@/lib/types"
+import { cn } from "@/lib/utils"
 import { ArtifactStatusBadge } from "@/components/loops/issue-badges"
 
 // One read-only column per artifact kind (the issue root is the container, not a
@@ -46,11 +50,15 @@ const STAGE_COLUMN: Partial<Record<LoopStage, LoopArtifactKind>> = {
 export function BoardView({
   artifacts,
   liveIterations,
+  attentionMap,
   onSelect,
 }: {
   artifacts: LoopArtifactRow[]
   /** queued|running iterations — drives in-flight ghost cards per column. */
   liveIterations: LoopIterationRow[]
+  /** Pending inbox cards keyed by the node they concern (D8): a card whose
+   *  `artifact:{id}` key has items shows an amber attention ring + alert glyph. */
+  attentionMap?: Map<AttentionKey, LoopInboxItemRow[]>
   onSelect: (id: number) => void
 }) {
   const t = useTranslations("Loops.boardView")
@@ -151,22 +159,50 @@ export function BoardView({
                   </span>
                 </div>
               ))}
-              {cards.map((a) => (
-                <button
-                  key={a.id}
-                  type="button"
-                  onClick={() => onSelect(a.id)}
-                  className="flex w-full flex-col gap-1.5 rounded-md border bg-card p-2 text-left hover:bg-accent"
-                >
-                  <span className="line-clamp-2 text-xs">{a.title}</span>
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-mono text-[10px] text-muted-foreground">
-                      #{a.issue_seq}
-                    </span>
-                    <ArtifactStatusBadge status={a.status} />
-                  </div>
-                </button>
-              ))}
+              {cards.map((a) => {
+                const attentionCount =
+                  attentionMap?.get(`artifact:${a.id}`)?.length ?? 0
+                const attention = attentionCount > 0
+                const attentionLabel = attention
+                  ? tDag("attention", { count: attentionCount })
+                  : undefined
+                return (
+                  <button
+                    key={a.id}
+                    type="button"
+                    onClick={() => onSelect(a.id)}
+                    aria-label={
+                      attentionLabel
+                        ? `${a.title} — ${attentionLabel}`
+                        : a.title
+                    }
+                    className={cn(
+                      "flex w-full flex-col gap-1.5 rounded-md border bg-card p-2 text-left hover:bg-accent",
+                      attention && "ring-2 ring-amber-500/70"
+                    )}
+                  >
+                    <div className="flex items-start gap-1.5">
+                      <span className="line-clamp-2 flex-1 text-xs">
+                        {a.title}
+                      </span>
+                      {attention && (
+                        <span title={attentionLabel}>
+                          <TriangleAlert
+                            aria-hidden
+                            className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400"
+                          />
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        #{a.issue_seq}
+                      </span>
+                      <ArtifactStatusBadge status={a.status} />
+                    </div>
+                  </button>
+                )
+              })}
             </div>
           </div>
         )

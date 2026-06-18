@@ -33,6 +33,8 @@ const approveLoopDesign = vi.fn().mockResolvedValue(undefined)
 const rejectLoopDesign = vi.fn().mockResolvedValue(undefined)
 const approveLoopMerge = vi.fn().mockResolvedValue(undefined)
 const rejectLoopMerge = vi.fn().mockResolvedValue(undefined)
+const listLoopIterations = vi.fn().mockResolvedValue([])
+const listLoopInbox = vi.fn().mockResolvedValue([])
 vi.mock("@/lib/loops-api", () => ({
   getLoopArtifact: (...a: unknown[]) => getLoopArtifact(...a),
   getLoopIssue: (...a: unknown[]) => getLoopIssue(...a),
@@ -41,6 +43,18 @@ vi.mock("@/lib/loops-api", () => ({
   rejectLoopDesign: (...a: unknown[]) => rejectLoopDesign(...a),
   approveLoopMerge: (...a: unknown[]) => approveLoopMerge(...a),
   rejectLoopMerge: (...a: unknown[]) => rejectLoopMerge(...a),
+  listLoopIterations: (...a: unknown[]) => listLoopIterations(...a),
+  listLoopInbox: (...a: unknown[]) => listLoopInbox(...a),
+}))
+
+// The drawer reads `nav.space` to scope its iteration/inbox lookups and opens
+// sessions through the overlays context; stub both so the body renders solo.
+vi.mock("@/hooks/use-loop-nav", () => ({
+  useLoopNav: () => ({ nav: { space: 1 } }),
+}))
+const openIteration = vi.fn()
+vi.mock("@/components/loops/loop-overlays-context", () => ({
+  useLoopOverlays: () => ({ openIteration }),
 }))
 
 // Radix Sheet/Dialog portal through to document.body and need browser APIs jsdom
@@ -117,6 +131,8 @@ function issue(status: LoopIssueDetail["status"]): LoopIssueDetail {
     route: "full",
     token_used: 0,
     token_budget: null,
+    blocking_count: 0,
+    notice_count: 0,
     created_at: "2026-06-14T00:00:00Z",
     updated_at: "2026-06-14T00:00:00Z",
     description: "",

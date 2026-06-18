@@ -18,6 +18,7 @@ import type {
 } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
 import { useLoopResource } from "@/hooks/use-loop-resource"
+import { AttentionBadges } from "@/components/loops/attention-badges"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -246,6 +247,10 @@ export function IssueList({
                     <IssueStatusBadge status={issue.status} />
                     <IssuePriorityBadge priority={issue.priority} />
                     <IssueRouteBadge route={issue.route} />
+                    <AttentionBadges
+                      blocking={issue.blocking_count}
+                      notice={issue.notice_count}
+                    />
                   </div>
                 </div>
               </li>

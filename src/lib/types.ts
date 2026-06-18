@@ -537,6 +537,10 @@ export interface LoopSpaceSummary {
   detached: boolean
   issue_count: number
   running_count: number
+  /** Pending-inbox attention rolled up over the space's issues (D6/D7).
+   *  `blocking` = approval/blocked/budget/question; `notice` = reflection_failed. */
+  blocking_count: number
+  notice_count: number
   last_activity_at: string | null
   created_at: string
   /** The space's default issue config (always present — every space stores a
@@ -556,6 +560,9 @@ export interface LoopIssueRow {
   route: LoopIssueRoute
   token_used: number
   token_budget: number | null
+  /** Pending-inbox attention for this issue (D6/D7), same split as the space. */
+  blocking_count: number
+  notice_count: number
   created_at: string
   updated_at: string
 }
@@ -675,6 +682,17 @@ export interface LoopDagView {
   live_iterations: LoopIterationRow[]
 }
 
+/** Why an iteration ended (D11). `declared_complete` is a Phase-C value, listed
+ *  now so the UI need no Phase-C edit. `null` = still in flight, or a settled
+ *  implement run before its checkpoint — the UI renders no outcome badge then. */
+export type LoopIterationOutcome =
+  | "succeeded"
+  | "empty_diff"
+  | "validation_failed"
+  | "declared_complete"
+  | "no_artifacts"
+  | "abandoned"
+
 export interface LoopIterationRow {
   id: number
   issue_id: number
@@ -687,6 +705,7 @@ export interface LoopIterationRow {
   launched_by: LoopLaunchedBy
   attempt: number
   tokens_used: number
+  outcome: LoopIterationOutcome | null
   created_at: string
   started_at: string | null
   ended_at: string | null
@@ -711,7 +730,26 @@ export interface LoopInboxItemRow {
   subject_key: string
   payload: unknown
   status: LoopInboxStatus
+  /** The artifact this card concerns, resolved at read time (D9); `null` for
+   *  issue-level cards with no backing artifact. */
+  subject_artifact_id: number | null
+  /** That artifact's title, so the card is self-contained. */
+  subject_title: string | null
   created_at: string
+}
+
+/** One space's pending-inbox attention, for the global sidebar badge (D7). */
+export interface LoopSpaceAttention {
+  space_id: number
+  blocking: number
+  notice: number
+}
+
+/** Cross-space attention rollup (D6/D7) — powers the "who needs me" badge. */
+export interface LoopAttention {
+  total_blocking: number
+  total_notice: number
+  per_space: LoopSpaceAttention[]
 }
 
 export interface LoopMemoryRow {

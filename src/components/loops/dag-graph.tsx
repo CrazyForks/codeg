@@ -1,7 +1,8 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
+import { TriangleAlert } from "lucide-react"
 
 import {
   buildDag,
@@ -10,9 +11,11 @@ import {
   type DagCluster,
   type PendingNode,
 } from "@/lib/loop-dag"
+import type { AttentionKey } from "@/lib/loop-attention"
 import type {
   LoopArtifactRow,
   LoopArtifactStatus,
+  LoopInboxItemRow,
   LoopIterationRow,
   LoopLinkRow,
   LoopReviewVerdict,
@@ -47,6 +50,35 @@ const STATUS_DOT: Record<LoopArtifactStatus, string> = {
   cancelled: "bg-muted-foreground/30",
 }
 
+/**
+ * The single ring a node shows, in priority order: a transient locate pulse wins
+ * (so a just-located node is unmistakable), then an attention ring (amber — a
+ * pending inbox card concerns it, D8), then the executing ring (sky). `inset` is
+ * used inside a bordered cluster header so the ring doesn't clip.
+ */
+function nodeRingClass(
+  opts: { pulsing: boolean; attention: boolean; executing: boolean },
+  inset = false
+): string {
+  const i = inset ? " ring-inset" : ""
+  if (opts.pulsing)
+    return "ring-2 ring-sky-400 ring-offset-2 ring-offset-background animate-pulse"
+  if (opts.attention) return `ring-2 ring-amber-500/70${i}`
+  if (opts.executing) return `ring-2 ring-sky-500/50${i}`
+  return ""
+}
+
+/** A small amber alert glyph marking a node that has pending inbox cards (D8).
+ *  Decorative; the count/meaning rides on the node's title + aria-label. */
+function AttentionMark() {
+  return (
+    <TriangleAlert
+      aria-hidden
+      className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400"
+    />
+  )
+}
+
 /** Height of a cluster's folded reviews block (0 when the task has no reviews). */
 function reviewsBlockHeight(reviews: LoopArtifactRow[]): number {
   const { latest, olderCount } = foldReviews(reviews)
@@ -69,6 +101,9 @@ export function DagGraph({
   links,
   liveIterations,
   executingIds,
+  attentionMap,
+  focus,
+  onFocusConsumed,
   onSelect,
   onOpenIteration,
 }: {
@@ -78,6 +113,14 @@ export function DagGraph({
   liveIterations: LoopIterationRow[]
   /** Namespaced executing keys (`artifact:{id}`) for nodes with a live iteration. */
   executingIds: Set<string>
+  /** Pending inbox cards keyed by the node they concern (D8). A node whose
+   *  `artifact:{id}` key has cards shows an amber attention ring + alert glyph. */
+  attentionMap?: Map<AttentionKey, LoopInboxItemRow[]>
+  /** A locate request: scroll this artifact's node into view and pulse it, then
+   *  call `onFocusConsumed`. Replayed on layout changes so it lands even when the
+   *  graph mounts after the request (Codex r1 I6). */
+  focus?: number | null
+  onFocusConsumed?: () => void
   onSelect: (artifactId: number) => void
   /** Open a ghost's live iteration session (when it has a conversation). */
   onOpenIteration?: (pending: PendingNode) => void
@@ -98,6 +141,60 @@ export function DagGraph({
       }),
     [artifacts, links, liveIterations, showSuperseded]
   )
+
+  // Locate-in-graph: when a `focus` request lands and its node is rendered,
+  // scroll to it and pulse it for a moment, then consume the request. Re-runs on
+  // layout changes so a focus set before the data arrived still resolves; if the
+  // node never renders (e.g. a focus on a hidden superseded node), the request is
+  // left for a later layout — the drawer remains the reliable locator regardless.
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [pulsingId, setPulsingId] = useState<number | null>(null)
+  const pulseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The graph has data once any node would render; only then is a missing focus
+  // target genuinely absent (vs. still loading / mounting after the request).
+  const layoutReady =
+    layout.stageNodes.length > 0 ||
+    layout.clusters.length > 0 ||
+    layout.result != null ||
+    layout.reflection != null ||
+    layout.pending.length > 0 ||
+    layout.supersededCount > 0
+  useEffect(() => {
+    if (focus == null) return
+    const el = rootRef.current?.querySelector<HTMLElement>(
+      `[data-artifact-id="${focus}"]`
+    )
+    if (!el) {
+      // Node not in the current layout. If the graph has data, the target is
+      // genuinely absent (superseded/hidden/gone) → consume so a stale focus can
+      // never pulse an unrelated node later. If the graph is still empty (data
+      // loading, or it mounted after the request) keep focus for replay.
+      if (layoutReady) onFocusConsumed?.()
+      return
+    }
+    el.scrollIntoView({ block: "center", inline: "center" })
+    // Reacting to an external locate request (URL nav) by scrolling the DOM and
+    // flashing a transient pulse — a legitimate effect→setState, like the
+    // sidebar's localStorage hydrate.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPulsingId(focus)
+    if (pulseTimer.current) clearTimeout(pulseTimer.current)
+    pulseTimer.current = setTimeout(() => setPulsingId(null), 1600)
+    onFocusConsumed?.()
+  }, [focus, layout, layoutReady, onFocusConsumed])
+  useEffect(
+    () => () => {
+      if (pulseTimer.current) clearTimeout(pulseTimer.current)
+    },
+    []
+  )
+  // Per-node attention count. The issue root additionally surfaces issue-level
+  // cards (budget / dependency / coverage / triage / reflect) that
+  // `buildAttentionMap` roots at "issue-root"; without this they'd be grouped but
+  // never ring any node (Codex r2).
+  const nodeAttentionCount = (a: LoopArtifactRow): number =>
+    (attentionMap?.get(`artifact:${a.id}`)?.length ?? 0) +
+    (a.kind === "issue" ? (attentionMap?.get("issue-root")?.length ?? 0) : 0)
 
   const geom = useMemo(() => {
     const stageLayout = layout.stageNodes.map((node) => ({
@@ -233,7 +330,7 @@ export function DagGraph({
   }
 
   return (
-    <div className="flex flex-col gap-2">
+    <div ref={rootRef} className="flex flex-col gap-2">
       {layout.supersededCount > 0 && (
         <button
           type="button"
@@ -288,9 +385,12 @@ export function DagGraph({
             y={y}
             executing={executingIds.has(`artifact:${node.artifact.id}`)}
             dimmed={isDead(node.artifact.status)}
+            attentionCount={nodeAttentionCount(node.artifact)}
+            pulsing={pulsingId === node.artifact.id}
             kindLabel={tKind(node.artifact.kind)}
             statusLabel={tStatus(node.artifact.status)}
             executingLabel={tDetail("executingNow")}
+            attentionLabelOf={(count) => tDag("attention", { count })}
             onSelect={onSelect}
           />
         ))}
@@ -304,9 +404,12 @@ export function DagGraph({
               `artifact:${geom.resultLayout.artifact.id}`
             )}
             dimmed={isDead(geom.resultLayout.artifact.status)}
+            attentionCount={nodeAttentionCount(geom.resultLayout.artifact)}
+            pulsing={pulsingId === geom.resultLayout.artifact.id}
             kindLabel={tKind(geom.resultLayout.artifact.kind)}
             statusLabel={tStatus(geom.resultLayout.artifact.status)}
             executingLabel={tDetail("executingNow")}
+            attentionLabelOf={(count) => tDag("attention", { count })}
             onSelect={onSelect}
           />
         )}
@@ -320,9 +423,12 @@ export function DagGraph({
               `artifact:${geom.reflectionLayout.artifact.id}`
             )}
             dimmed={isDead(geom.reflectionLayout.artifact.status)}
+            attentionCount={nodeAttentionCount(geom.reflectionLayout.artifact)}
+            pulsing={pulsingId === geom.reflectionLayout.artifact.id}
             kindLabel={tKind(geom.reflectionLayout.artifact.kind)}
             statusLabel={tStatus(geom.reflectionLayout.artifact.status)}
             executingLabel={tDetail("executingNow")}
+            attentionLabelOf={(count) => tDag("attention", { count })}
             onSelect={onSelect}
           />
         )}
@@ -337,11 +443,14 @@ export function DagGraph({
             height={height}
             dimmed={isDead(cluster.task.status)}
             executingIds={executingIds}
+            attentionCount={nodeAttentionCount(cluster.task)}
+            pulsing={pulsingId === cluster.task.id}
             kindLabel={tKind(cluster.task.kind)}
             reviewKindLabel={tKind("review")}
             statusLabelOf={(s) => tStatus(s)}
             verdictLabelOf={(v) => tVerdict(v)}
             executingLabel={tDetail("executingNow")}
+            attentionLabelOf={(count) => tDag("attention", { count })}
             olderLabelOf={(count) => tDetail("reviewsOlder", { count })}
             onSelect={onSelect}
           />
@@ -438,9 +547,12 @@ function NodeCard({
   y,
   executing,
   dimmed,
+  attentionCount,
+  pulsing,
   kindLabel,
   statusLabel,
   executingLabel,
+  attentionLabelOf,
   onSelect,
 }: {
   artifact: LoopArtifactRow
@@ -448,20 +560,30 @@ function NodeCard({
   y: number
   executing: boolean
   dimmed: boolean
+  attentionCount: number
+  pulsing: boolean
   kindLabel: string
   statusLabel: string
   executingLabel: string
+  attentionLabelOf: (count: number) => string
   onSelect: (artifactId: number) => void
 }) {
+  const attention = attentionCount > 0
+  const attentionLabel = attention ? attentionLabelOf(attentionCount) : null
   return (
     <button
       type="button"
+      data-artifact-id={artifact.id}
       onClick={() => onSelect(artifact.id)}
       style={{ left: x, top: y, width: NODE_W, height: HEADER_H }}
-      aria-label={`${kindLabel}: ${artifact.title}`}
+      aria-label={
+        attentionLabel
+          ? `${kindLabel}: ${artifact.title} — ${attentionLabel}`
+          : `${kindLabel}: ${artifact.title}`
+      }
       className={cn(
         "absolute flex flex-col justify-center gap-1 rounded-lg border bg-card px-3 py-2 text-left shadow-sm outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
-        executing && "ring-2 ring-sky-500/50",
+        nodeRingClass({ pulsing, attention, executing }),
         dimmed && "opacity-50"
       )}
     >
@@ -474,6 +596,11 @@ function NodeCard({
         <span className="text-[0.625rem] uppercase tracking-wide text-muted-foreground">
           {kindLabel}
         </span>
+        {attention && (
+          <span className="ml-auto" title={attentionLabel ?? undefined}>
+            <AttentionMark />
+          </span>
+        )}
       </div>
       <span className="truncate text-sm font-medium">{artifact.title}</span>
     </button>
@@ -489,11 +616,14 @@ function ClusterCard({
   height,
   dimmed,
   executingIds,
+  attentionCount,
+  pulsing,
   kindLabel,
   reviewKindLabel,
   statusLabelOf,
   verdictLabelOf,
   executingLabel,
+  attentionLabelOf,
   olderLabelOf,
   onSelect,
 }: {
@@ -504,22 +634,29 @@ function ClusterCard({
   height: number
   dimmed: boolean
   executingIds: Set<string>
+  attentionCount: number
+  pulsing: boolean
   kindLabel: string
   reviewKindLabel: string
   statusLabelOf: (s: LoopArtifactStatus) => string
   verdictLabelOf: (v: LoopReviewVerdict) => string
   executingLabel: string
+  attentionLabelOf: (count: number) => string
   olderLabelOf: (count: number) => string
   onSelect: (artifactId: number) => void
 }) {
   const { task } = cluster
   const taskExecuting = executingIds.has(`artifact:${task.id}`)
   const hasReviews = fold.latest.length > 0 || fold.olderCount > 0
+  const attention = attentionCount > 0
+  const attentionLabel = attention ? attentionLabelOf(attentionCount) : null
   return (
     <div
+      data-artifact-id={task.id}
       style={{ left: x, top: y, width: NODE_W, height }}
       className={cn(
         "absolute flex flex-col overflow-hidden rounded-lg border bg-card shadow-sm",
+        nodeRingClass({ pulsing, attention, executing: false }),
         dimmed && "opacity-50"
       )}
     >
@@ -527,7 +664,11 @@ function ClusterCard({
         type="button"
         onClick={() => onSelect(task.id)}
         style={{ height: HEADER_H }}
-        aria-label={`${kindLabel}: ${task.title}`}
+        aria-label={
+          attentionLabel
+            ? `${kindLabel}: ${task.title} — ${attentionLabel}`
+            : `${kindLabel}: ${task.title}`
+        }
         className={cn(
           "flex flex-col justify-center gap-1 px-3 py-2 text-left outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           taskExecuting && "ring-2 ring-inset ring-sky-500/50"
@@ -542,6 +683,11 @@ function ClusterCard({
           <span className="text-[0.625rem] uppercase tracking-wide text-muted-foreground">
             {kindLabel}
           </span>
+          {attention && (
+            <span className="ml-auto" title={attentionLabel ?? undefined}>
+              <AttentionMark />
+            </span>
+          )}
         </div>
         <span className="truncate text-sm font-medium">{task.title}</span>
       </button>

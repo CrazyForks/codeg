@@ -322,6 +322,7 @@ function iter(
     launched_by: "engine",
     attempt: 0,
     tokens_used: 0,
+    outcome: null,
     created_at: "2026-06-17T00:00:00Z",
     started_at: "2026-06-17T00:00:00Z",
     ended_at: null,

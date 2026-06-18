@@ -9,6 +9,7 @@ import {
   cancelLoopIssue,
   getLoopDag,
   getLoopIssue,
+  listLoopInbox,
   pauseLoopIssue,
   resumeLoopIssue,
   triggerLoopIssue,
@@ -16,11 +17,13 @@ import {
 import type {
   IssueConfig,
   LoopArtifactRow,
+  LoopInboxItemRow,
   LoopIssueDetail,
   LoopIterationRow,
   LoopLinkRow,
 } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
+import { buildAttentionMap } from "@/lib/loop-attention"
 import { useLoopResource } from "@/hooks/use-loop-resource"
 import { useLoopNav } from "@/hooks/use-loop-nav"
 import { Button } from "@/components/ui/button"
@@ -59,6 +62,7 @@ interface IssueDetailData {
   artifacts: LoopArtifactRow[]
   links: LoopLinkRow[]
   liveIterations: LoopIterationRow[]
+  inbox: LoopInboxItemRow[]
 }
 
 const EMPTY_ISSUE_DETAIL: IssueDetailData = {
@@ -66,6 +70,7 @@ const EMPTY_ISSUE_DETAIL: IssueDetailData = {
   artifacts: [],
   links: [],
   liveIterations: [],
+  inbox: [],
 }
 
 export function IssueDetail({
@@ -82,7 +87,8 @@ export function IssueDetail({
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
 
-  const { nav, openArtifact, openSettings, closeSettings } = useLoopNav()
+  const { nav, openArtifact, openSettings, closeSettings, clearFocus } =
+    useLoopNav()
   const { openIteration } = useLoopOverlays()
   const settingsOpen = nav.settings
   const [actionBusy, setActionBusy] = useState(false)
@@ -101,6 +107,12 @@ export function IssueDetail({
         getLoopDag(issueId),
       ])
       if (!detail) return EMPTY_ISSUE_DETAIL
+      // This issue's pending inbox cards drive the per-node attention rings (D8).
+      // Fetched from the space pane and narrowed to this issue; a failed fetch
+      // just yields no rings (the cards still surface in the space inbox).
+      const inbox = await listLoopInbox(detail.space_id, "pending")
+        .then((rows) => rows.filter((r) => r.issue_id === issueId))
+        .catch(() => [] as LoopInboxItemRow[])
       // In-flight iterations ride on the DAG view (single authoritative fetch):
       // they drive the "executing now" highlight + the real-time ghost nodes and
       // stage rail. Read-stage artifacts land done/pending, so status alone can't
@@ -110,6 +122,7 @@ export function IssueDetail({
         artifacts: dag.artifacts,
         links: dag.links,
         liveIterations: dag.live_iterations,
+        inbox,
       }
     },
     {
@@ -120,6 +133,13 @@ export function IssueDetail({
   )
   const issue = data.detail
   const { artifacts, links, liveIterations } = data
+
+  // Pending inbox cards grouped onto the nodes they concern (D8) — drives the
+  // amber attention rings on the graph and board.
+  const attentionMap = useMemo(
+    () => buildAttentionMap(data.inbox),
+    [data.inbox]
+  )
 
   // Namespaced executing keys (`artifact:{id}`) for nodes with a live iteration:
   // the issue root while triage runs, and the target task while implement/review
@@ -329,6 +349,9 @@ export function IssueDetail({
                 links={links}
                 liveIterations={liveIterations}
                 executingIds={executingIds}
+                attentionMap={attentionMap}
+                focus={nav.focus}
+                onFocusConsumed={clearFocus}
                 onSelect={openArtifact}
                 onOpenIteration={onOpenIteration}
               />
@@ -345,6 +368,7 @@ export function IssueDetail({
               <BoardView
                 artifacts={artifacts}
                 liveIterations={liveIterations}
+                attentionMap={attentionMap}
                 onSelect={openArtifact}
               />
             </TabsContent>

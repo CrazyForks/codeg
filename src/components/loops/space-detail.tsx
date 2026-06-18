@@ -25,6 +25,7 @@ import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
 import { IssueList } from "@/components/loops/issue-list"
 import { IssueDetail } from "@/components/loops/issue-detail"
 import { InboxPanel } from "@/components/loops/inbox-panel"
+import { AttentionBadges } from "@/components/loops/attention-badges"
 import { IterationList } from "@/components/loops/iteration-list"
 import { ArtifactList } from "@/components/loops/artifact-list"
 import { MemoryPanel } from "@/components/loops/memory-panel"
@@ -101,7 +102,13 @@ export function SpaceDetail({
             <TabsTrigger value="issues">{t("tabIssues")}</TabsTrigger>
             <TabsTrigger value="iterations">{t("tabIterations")}</TabsTrigger>
             <TabsTrigger value="artifacts">{t("tabArtifacts")}</TabsTrigger>
-            <TabsTrigger value="inbox">{t("tabInbox")}</TabsTrigger>
+            <TabsTrigger value="inbox" className="gap-1.5">
+              {t("tabInbox")}
+              <AttentionBadges
+                blocking={space.blocking_count}
+                notice={space.notice_count}
+              />
+            </TabsTrigger>
             <TabsTrigger value="memory">{t("tabMemory")}</TabsTrigger>
           </TabsList>
           <Button

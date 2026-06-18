@@ -9,6 +9,7 @@ import type { LoopInboxItemRow } from "@/lib/types"
 const {
   stableT,
   listLoopInbox,
+  listLoopIterations,
   approveLoopDesign,
   rejectLoopDesign,
   approveLoopMerge,
@@ -16,9 +17,13 @@ const {
   retryLoopIssue,
   addLoopIssueBudget,
   cancelLoopIssue,
+  focusArtifact,
+  gotoIssue,
+  openIteration,
 } = vi.hoisted(() => ({
   stableT: (key: string) => key,
   listLoopInbox: vi.fn(),
+  listLoopIterations: vi.fn(),
   approveLoopDesign: vi.fn(),
   rejectLoopDesign: vi.fn(),
   approveLoopMerge: vi.fn(),
@@ -26,6 +31,9 @@ const {
   retryLoopIssue: vi.fn(),
   addLoopIssueBudget: vi.fn(),
   cancelLoopIssue: vi.fn(),
+  focusArtifact: vi.fn(),
+  gotoIssue: vi.fn(),
+  openIteration: vi.fn(),
 }))
 
 vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
@@ -33,8 +41,15 @@ vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
 vi.mock("@/components/loops/loop-realtime-context", () => ({
   useLoopRealtime: () => ({ register: () => () => {} }),
 }))
+vi.mock("@/hooks/use-loop-nav", () => ({
+  useLoopNav: () => ({ focusArtifact, gotoIssue }),
+}))
+vi.mock("@/components/loops/loop-overlays-context", () => ({
+  useLoopOverlays: () => ({ openIteration }),
+}))
 vi.mock("@/lib/loops-api", () => ({
   listLoopInbox,
+  listLoopIterations,
   approveLoopDesign,
   rejectLoopDesign,
   approveLoopMerge,
@@ -54,6 +69,8 @@ function item(over: Partial<LoopInboxItemRow> = {}): LoopInboxItemRow {
     subject_key: "design:7",
     payload: { gate: "design" },
     status: "pending",
+    subject_artifact_id: null,
+    subject_title: null,
     created_at: "2026-06-14T00:00:00Z",
     ...over,
   }
@@ -79,6 +96,9 @@ const budget = (over: Partial<LoopInboxItemRow> = {}) =>
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The panel's second resource (iteration→session map) must resolve; tests that
+  // exercise "open session" override this with specific rows.
+  listLoopIterations.mockResolvedValue([])
 })
 
 describe("InboxPanel", () => {

@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react"
 
-import type { AgentType, LoopStage } from "@/lib/types"
+import type { AgentType, LoopIterationOutcome, LoopStage } from "@/lib/types"
 import { IterationDialog } from "@/components/loops/iteration-dialog"
 
 /** Issue identity carried from an opener so the iteration viewer can show it and
@@ -26,6 +26,9 @@ interface OpenIterationArgs {
   conversationId: number
   agentType?: AgentType | null
   issueContext?: IterationIssueContext | null
+  /** The settled iteration's outcome (D11), shown in the viewer header. Null /
+   *  omitted for a still-running iteration or a question card. */
+  outcome?: LoopIterationOutcome | null
 }
 
 interface LoopOverlaysValue {
@@ -57,6 +60,7 @@ export function LoopOverlaysProvider({ children }: { children: ReactNode }) {
         conversationId={iteration?.conversationId ?? 0}
         agentType={iteration?.agentType ?? null}
         issueContext={iteration?.issueContext ?? null}
+        outcome={iteration?.outcome ?? null}
       />
     </Ctx.Provider>
   )

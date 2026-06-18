@@ -44,6 +44,7 @@ function iter(over: Partial<LoopIterationRow>): LoopIterationRow {
     launched_by: "engine",
     attempt: 0,
     tokens_used: 1234,
+    outcome: null,
     created_at: "2026-06-14T00:00:00Z",
     started_at: null,
     ended_at: null,
@@ -112,13 +113,20 @@ describe("IterationList", () => {
     // The `stage` field is optional on IterationIssueContext, so it is NOT
     // type-enforced here — assert it explicitly (review NB3).
     listLoopIterations.mockResolvedValue([
-      iter({ id: 1, conversation_id: 55, issue_id: 7, issue_seq: 3 }),
+      iter({
+        id: 1,
+        conversation_id: 55,
+        issue_id: 7,
+        issue_seq: 3,
+        outcome: "succeeded",
+      }),
     ])
     render(<IterationList spaceId={1} />)
 
     fireEvent.click(await screen.findByLabelText("openConversation"))
     expect(openIteration).toHaveBeenCalledWith({
       conversationId: 55,
+      outcome: "succeeded",
       issueContext: { spaceId: 1, issueId: 7, issueSeq: 3, stage: "implement" },
     })
   })

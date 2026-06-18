@@ -56,6 +56,8 @@ function makeSpace(over: Partial<LoopSpaceSummary> = {}): LoopSpaceSummary {
     detached: false,
     issue_count: 2,
     running_count: 1,
+    blocking_count: 0,
+    notice_count: 0,
     last_activity_at: null,
     created_at: "2026-06-13T00:00:00Z",
     default_config: defaultIssueConfig(),

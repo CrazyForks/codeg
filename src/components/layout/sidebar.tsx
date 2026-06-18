@@ -13,6 +13,8 @@ import {
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useLoopNav } from "@/hooks/use-loop-nav"
+import { useLoopAttentionBadge } from "@/hooks/use-loop-attention-badge"
+import { AttentionBadges } from "@/components/loops/attention-badges"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
@@ -66,6 +68,7 @@ export function Sidebar() {
   const { openNewConversationTab, openChatModeTab } = useTabContext()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { nav, toggleLoops } = useLoopNav()
+  const loopAttention = useLoopAttentionBadge()
   const isMac = useIsMac()
   const { shortcuts } = useShortcutSettings()
   const isMobile = useIsMobile()
@@ -259,6 +262,11 @@ export function Sidebar() {
           >
             <Workflow className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
             <span className="truncate">{t("loops")}</span>
+            <AttentionBadges
+              blocking={loopAttention.totalBlocking}
+              notice={loopAttention.totalNotice}
+              className="ml-auto"
+            />
           </button>
         ) : null}
       </div>

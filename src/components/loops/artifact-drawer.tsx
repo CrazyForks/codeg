@@ -3,7 +3,7 @@
 import { useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Loader2 } from "lucide-react"
+import { Loader2, MessageSquare, TriangleAlert } from "lucide-react"
 
 import {
   approveLoopDesign,
@@ -11,6 +11,8 @@ import {
   getLoopArtifact,
   getLoopDag,
   getLoopIssue,
+  listLoopInbox,
+  listLoopIterations,
   rejectLoopDesign,
   rejectLoopMerge,
 } from "@/lib/loops-api"
@@ -23,14 +25,20 @@ import {
   taskCovers,
   type CriterionOrdinal,
 } from "@/lib/loop-coverage"
+import { buildAttentionMap } from "@/lib/loop-attention"
 import type {
   LoopArtifactDetail,
   LoopCriterionCheckRow,
   LoopGateDecisionRow,
+  LoopInboxItemRow,
   LoopIssueDetail,
+  LoopIterationRow,
   LoopRevision,
 } from "@/lib/types"
 import { useLoopResource } from "@/hooks/use-loop-resource"
+import { useLoopNav } from "@/hooks/use-loop-nav"
+import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
+import { IterationStatusBadge } from "@/components/loops/issue-badges"
 import {
   Sheet,
   SheetContent,
@@ -53,6 +61,10 @@ import {
 import { MessageResponse } from "@/components/ai-elements/message"
 
 type Gate = "design" | "merge"
+
+function payloadObj(p: unknown): Record<string, unknown> {
+  return p && typeof p === "object" ? (p as Record<string, unknown>) : {}
+}
 
 /** A per-criterion verdict pill — glyph PLUS the verdict word (never color- or
  * glyph-only) so the trace is accessible. The glyph is decorative (`aria-hidden`);
@@ -101,6 +113,12 @@ interface ArtifactDrawerData {
   // The gate decision for THIS artifact's own target: a task's review gate or a
   // result's integration (finalize) gate. Null when none recorded yet.
   gateDecision: LoopGateDecisionRow | null
+  // This issue's iterations — used to resolve the producer's session and to list
+  // every iteration that targeted this artifact (D10 cross-nav).
+  iterations: LoopIterationRow[]
+  // This artifact's pending inbox cards (D10): a card concerning it shows inline
+  // with a jump to its session.
+  inboxCards: LoopInboxItemRow[]
 }
 
 const EMPTY_DRAWER: ArtifactDrawerData = {
@@ -109,6 +127,8 @@ const EMPTY_DRAWER: ArtifactDrawerData = {
   coverage: null,
   checks: new Map(),
   gateDecision: null,
+  iterations: [],
+  inboxCards: [],
 }
 
 /** The most recent gate decision for a target+stage (highest attempt, then id). */
@@ -185,6 +205,14 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
   const tGate = useTranslations("Loops.inbox")
   const tCommon = useTranslations("Loops.common")
   const tToasts = useTranslations("Loops.toasts")
+  const tStage = useTranslations("Loops.stage")
+
+  // The drawer lives at the workbench level, bound to `?artifact=` — `nav.space`
+  // is the space this artifact belongs to (you can only open it from inside its
+  // space), so it scopes the iterations/inbox lookups below.
+  const { nav } = useLoopNav()
+  const spaceId = nav.space
+  const { openIteration } = useLoopOverlays()
 
   const [busy, setBusy] = useState(false)
   const [rejecting, setRejecting] = useState<Gate | null>(null)
@@ -206,6 +234,24 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
       let coverage: CoverageView | null = null
       let checks: Map<number, LoopCriterionCheckRow> = new Map()
       let gateDecision: LoopGateDecisionRow | null = null
+      let iterations: LoopIterationRow[] = []
+      let inboxCards: LoopInboxItemRow[] = []
+      if (detail && spaceId != null) {
+        // This issue's iterations (producer + everything that targeted this
+        // artifact) and its pending inbox cards concerning this artifact. Both
+        // best-effort: a failure just hides the cross-nav, never the artifact.
+        iterations = await listLoopIterations(spaceId, detail.issue_id).catch(
+          () => []
+        )
+        inboxCards = await listLoopInbox(spaceId, "pending")
+          .then((rows) => {
+            const byNode = buildAttentionMap(
+              rows.filter((r) => r.issue_id === detail.issue_id)
+            )
+            return byNode.get(`artifact:${detail.id}`) ?? []
+          })
+          .catch(() => [])
+      }
       if (detail && detail.kind === "result") {
         issue = await getLoopIssue(detail.issue_id).catch(() => null)
       }
@@ -261,16 +307,75 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
           }
         }
       }
-      return { detail, issue, coverage, checks, gateDecision }
+      return {
+        detail,
+        issue,
+        coverage,
+        checks,
+        gateDecision,
+        iterations,
+        inboxCards,
+      }
     },
     {
       match: (e) => issueRef.current == null || e.issue_id === issueRef.current,
       initial: EMPTY_DRAWER,
-      deps: [artifactId],
+      deps: [artifactId, spaceId],
     }
   )
   const detail = data.detail
   const issue = data.issue
+
+  // The iteration that produced this artifact (for the "open producing session"
+  // button) and every iteration that targeted it (D10), newest first.
+  const producer =
+    detail?.produced_by_iteration_id != null
+      ? (data.iterations.find(
+          (it) => it.id === detail.produced_by_iteration_id
+        ) ?? null)
+      : null
+  const targetingIterations = detail
+    ? [...data.iterations]
+        .filter((it) => it.target_artifact_id === detail.id)
+        .sort((a, b) => b.id - a.id)
+    : []
+
+  // Open an iteration's read-only session in the shared viewer (when it has a
+  // bound conversation). Labels the viewer with this artifact's issue context.
+  const openSession = (it: LoopIterationRow) => {
+    if (it.conversation_id == null || !detail) return
+    openIteration({
+      conversationId: it.conversation_id,
+      outcome: it.outcome,
+      issueContext: {
+        spaceId: spaceId ?? 0,
+        issueId: detail.issue_id,
+        issueSeq: detail.issue_seq,
+        stage: it.stage,
+      },
+    })
+  }
+
+  // A concise label for a related inbox card, reusing the inbox's own kind
+  // strings (the rich card with cause/humanized failure lives in the inbox pane).
+  const inboxKindLabel = (item: LoopInboxItemRow): string => {
+    switch (item.kind) {
+      case "approval":
+        return payloadObj(item.payload).gate === "merge"
+          ? tGate("gateMerge")
+          : tGate("gateDesign")
+      case "blocked":
+        return tGate("kindBlocked")
+      case "budget_exhausted":
+        return tGate("kindBudget")
+      case "question":
+        return tGate("kindQuestion")
+      case "reflection_failed":
+        return tGate("kindReflectFailed")
+      default:
+        return item.kind
+    }
+  }
 
   // Newest revision first; the latest drives the content section.
   const revisions: LoopRevision[] = detail
@@ -492,11 +597,86 @@ function ArtifactDrawerBody({ artifactId }: { artifactId: number }) {
 
             {detail.produced_by_iteration_id != null && (
               <Section title={t("linkedHeading")}>
-                <p className="text-sm text-muted-foreground">
-                  {t("producedBy", {
-                    id: detail.produced_by_iteration_id,
+                {producer && producer.conversation_id != null ? (
+                  <button
+                    type="button"
+                    onClick={() => openSession(producer)}
+                    className="inline-flex items-center gap-1.5 text-sm text-primary outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <MessageSquare className="h-3.5 w-3.5" />
+                    {t("producedBy", { id: detail.produced_by_iteration_id })}
+                  </button>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {t("producedBy", { id: detail.produced_by_iteration_id })}
+                  </p>
+                )}
+              </Section>
+            )}
+
+            {targetingIterations.length > 0 && (
+              <Section title={t("targetingHeading")}>
+                <ul className="space-y-1.5">
+                  {targetingIterations.map((it) => (
+                    <li key={it.id} className="flex items-center gap-2 text-sm">
+                      <span className="text-muted-foreground">
+                        {tStage(it.stage)}
+                      </span>
+                      <IterationStatusBadge status={it.status} />
+                      {it.attempt > 0 && (
+                        <span className="text-[11px] text-muted-foreground">
+                          {t("attempt", { n: it.attempt })}
+                        </span>
+                      )}
+                      {it.conversation_id != null && (
+                        <button
+                          type="button"
+                          onClick={() => openSession(it)}
+                          className="ml-auto inline-flex items-center gap-1 text-xs text-primary outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          <MessageSquare className="h-3 w-3" />
+                          {t("openSession")}
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </Section>
+            )}
+
+            {data.inboxCards.length > 0 && (
+              <Section title={t("attentionHeading")}>
+                <ul className="space-y-1.5">
+                  {data.inboxCards.map((card) => {
+                    const it =
+                      card.iteration_id != null
+                        ? data.iterations.find(
+                            (x) => x.id === card.iteration_id
+                          )
+                        : undefined
+                    return (
+                      <li
+                        key={card.id}
+                        className="flex items-center gap-2 text-sm"
+                      >
+                        <TriangleAlert className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                        <span className="flex-1 truncate">
+                          {inboxKindLabel(card)}
+                        </span>
+                        {it && it.conversation_id != null && (
+                          <button
+                            type="button"
+                            onClick={() => openSession(it)}
+                            className="ml-auto inline-flex items-center gap-1 text-xs text-primary outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            <MessageSquare className="h-3 w-3" />
+                            {t("openSession")}
+                          </button>
+                        )}
+                      </li>
+                    )
                   })}
-                </p>
+                </ul>
               </Section>
             )}
           </div>

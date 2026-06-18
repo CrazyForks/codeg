@@ -8,6 +8,7 @@ import type {
   LoopIssuePriority,
   LoopIssueRoute,
   LoopIssueStatus,
+  LoopIterationOutcome,
   LoopIterationStatus,
 } from "@/lib/types"
 
@@ -70,6 +71,29 @@ export function IterationStatusBadge({
 }) {
   const t = useTranslations("Loops.iterationStatus")
   return <Badge variant={ITERATION_STATUS_VARIANT[status]}>{t(status)}</Badge>
+}
+
+// Why an iteration ended (D11). All six values render (one place, including the
+// Phase-C `declared_complete`); a null outcome — still in flight, or an implement
+// run before its checkpoint — renders no badge at the call site.
+const ITERATION_OUTCOME_VARIANT: Record<LoopIterationOutcome, BadgeVariant> = {
+  succeeded: "secondary",
+  declared_complete: "secondary",
+  empty_diff: "outline",
+  no_artifacts: "outline",
+  validation_failed: "destructive",
+  abandoned: "ghost",
+}
+
+export function IterationOutcomeBadge({
+  outcome,
+}: {
+  outcome: LoopIterationOutcome
+}) {
+  const t = useTranslations("Loops.iterationOutcome")
+  return (
+    <Badge variant={ITERATION_OUTCOME_VARIANT[outcome]}>{t(outcome)}</Badge>
+  )
 }
 
 const ARTIFACT_STATUS_VARIANT: Record<LoopArtifactStatus, BadgeVariant> = {

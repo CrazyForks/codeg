@@ -21,6 +21,7 @@ import { useLoopResource } from "@/hooks/use-loop-resource"
 import { useLoopNav } from "@/hooks/use-loop-nav"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { AttentionBadges } from "@/components/loops/attention-badges"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -309,6 +310,10 @@ function SpaceCard({
             {t("spaceRunning", { count: space.running_count })}
           </Badge>
         )}
+        <AttentionBadges
+          blocking={space.blocking_count}
+          notice={space.notice_count}
+        />
       </div>
     </div>
   )

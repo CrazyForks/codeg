@@ -44,6 +44,11 @@ vi.mock("@/hooks/use-loop-nav", () => ({
     toggleLoops: spies.toggleLoops,
   }),
 }))
+// The Loops entry shows an attention badge fed by this hook; stub it so the test
+// doesn't reach the transport (the badge's own behavior is covered elsewhere).
+vi.mock("@/hooks/use-loop-attention-badge", () => ({
+  useLoopAttentionBadge: () => ({ totalBlocking: 0, totalNotice: 0 }),
+}))
 vi.mock("@/hooks/use-is-mac", () => ({ useIsMac: () => false }))
 vi.mock("@/hooks/use-shortcut-settings", () => ({
   useShortcutSettings: () => ({

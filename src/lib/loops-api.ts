@@ -3,6 +3,7 @@ import type {
   IssueConfig,
   LoopArtifactDetail,
   LoopArtifactRow,
+  LoopAttention,
   LoopDagView,
   LoopEngineHealth,
   LoopInboxItemRow,
@@ -191,6 +192,12 @@ export function listLoopInbox(spaceId: number, status?: LoopInboxStatus) {
     spaceId,
     status: status ?? null,
   })
+}
+
+/** Cross-space pending-inbox attention rollup (D6/D7) — powers the always-visible
+ *  "who needs me" sidebar badge. No args: it aggregates every space at once. */
+export function getLoopAttention() {
+  return getTransport().call<LoopAttention>("get_loop_attention", {})
 }
 
 /** Dismiss an informational inbox card (the reflect-exhausted notice) — marks it

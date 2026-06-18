@@ -29,6 +29,7 @@ import { useTranslations } from "next-intl"
 import { AgentIcon } from "@/components/agent-icon"
 import { Button } from "@/components/ui/button"
 import { useLoopNav } from "@/hooks/use-loop-nav"
+import { IterationOutcomeBadge } from "@/components/loops/issue-badges"
 import type { IterationIssueContext } from "@/components/loops/loop-overlays-context"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
@@ -47,7 +48,12 @@ import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import { useConversationRuntime } from "@/contexts/conversation-runtime-context"
 import { useAcpActions } from "@/contexts/acp-connections-context"
 import { acpFindConnectionForConversation } from "@/lib/api"
-import { AGENT_LABELS, type AgentType, type QuestionAnswer } from "@/lib/types"
+import {
+  AGENT_LABELS,
+  type AgentType,
+  type LoopIterationOutcome,
+  type QuestionAnswer,
+} from "@/lib/types"
 
 interface Props {
   open: boolean
@@ -62,6 +68,8 @@ interface Props {
   /** Issue identity from the opener; when present the header shows it and offers
    *  an "open issue" back-link. */
   issueContext?: IterationIssueContext | null
+  /** The settled iteration's outcome (D11), shown as a header badge. */
+  outcome?: LoopIterationOutcome | null
 }
 
 export function IterationDialog({
@@ -70,6 +78,7 @@ export function IterationDialog({
   conversationId,
   agentType,
   issueContext,
+  outcome,
 }: Props) {
   const t = useTranslations("Loops.iteration")
 
@@ -88,6 +97,7 @@ export function IterationDialog({
             conversationId={conversationId}
             agentTypeHint={agentType ?? null}
             issueContext={issueContext ?? null}
+            outcome={outcome ?? null}
             onClose={() => onOpenChange(false)}
           />
         ) : null}
@@ -100,11 +110,13 @@ function IterationSessionBody({
   conversationId,
   agentTypeHint,
   issueContext,
+  outcome,
   onClose,
 }: {
   conversationId: number
   agentTypeHint: AgentType | null
   issueContext: IterationIssueContext | null
+  outcome: LoopIterationOutcome | null
   onClose: () => void
 }) {
   const t = useTranslations("Loops.iteration")
@@ -220,14 +232,17 @@ function IterationSessionBody({
           <div className="truncate text-sm font-semibold text-foreground">
             {agentType ? AGENT_LABELS[agentType] : t("title")}
           </div>
-          {issueContext && (
+          {(issueContext || outcome) && (
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span className="font-mono">#{issueContext.issueSeq}</span>
-              {issueContext.stage && (
+              {issueContext && (
+                <span className="font-mono">#{issueContext.issueSeq}</span>
+              )}
+              {issueContext?.stage && (
                 <span className="rounded bg-muted px-1.5 py-0.5">
                   {tStage(issueContext.stage)}
                 </span>
               )}
+              {outcome && <IterationOutcomeBadge outcome={outcome} />}
             </div>
           )}
         </div>

@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Loader2 } from "lucide-react"
+import { Crosshair, Loader2, MessageSquare } from "lucide-react"
 
 import {
   addLoopIssueBudget,
@@ -12,13 +12,17 @@ import {
   cancelLoopIssue,
   dismissLoopInbox,
   listLoopInbox,
+  listLoopIterations,
   rejectLoopDesign,
   rejectLoopMerge,
   retryLoopIssue,
 } from "@/lib/loops-api"
-import type { LoopInboxItemRow } from "@/lib/types"
+import type { LoopInboxItemRow, LoopIterationRow } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
+import { humanizeFailureSig, failureAttempt } from "@/lib/loop-failure-sig"
 import { useLoopResource } from "@/hooks/use-loop-resource"
+import { useLoopNav } from "@/hooks/use-loop-nav"
+import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -108,8 +112,12 @@ export function InboxPanel({
   onOpenQuestion?: (item: LoopInboxItemRow) => void
 }) {
   const t = useTranslations("Loops.inbox")
+  const tFailure = useTranslations("Loops.failureSig")
   const tToasts = useTranslations("Loops.toasts")
   const tCommon = useTranslations("Loops.common")
+
+  const { focusArtifact, gotoIssue } = useLoopNav()
+  const { openIteration } = useLoopOverlays()
 
   const [busyId, setBusyId] = useState<number | null>(null)
   const [rejecting, setRejecting] = useState<LoopInboxItemRow | null>(null)
@@ -129,6 +137,19 @@ export function InboxPanel({
     () => listLoopInbox(spaceId, "pending"),
     { match: (e) => e.space_id === spaceId, initial: [], deps: [spaceId] }
   )
+
+  // This space's iterations, so a card carrying an `iteration_id` can offer a
+  // direct jump to that session (D10). Kept live; a failed fetch just hides the
+  // "open session" action. Indexed by iteration id.
+  const { data: iterations } = useLoopResource<LoopIterationRow[]>(
+    () => listLoopIterations(spaceId),
+    { match: (e) => e.space_id === spaceId, initial: [], deps: [spaceId] }
+  )
+  const iterById = useMemo(() => {
+    const m = new Map<number, LoopIterationRow>()
+    for (const it of iterations) m.set(it.id, it)
+    return m
+  }, [iterations])
 
   // Split into the two panes, deduping defensively (the backend's partial unique
   // index already forbids two pending cards with the same issue/kind/subject).
@@ -339,17 +360,89 @@ export function InboxPanel({
     }
   }
 
+  // Cross-navigation shared by every card (D10): jump to the concerned node in
+  // the graph (or the issue when the card has no backing artifact), and — when
+  // the card points at an iteration with a bound session — open it directly.
+  // The question card keeps its own `openConversation`, so it skips open-session.
+  const crossNav = (item: LoopInboxItemRow) => {
+    const sessionIter =
+      item.kind !== "question" && item.iteration_id != null
+        ? iterById.get(item.iteration_id)
+        : undefined
+    return (
+      <>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 gap-1 text-muted-foreground"
+          onClick={() =>
+            item.subject_artifact_id != null
+              ? focusArtifact(spaceId, item.issue_id, item.subject_artifact_id)
+              : gotoIssue(spaceId, item.issue_id)
+          }
+        >
+          <Crosshair className="h-3.5 w-3.5" />
+          {t("locateInGraph")}
+        </Button>
+        {sessionIter?.conversation_id != null && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1 text-muted-foreground"
+            onClick={() =>
+              openIteration({
+                conversationId: sessionIter.conversation_id!,
+                outcome: sessionIter.outcome,
+                issueContext: {
+                  spaceId,
+                  issueId: item.issue_id,
+                  issueSeq: item.issue_seq,
+                  stage: sessionIter.stage,
+                },
+              })
+            }
+          >
+            <MessageSquare className="h-3.5 w-3.5" />
+            {t("openSession")}
+          </Button>
+        )}
+      </>
+    )
+  }
+
   const renderCard = (item: LoopInboxItemRow) => {
     const { label, desc } = describe(item)
+    // Prefer the humanized failure cause (D9) over the raw reason; fall back to
+    // the kind's generic description when there's nothing machine-readable.
+    const human = humanizeFailureSig(item)
+    const body = human ? tFailure(human.key) : desc
+    const attempt = failureAttempt(item)
     return (
       <li key={item.id} className="rounded-md border p-3">
-        <div className="text-sm font-medium">{label}</div>
-        {desc && (
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium">{label}</div>
+            {item.subject_title && (
+              <div className="truncate text-xs text-muted-foreground">
+                {item.subject_title}
+              </div>
+            )}
+          </div>
+          {attempt != null && (
+            <span className="shrink-0 text-[11px] text-muted-foreground">
+              {t("attempt", { n: attempt })}
+            </span>
+          )}
+        </div>
+        {body && (
           <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">
-            {desc}
+            {body}
           </p>
         )}
-        <div className="mt-2 flex flex-wrap gap-2">{actions(item)}</div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {actions(item)}
+          {crossNav(item)}
+        </div>
       </li>
     )
   }

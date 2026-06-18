@@ -18,6 +18,7 @@ import { useLoopResource } from "@/hooks/use-loop-resource"
 import { Button } from "@/components/ui/button"
 import {
   ArtifactStatusBadge,
+  IterationOutcomeBadge,
   IterationStatusBadge,
 } from "@/components/loops/issue-badges"
 import { useLoopOverlays } from "@/components/loops/loop-overlays-context"
@@ -148,10 +149,18 @@ export function IterationList({
                 <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
                   #{it.issue_seq}
                 </span>
-                <span className="text-sm font-medium">{tStage(it.stage)}</span>
+                <span className="shrink-0 text-sm font-medium">
+                  {tStage(it.stage)}
+                </span>
+                {it.target_title && (
+                  <span className="min-w-0 truncate text-xs text-muted-foreground">
+                    {it.target_title}
+                  </span>
+                )}
                 <IterationStatusBadge status={it.status} />
+                {it.outcome && <IterationOutcomeBadge outcome={it.outcome} />}
                 {it.attempt > 0 && (
-                  <span className="text-[11px] text-muted-foreground">
+                  <span className="shrink-0 text-[11px] text-muted-foreground">
                     {t("attempt", { n: it.attempt })}
                   </span>
                 )}
@@ -167,6 +176,7 @@ export function IterationList({
                     onClick={() =>
                       openIteration({
                         conversationId: it.conversation_id!,
+                        outcome: it.outcome,
                         issueContext: {
                           spaceId,
                           issueId: it.issue_id,
