@@ -52,7 +52,8 @@ export interface AgentOptionsState {
   loading: boolean
   error: string | null
   reload: () => void
-  /** Resolve the snapshot for a save-time read: the loaded one if present, else
+  /** Resolve the snapshot for a save-time read, keyed to the CURRENT agent (never
+   *  a snapshot retained across an agent switch): the cached one if fresh, else
    *  the in-flight/fresh probe, bounded so a wedged probe never blocks saving
    *  (returns null on timeout/failure → caller falls back to raw overrides). */
   ensure: () => Promise<AgentOptionsSnapshot | null>
@@ -115,9 +116,15 @@ export function useAgentOptions(agentType: AgentType): AgentOptionsState {
   const reload = useCallback(() => load(agentType, true), [agentType, load])
 
   const ensure = useCallback(async (): Promise<AgentOptionsSnapshot | null> => {
-    if (snapshot) return snapshot
-    // Share the module-level inflight/cache; bound the wait so a wedged probe
-    // degrades to "save with raw overrides" rather than hanging the save.
+    // Resolve against the CURRENT agent, not the retained React `snapshot`: after
+    // an agent switch the previous agent's snapshot lingers until the debounced
+    // re-probe lands, and returning it here would pin that agent's defaults into
+    // the save. The module cache + inflight map are keyed by agentType, so a hit
+    // is instant and a switch rides the effect's in-flight probe (no double spawn).
+    const cached = readCache(agentType)
+    if (cached) return cached
+    // Bound the wait so a wedged probe degrades to "save with raw overrides"
+    // rather than hanging the save.
     let timer: number | undefined
     const timeout = new Promise<null>((resolve) => {
       timer = window.setTimeout(() => resolve(null), 5000)
@@ -130,7 +137,7 @@ export function useAgentOptions(agentType: AgentType): AgentOptionsState {
     } finally {
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [snapshot, agentType])
+  }, [agentType])
 
   return { snapshot, loading, error, reload, ensure }
 }
