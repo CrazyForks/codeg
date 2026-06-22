@@ -28,8 +28,8 @@ use crate::acp::InternalEventBus;
 use crate::commands::acp::{build_session_runtime_env, verify_agent_installed};
 use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
 use crate::commands::folders::{
-    emit_folder_upsert, get_folder_core, git_checkout, git_list_branches, git_worktree_add,
-    open_worktree_folder_core, resolve_worktree_folder_core,
+    emit_folder_upsert, get_folder_core, git_checkout, git_is_clean, git_list_branches,
+    git_worktree_add, open_worktree_folder_core, resolve_worktree_folder_core,
 };
 use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::service::automation_service;
@@ -496,6 +496,21 @@ impl AutomationEngine {
                                      remove the local branch"
                                 ));
                             }
+                        }
+                        // Switching the user's shared root tree to the target
+                        // branch must not drag their uncommitted work along: a
+                        // dirty tree would carry those edits onto the target
+                        // branch (or make `git checkout` fail). Refuse loudly and
+                        // tell them to commit/stash or use a per-run worktree.
+                        if !git_is_clean(root.path.clone())
+                            .await
+                            .map_err(|e| e.to_string())?
+                        {
+                            return Err(format!(
+                                "the shared root working tree has uncommitted changes, so it \
+                                 can't be switched to '{branch}' — commit or stash them, or \
+                                 use a per-run worktree for this automation"
+                            ));
                         }
                         git_checkout(root.path.clone(), branch)
                             .await

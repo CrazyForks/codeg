@@ -1,4 +1,5 @@
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_orm::ConnectionTrait;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -227,6 +228,19 @@ impl MigrationTrait for Migration {
                     .table(AutomationRun::Table)
                     .col(AutomationRun::Status)
                     .to_owned(),
+            )
+            .await?;
+
+        // At most one in-flight run per automation — a hard DB backstop against a
+        // duplicate concurrent fire slipping past the in-process overlap guard
+        // (e.g. two engine processes sharing one data dir). `running` is the only
+        // non-terminal status, so a partial unique index on it covers the entire
+        // active set while exempting the many terminal rows per automation.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_run_one_active \
+                 ON automation_run (automation_id) WHERE status = 'running'",
             )
             .await?;
 

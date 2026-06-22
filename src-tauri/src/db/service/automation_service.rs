@@ -13,7 +13,7 @@ use sea_orm::{
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::db::entities::automation::TriggerKind;
+use crate::db::entities::automation::{IsolationMode, TriggerKind};
 use crate::db::entities::{automation, automation_run};
 use crate::db::error::DbError;
 use crate::models::{
@@ -64,13 +64,92 @@ fn run_to_info(m: automation_run::Model) -> AutomationRunInfo {
 
 // ── cron math ──────────────────────────────────────────────────────────────
 
+/// Translate the day-of-week field from the UI/POSIX convention (0-6 = Sun-Sat,
+/// with 7 also = Sun) to the `cron` crate's convention (1-7 = Sun-Sat). The
+/// builder, humanizer, and templates all speak 0-6, but `cron` 0.12 evaluates
+/// `weekday().number_from_sunday()` (Sun=1 .. Sat=7) and rejects 0 — so without
+/// this every weekly automation would fire a day early and Sunday would be
+/// unschedulable. Numeric tokens are expanded to an explicit set, shifted by
+/// `(n % 7) + 1`, then re-emitted as a sorted list — this also sidesteps
+/// wrap-around ranges (`6-7` → would be `7-1`). Symbolic day names (`mon`, …)
+/// are passed through untouched: the crate's own name table is self-consistent.
+fn remap_dow_field(field: &str) -> Result<String, DbError> {
+    let field = field.trim();
+    if field == "*" {
+        return Ok("*".to_string());
+    }
+    // Day names are already crate-native; don't touch them.
+    if field.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Ok(field.to_string());
+    }
+    let invalid = || DbError::Validation(format!("invalid cron day-of-week field '{field}'"));
+    let mut days: Vec<u32> = Vec::new();
+    for part in field.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(invalid());
+        }
+        // Optional step: `BASE/STEP`.
+        let (base, step) = match part.split_once('/') {
+            Some((b, s)) => {
+                let step: u32 = s.trim().parse().map_err(|_| invalid())?;
+                if step == 0 {
+                    return Err(invalid());
+                }
+                (b.trim(), step)
+            }
+            None => (part, 1),
+        };
+        // Resolve the base into an inclusive [lo, hi] range over the UI domain.
+        let (lo, hi) = if base == "*" {
+            (0u32, 6u32)
+        } else if let Some((a, b)) = base.split_once('-') {
+            let a: u32 = a.trim().parse().map_err(|_| invalid())?;
+            let b: u32 = b.trim().parse().map_err(|_| invalid())?;
+            if a > b {
+                // Wrap-around ranges (e.g. `5-1`) are unsupported; use a list.
+                return Err(invalid());
+            }
+            (a, b)
+        } else {
+            let n: u32 = base.parse().map_err(|_| invalid())?;
+            (n, n)
+        };
+        if hi > 7 {
+            return Err(invalid());
+        }
+        for d in (lo..=hi).step_by(step as usize) {
+            days.push((d % 7) + 1);
+        }
+    }
+    days.sort_unstable();
+    days.dedup();
+    if days.is_empty() {
+        return Err(invalid());
+    }
+    Ok(days
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 /// Normalize a user-supplied 5-field cron (`min hour dom mon dow`) to the
 /// 6-field form (`sec min hour dom mon dow`) the `cron` crate requires, by
-/// prepending a zero-seconds field. 6/7-field expressions pass through.
+/// remapping the day-of-week field (see [`remap_dow_field`]) and prepending a
+/// zero-seconds field. 6/7-field expressions are assumed crate-native and pass
+/// through unchanged (nothing first-party emits them).
 fn normalize_cron(expr: &str) -> Result<String, DbError> {
     let trimmed = expr.trim();
-    match trimmed.split_whitespace().count() {
-        5 => Ok(format!("0 {trimmed}")),
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    match fields.len() {
+        5 => {
+            let dow = remap_dow_field(fields[4])?;
+            Ok(format!(
+                "0 {} {} {} {} {}",
+                fields[0], fields[1], fields[2], fields[3], dow
+            ))
+        }
         6 | 7 => Ok(trimmed.to_string()),
         n => Err(DbError::Validation(format!(
             "cron must have 5 fields (min hour dom mon dow), got {n}"
@@ -105,6 +184,18 @@ fn validate_draft(draft: &AutomationDraft) -> Result<(), DbError> {
     let cfg: AutomationConfig = serde_json::from_value(draft.config.clone()).unwrap_or_default();
     if cfg.display_text.trim().is_empty() && cfg.prompt_blocks.is_empty() {
         return Err(DbError::Validation("prompt is required".into()));
+    }
+    // A remote branch is resolved by minting a per-run worktree that tracks it;
+    // it can't be checked out in the shared root tree (the engine would refuse
+    // at fire time). Reject the combination at save so the misconfiguration
+    // surfaces immediately instead of as a failed run — covers Web/API callers,
+    // not just the UI (which also hides remote branches for shared_in_root).
+    if draft.isolation == IsolationMode::SharedInRoot && draft.is_remote_branch {
+        return Err(DbError::Validation(
+            "a remote branch requires a per-run worktree; it can't be used with shared-in-root \
+             isolation"
+                .into(),
+        ));
     }
     if draft.trigger_kind == TriggerKind::Schedule {
         let cron = draft.cron.as_deref().unwrap_or("").trim();
@@ -567,8 +658,18 @@ pub async fn prune_old_runs(
     keep_days: i64,
 ) -> Result<u64, DbError> {
     let cutoff = Utc::now() - chrono::Duration::days(keep_days);
+    // Only prune terminal rows. A still-`running` row must survive regardless of
+    // age: deleting it would defeat the one-active-run unique index (letting a
+    // duplicate fire) and orphan the live run's worktree/conversation. In normal
+    // operation reconcile force-fails a run long before the retention window, so
+    // this only guards the pathological "stuck running past retention" case.
+    // NOTE: this deletes the run *rows*; the per-run worktree directory + branch
+    // (`automation/<id>/run-<id>`) created for `worktree_per_run` are not yet
+    // garbage-collected here — tracked as a follow-up (bounded GC of those
+    // artifacts keyed on the run's worktree_folder_id + name signature).
     let res = automation_run::Entity::delete_many()
         .filter(automation_run::Column::CreatedAt.lt(cutoff))
+        .filter(automation_run::Column::Status.ne(AutomationRunStatus::Running))
         .exec(conn)
         .await?;
     Ok(res.rows_affected)
@@ -686,6 +787,98 @@ mod tests {
     fn compute_next_run_rejects_bad_tz() {
         let now = Utc::now();
         assert!(compute_next_run("0 0 * * *", "Not/AZone", now).is_err());
+    }
+
+    #[test]
+    fn remap_dow_field_translates_ui_convention() {
+        // Singles: UI 0-6 (Sun-Sat) → crate 1-7 (Sun-Sat); 7 is an alias for Sun.
+        assert_eq!(remap_dow_field("*").unwrap(), "*");
+        assert_eq!(remap_dow_field("0").unwrap(), "1"); // Sun
+        assert_eq!(remap_dow_field("1").unwrap(), "2"); // Mon
+        assert_eq!(remap_dow_field("6").unwrap(), "7"); // Sat
+        assert_eq!(remap_dow_field("7").unwrap(), "1"); // Sun alias
+        // Ranges expand + re-emit as a sorted list (no wrap-around output).
+        assert_eq!(remap_dow_field("1-5").unwrap(), "2,3,4,5,6"); // weekdays preset
+        assert_eq!(remap_dow_field("6-7").unwrap(), "1,7"); // Sat,Sun
+        assert_eq!(remap_dow_field("0-7").unwrap(), "1,2,3,4,5,6,7");
+        // Lists + steps.
+        assert_eq!(remap_dow_field("0,7").unwrap(), "1");
+        assert_eq!(remap_dow_field("0,2,4").unwrap(), "1,3,5");
+        assert_eq!(remap_dow_field("*/2").unwrap(), "1,3,5,7");
+        assert_eq!(remap_dow_field("*/3").unwrap(), "1,4,7");
+        assert_eq!(remap_dow_field("1-5/2").unwrap(), "2,4,6");
+        // Day names are crate-native already — passed through verbatim.
+        assert_eq!(remap_dow_field("MON").unwrap(), "MON");
+        // Rejections.
+        assert!(remap_dow_field("8").is_err());
+        assert!(remap_dow_field("7-8").is_err());
+        assert!(remap_dow_field("5-1").is_err()); // wrap-around
+        assert!(remap_dow_field("*/0").is_err());
+        assert!(remap_dow_field("").is_err());
+    }
+
+    #[test]
+    fn normalize_cron_remaps_dow_and_passes_through_seconds_form() {
+        // 5-field: prepend seconds + remap DOW (Mon: UI 1 → crate 2).
+        assert_eq!(normalize_cron("0 9 * * 1").unwrap(), "0 0 9 * * 2");
+        // DOW `*` is untouched.
+        assert_eq!(normalize_cron("0 0 * * *").unwrap(), "0 0 0 * * *");
+        // 6-field is assumed crate-native and passes through verbatim.
+        assert_eq!(normalize_cron("0 0 9 * * 2").unwrap(), "0 0 9 * * 2");
+    }
+
+    /// Regression for the day-of-week off-by-one: a weekly cron must fire on the
+    /// weekday the UI label promises (UI 0=Sun..6=Sat), not a day early.
+    #[test]
+    fn compute_next_run_weekly_lands_on_intended_weekday() {
+        use chrono::Datelike;
+        // 2026-06-21 is a Sunday, so the search window covers a full week.
+        let after = DateTime::parse_from_rfc3339("2026-06-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cases = [
+            ("0 9 * * 0", chrono::Weekday::Sun),
+            ("0 9 * * 1", chrono::Weekday::Mon),
+            ("0 9 * * 2", chrono::Weekday::Tue),
+            ("0 9 * * 3", chrono::Weekday::Wed),
+            ("0 9 * * 4", chrono::Weekday::Thu),
+            ("0 9 * * 5", chrono::Weekday::Fri),
+            ("0 9 * * 6", chrono::Weekday::Sat),
+            ("0 9 * * 7", chrono::Weekday::Sun), // 7 alias for Sunday
+        ];
+        for (cron, want) in cases {
+            let next = compute_next_run(cron, "UTC", after)
+                .expect("compute")
+                .expect("has next");
+            assert_eq!(next.weekday(), want, "cron `{cron}` fired on the wrong day");
+        }
+    }
+
+    /// The "weekdays" preset (`1-5`) must fire Mon–Fri only, never Sat/Sun.
+    #[test]
+    fn compute_next_run_weekdays_preset_excludes_weekend() {
+        use chrono::Datelike;
+        let mut cursor = DateTime::parse_from_rfc3339("2026-06-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for _ in 0..7 {
+            let next = compute_next_run("0 9 * * 1-5", "UTC", cursor)
+                .expect("compute")
+                .expect("has next");
+            assert!(
+                matches!(
+                    next.weekday(),
+                    chrono::Weekday::Mon
+                        | chrono::Weekday::Tue
+                        | chrono::Weekday::Wed
+                        | chrono::Weekday::Thu
+                        | chrono::Weekday::Fri
+                ),
+                "weekdays preset fired on {:?}",
+                next.weekday()
+            );
+            cursor = next + chrono::Duration::minutes(1);
+        }
     }
 
     #[tokio::test]
@@ -836,6 +1029,22 @@ mod tests {
         rm.created_at = Set(Utc::now() - chrono::Duration::days(60));
         rm.update(&db.conn).await.unwrap();
 
+        // A still-running run is never pruned, however old — pruning it would
+        // defeat the one-active-run guard and orphan the live run.
+        assert_eq!(prune_old_runs(&db.conn, 30).await.unwrap(), 0);
+        assert!(!list_runs(&db.conn, a.id, 10).await.unwrap().is_empty());
+
+        // Once terminal, an old run is pruned.
+        settle_run(
+            &db.conn,
+            run.id,
+            AutomationRunStatus::Succeeded,
+            Some("end_turn".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(prune_old_runs(&db.conn, 30).await.unwrap(), 1);
         assert!(list_runs(&db.conn, a.id, 10).await.unwrap().is_empty());
     }

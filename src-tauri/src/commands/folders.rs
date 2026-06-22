@@ -1506,6 +1506,26 @@ pub async fn git_checkout(path: String, branch_name: String) -> Result<(), AppCo
     Ok(())
 }
 
+/// Whether the working tree at `path` has no uncommitted changes to *tracked*
+/// files (untracked files are ignored — they survive a branch switch). Used to
+/// refuse a `shared_in_root` automation before it `git checkout`s the user's
+/// root tree, which would otherwise carry their in-progress edits onto the
+/// target branch (or fail outright).
+pub async fn git_is_clean(path: String) -> Result<bool, AppCommandError> {
+    let output = crate::process::tokio_command("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(&path)
+        .output()
+        .await
+        .map_err(AppCommandError::io)?;
+
+    if !output.status.success() {
+        return Err(git_command_error("status", &output.stderr));
+    }
+    // Porcelain prints one line per changed tracked path; clean ⇒ no output.
+    Ok(output.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn git_reset(path: String, commit: String, mode: String) -> Result<(), AppCommandError> {
     let mode = mode.trim().to_lowercase();
