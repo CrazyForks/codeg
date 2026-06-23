@@ -17,6 +17,16 @@ if (typeof Element !== "undefined") {
   Element.prototype.setPointerCapture ??= () => {}
   Element.prototype.releasePointerCapture ??= () => {}
 }
+if (typeof globalThis !== "undefined" && !("ResizeObserver" in globalThis)) {
+  // jsdom doesn't implement ResizeObserver; cmdk (the command palette used by
+  // the branch/folder pickers) constructs one on mount. A no-op stub is enough
+  // for headless rendering — layout callbacks never need to fire.
+  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+}
 if (typeof Range !== "undefined") {
   Range.prototype.getClientRects ??= () =>
     ({

@@ -23,8 +23,7 @@ import {
 import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
-import { useTaskContext } from "@/contexts/task-context"
-import { gitListAllBranches, gitCheckout } from "@/lib/api"
+import { gitListAllBranches } from "@/lib/api"
 import {
   buildBranchTree,
   buildRemoteBranchSections,
@@ -51,7 +50,6 @@ import {
 } from "@/components/ui/command"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
-import { toErrorMessage } from "@/lib/app-error"
 import {
   excludeChatFolders,
   filterTopLevelFolders,
@@ -139,12 +137,9 @@ export const ConversationFolderBranchPicker = memo(
     tabId,
   }: ConversationFolderBranchPickerProps) {
     const t = useTranslations("Folder.conversationContextBar")
-    const tBd = useTranslations("Folder.branchDropdown")
     const { tabs, activeTabId, openNewConversationTab, openChatModeTab } =
       useTabContext()
-    const { folders, allFolders, branches, setBranch, refreshFolder } =
-      useAppWorkspace()
-    const { addTask, updateTask } = useTaskContext()
+    const { folders, allFolders, branches } = useAppWorkspace()
     const switchToBranch = useSwitchToBranch()
 
     const ownTab = useMemo(() => {
@@ -253,33 +248,20 @@ export const ConversationFolderBranchPicker = memo(
             currentBranch={currentBranch}
             title={`${t("branchTitle")}: ${currentBranch ?? t("noBranch")}`}
             onCheckout={async (branchName, isRemote) => {
-              // Draft conversation: route through the shared switch logic so a
-              // worktree branch navigates to its folder instead of a doomed
-              // in-place checkout.
-              if (isNewConversation) {
-                await switchToBranch({
-                  activeFolder: ownFolder,
-                  branchName,
-                  currentBranch,
-                  isRemote,
-                })
-                return
-              }
-              // Existing conversation: check out in place in its own folder —
-              // never navigate away from a live conversation's working dir.
-              const taskId = `checkout-${ownFolder.id}-${Date.now()}`
-              addTask(taskId, tBd("tasks.checkoutTo", { branchName }))
-              updateTask(taskId, { status: "running" })
-              try {
-                await gitCheckout(ownFolder.path, branchName)
-                setBranch(ownFolder.id, branchName)
-                await refreshFolder(ownFolder.id)
-                updateTask(taskId, { status: "completed" })
-              } catch (err) {
-                const msg = toErrorMessage(err)
-                updateTask(taskId, { status: "failed", error: msg })
-                toast.error(msg)
-              }
+              // Both draft and existing conversations route through the shared
+              // switch logic (mirroring the top-bar branch dropdown). It never
+              // mutates the live conversation: a branch checked out in another
+              // worktree navigates to that folder (opening a fresh draft there
+              // via the singleton), and a free branch checks out in place only
+              // when the active folder is already the root tree. A bare
+              // in-place `git checkout` would instead fail (branch already
+              // checked out elsewhere) or hijack a worktree onto another branch.
+              await switchToBranch({
+                activeFolder: ownFolder,
+                branchName,
+                currentBranch,
+                isRemote,
+              })
             }}
           />
         )}
