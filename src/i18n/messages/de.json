@@ -575,6 +575,7 @@
       "confirmUninstall": "Deinstallation bestätigen",
       "saveClineConfig": "Cline-Konfiguration speichern",
       "saveHermesConfig": "Hermes-Konfiguration speichern",
+      "saveCodeBuddyConfig": "CodeBuddy-Konfiguration speichern",
       "customInstall": "Benutzerdefinierte Installation"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "Bearbeite ~/.hermes/config.yaml direkt. Das Speichern hier überschreibt die Datei wortwörtlich.",
       "saveRawConfig": "config.yaml speichern"
     },
+    "codebuddy": {
+      "configManagement": "CodeBuddy-Konfiguration",
+      "configDescription": "CodeBuddy authentifiziert sich mit einem API-Schlüssel. Builds für Festlandchina erfordern zudem die Umgebung „China (internal)“; iOA-Builds verwenden „iOA“. Der internationale Build lässt sie ungesetzt.",
+      "apiKeyLabel": "API-Schlüssel",
+      "apiKeyHint": "Wird als CODEBUDDY_API_KEY für diesen Agenten gespeichert. Alternativ kannst du dich mit der CodeBuddy-CLI im Terminal anmelden.",
+      "environmentLabel": "Umgebung",
+      "environmentHint": "Legt CODEBUDDY_INTERNET_ENVIRONMENT fest. Festlandchina muss „China (internal)“ verwenden; der internationale Build lässt es ungesetzt.",
+      "envOverseas": "International (Standard)",
+      "envChina": "China (internal)",
+      "envIoa": "iOA",
+      "loginHint": "Kein API-Schlüssel? Führe „codebuddy“ im Terminal aus, um dich stattdessen mit deinem Tencent-Konto anzumelden."
+    },
     "authModeOfficialSubscription": "Offizielles Abonnement",
     "authModeCustomEndpoint": "Benutzerdefinierter Endpunkt",
     "authModeCustomEndpointHint": "API-URL und API-Key manuell für einen benutzerdefinierten Endpunkt konfigurieren.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Cline-Konfiguration konnte nicht gespeichert werden",
       "hermesSaved": "Hermes-Konfiguration gespeichert",
       "saveHermesFailed": "Hermes-Konfiguration konnte nicht gespeichert werden",
+      "codeBuddySaved": "CodeBuddy-Konfiguration gespeichert",
+      "saveCodeBuddyFailed": "CodeBuddy-Konfiguration konnte nicht gespeichert werden",
       "modelProviderRequired": "Bitte wählen Sie vor dem Speichern einen Modellanbieter aus.",
       "affectedRunningSessions": "{count, plural, one {# laufende Sitzung muss zum Anwenden neu verbunden werden} other {# laufende Sitzungen müssen zum Anwenden neu verbunden werden}}"
     },

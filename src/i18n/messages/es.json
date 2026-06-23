@@ -575,6 +575,7 @@
       "confirmUninstall": "Confirmar desinstalación",
       "saveClineConfig": "Guardar configuración de Cline",
       "saveHermesConfig": "Guardar configuración de Hermes",
+      "saveCodeBuddyConfig": "Guardar configuración de CodeBuddy",
       "customInstall": "Instalación personalizada"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "Edita ~/.hermes/config.yaml directamente. Guardar aquí sobrescribe el archivo tal cual.",
       "saveRawConfig": "Guardar config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "Configuración de CodeBuddy",
+      "configDescription": "CodeBuddy se autentica con una clave de API. Las versiones para China continental también requieren establecer el entorno en «China (internal)»; las versiones iOA usan «iOA». La versión internacional lo deja sin definir.",
+      "apiKeyLabel": "Clave de API",
+      "apiKeyHint": "Se guarda como CODEBUDDY_API_KEY para este agente. También puedes iniciar sesión con la CLI de CodeBuddy en una terminal.",
+      "environmentLabel": "Entorno",
+      "environmentHint": "Establece CODEBUDDY_INTERNET_ENVIRONMENT. China continental debe usar «China (internal)»; la versión internacional lo deja sin definir.",
+      "envOverseas": "Internacional (predeterminado)",
+      "envChina": "China (internal)",
+      "envIoa": "iOA",
+      "loginHint": "¿No tienes clave de API? Ejecuta «codebuddy» en una terminal para iniciar sesión con tu cuenta de Tencent."
+    },
     "authModeOfficialSubscription": "Suscripción oficial",
     "authModeCustomEndpoint": "Endpoint personalizado",
     "authModeCustomEndpointHint": "Configurar manualmente la URL de API y la clave API para un endpoint personalizado.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Error al guardar la configuración de Cline",
       "hermesSaved": "Configuración de Hermes guardada",
       "saveHermesFailed": "Error al guardar la configuración de Hermes",
+      "codeBuddySaved": "Configuración de CodeBuddy guardada",
+      "saveCodeBuddyFailed": "No se pudo guardar la configuración de CodeBuddy",
       "modelProviderRequired": "Seleccione un proveedor de modelo antes de guardar.",
       "affectedRunningSessions": "{count, plural, one {# sesión activa necesita reconectarse para aplicar el cambio} other {# sesiones activas necesitan reconectarse para aplicar el cambio}}"
     },

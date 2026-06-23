@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod cline;
+pub mod codebuddy;
 pub mod codex;
 pub mod gemini;
 pub mod hermes;
@@ -90,6 +91,15 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             agent: "hermes",
             root: hermes::resolve_hermes_home_dir().join("state.db"),
             is_file: true,
+            include_top: None,
+        },
+        ExternalSource {
+            // CodeBuddy stores its JSONL transcripts under
+            // `~/.codebuddy/projects` — Claude Code's directory layout, but an
+            // OpenAI Agents-SDK item record schema (see `parsers::codebuddy`).
+            agent: "codebuddy",
+            root: codebuddy::resolve_codebuddy_config_dir().join("projects"),
+            is_file: false,
             include_top: None,
         },
     ];

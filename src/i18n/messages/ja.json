@@ -575,6 +575,7 @@
       "confirmUninstall": "アンインストールを確認",
       "saveClineConfig": "Cline設定を保存",
       "saveHermesConfig": "Hermes設定を保存",
+      "saveCodeBuddyConfig": "CodeBuddy 設定を保存",
       "customInstall": "カスタムインストール"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "~/.hermes/config.yaml を直接編集します。ここで保存すると、ファイルがそのまま上書きされます。",
       "saveRawConfig": "config.yaml を保存"
     },
+    "codebuddy": {
+      "configManagement": "CodeBuddy の設定",
+      "configDescription": "CodeBuddy は API キーで認証します。中国版では環境を「中国版（internal）」に設定する必要があります。iOA 版は「iOA」を使用し、海外版は未設定のままにします。",
+      "apiKeyLabel": "API キー",
+      "apiKeyHint": "このエージェントの CODEBUDDY_API_KEY として保存されます。または、ターミナルで CodeBuddy CLI からサインインすることもできます。",
+      "environmentLabel": "環境",
+      "environmentHint": "CODEBUDDY_INTERNET_ENVIRONMENT を設定します。中国本土では「中国版（internal）」を使用する必要があります。海外版は未設定のままにします。",
+      "envOverseas": "海外版（デフォルト）",
+      "envChina": "中国版（internal）",
+      "envIoa": "iOA",
+      "loginHint": "API キーがない場合は、ターミナルで「codebuddy」を実行して Tencent アカウントでサインインすることもできます。"
+    },
     "authModeOfficialSubscription": "公式サブスクリプション",
     "authModeCustomEndpoint": "カスタムエンドポイント",
     "authModeCustomEndpointHint": "API URL と API Key を手動で設定してカスタムエンドポイントに接続します。",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Cline設定の保存に失敗しました",
       "hermesSaved": "Hermes設定を保存しました",
       "saveHermesFailed": "Hermes設定の保存に失敗しました",
+      "codeBuddySaved": "CodeBuddy の設定を保存しました",
+      "saveCodeBuddyFailed": "CodeBuddy の設定の保存に失敗しました",
       "modelProviderRequired": "保存する前にモデルプロバイダーを選択してください。",
       "affectedRunningSessions": "{count} 件の実行中セッションは再接続すると変更が適用されます"
     },

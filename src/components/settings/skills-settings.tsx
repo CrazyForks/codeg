@@ -105,6 +105,7 @@ function defaultSkillLayoutForAgent(
   if (agentType === "open_claw") return "skill_directory"
   if (agentType === "cline") return "skill_directory"
   if (agentType === "hermes") return "skill_directory"
+  if (agentType === "code_buddy") return "skill_directory"
   return null
 }
 

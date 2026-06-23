@@ -575,6 +575,7 @@
       "confirmUninstall": "Confirmar desinstalação",
       "saveClineConfig": "Salvar configuração do Cline",
       "saveHermesConfig": "Salvar configuração do Hermes",
+      "saveCodeBuddyConfig": "Salvar configuração do CodeBuddy",
       "customInstall": "Instalação personalizada"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "Edite ~/.hermes/config.yaml diretamente. Salvar aqui sobrescreve o arquivo exatamente como está.",
       "saveRawConfig": "Salvar config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "Configuração do CodeBuddy",
+      "configDescription": "O CodeBuddy autentica com uma chave de API. As versões da China continental também exigem o ambiente definido como “China (internal)”; as versões iOA usam “iOA”. A versão internacional deixa sem definir.",
+      "apiKeyLabel": "Chave de API",
+      "apiKeyHint": "Salvo como CODEBUDDY_API_KEY para este agente. Como alternativa, faça login com a CLI do CodeBuddy em um terminal.",
+      "environmentLabel": "Ambiente",
+      "environmentHint": "Define CODEBUDDY_INTERNET_ENVIRONMENT. A China continental deve usar “China (internal)”; a versão internacional deixa sem definir.",
+      "envOverseas": "Internacional (padrão)",
+      "envChina": "China (internal)",
+      "envIoa": "iOA",
+      "loginHint": "Sem chave de API? Execute “codebuddy” em um terminal para fazer login com sua conta Tencent."
+    },
     "authModeOfficialSubscription": "Assinatura oficial",
     "authModeCustomEndpoint": "Endpoint personalizado",
     "authModeCustomEndpointHint": "Configurar manualmente a URL da API e a chave API para um endpoint personalizado.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Falha ao salvar a configuração do Cline",
       "hermesSaved": "Configuração do Hermes salva",
       "saveHermesFailed": "Falha ao salvar a configuração do Hermes",
+      "codeBuddySaved": "Configuração do CodeBuddy salva",
+      "saveCodeBuddyFailed": "Falha ao salvar a configuração do CodeBuddy",
       "modelProviderRequired": "Selecione um provedor de modelo antes de salvar.",
       "affectedRunningSessions": "{count, plural, one {# sessão ativa precisa reconectar para aplicar a alteração} other {# sessões ativas precisam reconectar para aplicar a alteração}}"
     },

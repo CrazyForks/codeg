@@ -104,6 +104,7 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::OpenCode,
         AgentType::Cline,
         AgentType::Hermes,
+        AgentType::CodeBuddy,
     ]
 }
 
@@ -116,6 +117,7 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::OpenCode => "opencode",
         AgentType::Cline => "cline",
         AgentType::Hermes => "hermes",
+        AgentType::CodeBuddy => "codebuddy-code",
     }
 }
 
@@ -128,6 +130,7 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "opencode" => Some(AgentType::OpenCode),
         "cline" => Some(AgentType::Cline),
         "hermes" => Some(AgentType::Hermes),
+        "codebuddy-code" => Some(AgentType::CodeBuddy),
         _ => None,
     }
 }
@@ -285,6 +288,19 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 system_cmd: Some(("hermes", &["acp"])),
             },
         },
+        AgentType::CodeBuddy => AcpAgentMeta {
+            agent_type,
+            name: "CodeBuddy",
+            description: "Tencent Cloud's official AI coding assistant (ACP)",
+            distribution: AgentDistribution::Npx {
+                version: "2.109.2",
+                package: "@tencent-ai/codebuddy-code@2.109.2",
+                cmd: "codebuddy",
+                args: &["--acp"],
+                env: &[],
+                node_required: Some("22.0.0"),
+            },
+        },
     }
 }
 
@@ -393,6 +409,12 @@ mod tests {
             Some("22.19.0"),
         );
         assert_npx_version(AgentType::Cline, "3.0.29", "cline@3.0.29", None);
+        assert_npx_version(
+            AgentType::CodeBuddy,
+            "2.109.2",
+            "@tencent-ai/codebuddy-code@2.109.2",
+            Some("22.0.0"),
+        );
         assert_binary_version(AgentType::Codex, "0.16.0", "/releases/download/v0.16.0/");
         assert_binary_version(AgentType::OpenCode, "1.17.9", "/releases/download/v1.17.9/");
         assert_uvx_version(

@@ -2997,6 +2997,13 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             global_dirs: vec![hermes_home_dir().join("skills")],
             project_rel_dirs: vec![],
         }),
+        // CodeBuddy is a Claude Code derivative: same `skills` directory
+        // layout, under `~/.codebuddy` instead of `~/.claude`.
+        AgentType::CodeBuddy => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![home_dir_or_default().join(".codebuddy").join("skills")],
+            project_rel_dirs: vec![".codebuddy/skills"],
+        }),
     }
 }
 
@@ -3721,6 +3728,12 @@ fn cascade_update_agent_config(
             persist_agent_local_config_json(agent_type, Some(&patch_str))?;
         }
         AgentType::Cline => {}
+        AgentType::CodeBuddy => {
+            // CodeBuddy authenticates via env vars (CODEBUDDY_API_KEY /
+            // CODEBUDDY_INTERNET_ENVIRONMENT) managed by its dedicated settings
+            // panel through `acpUpdateAgentEnv`; it does not participate in the
+            // model-provider credential cascade.
+        }
     }
     Ok(())
 }

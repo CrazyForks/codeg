@@ -575,6 +575,7 @@
       "confirmUninstall": "تأكيد إزالة التثبيت",
       "saveClineConfig": "حفظ تكوين Cline",
       "saveHermesConfig": "حفظ تكوين Hermes",
+      "saveCodeBuddyConfig": "حفظ إعدادات CodeBuddy",
       "customInstall": "تثبيت مخصص"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "حرّر ~/.hermes/config.yaml مباشرةً. الحفظ هنا يستبدل الملف حرفيًا.",
       "saveRawConfig": "حفظ config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "تكوين CodeBuddy",
+      "configDescription": "يصادق CodeBuddy باستخدام مفتاح API. تتطلب إصدارات الصين أيضًا ضبط البيئة على «الصين (internal)»؛ وتستخدم إصدارات iOA «iOA». أما الإصدار الخارجي فيتركها غير مضبوطة.",
+      "apiKeyLabel": "مفتاح API",
+      "apiKeyHint": "يُحفظ باسم CODEBUDDY_API_KEY لهذا الوكيل. بدلاً من ذلك، يمكنك تسجيل الدخول عبر واجهة CodeBuddy في الطرفية.",
+      "environmentLabel": "البيئة",
+      "environmentHint": "يضبط CODEBUDDY_INTERNET_ENVIRONMENT. يجب أن تستخدم الصين «الصين (internal)»؛ أما الإصدار الخارجي فيتركها غير مضبوطة.",
+      "envOverseas": "الخارجي (افتراضي)",
+      "envChina": "الصين (internal)",
+      "envIoa": "iOA",
+      "loginHint": "لا تملك مفتاح API؟ شغّل «codebuddy» في الطرفية لتسجيل الدخول بحساب Tencent بدلاً من ذلك."
+    },
     "authModeOfficialSubscription": "الاشتراك الرسمي",
     "authModeCustomEndpoint": "نقطة نهاية مخصصة",
     "authModeCustomEndpointHint": "تكوين عنوان API ومفتاح API يدوياً لنقطة نهاية مخصصة.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "فشل في حفظ تكوين Cline",
       "hermesSaved": "تم حفظ تكوين Hermes",
       "saveHermesFailed": "فشل في حفظ تكوين Hermes",
+      "codeBuddySaved": "تم حفظ إعدادات CodeBuddy",
+      "saveCodeBuddyFailed": "فشل حفظ إعدادات CodeBuddy",
       "modelProviderRequired": "يرجى اختيار مزود نموذج قبل الحفظ.",
       "affectedRunningSessions": "{count} جلسة نشطة تحتاج إلى إعادة الاتصال لتطبيق التغيير"
     },

@@ -575,6 +575,7 @@
       "confirmUninstall": "确认卸载",
       "saveClineConfig": "保存 Cline 配置",
       "saveHermesConfig": "保存 Hermes 配置",
+      "saveCodeBuddyConfig": "保存 CodeBuddy 配置",
       "customInstall": "自定义安装"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "直接编辑 ~/.hermes/config.yaml。在此保存将原样覆盖该文件。",
       "saveRawConfig": "保存 config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "CodeBuddy 配置",
+      "configDescription": "CodeBuddy 使用 API Key 进行认证。中国版还必须将环境设为“中国版（internal）”；iOA 版使用“iOA”；海外版则不设置。",
+      "apiKeyLabel": "API Key",
+      "apiKeyHint": "将作为该智能体的 CODEBUDDY_API_KEY 保存。也可以在终端用 CodeBuddy CLI 登录。",
+      "environmentLabel": "环境",
+      "environmentHint": "设置 CODEBUDDY_INTERNET_ENVIRONMENT。中国大陆必须使用“中国版（internal）”；海外版则不设置。",
+      "envOverseas": "海外版（默认）",
+      "envChina": "中国版（internal）",
+      "envIoa": "iOA",
+      "loginHint": "没有 API Key？也可以在终端运行 “codebuddy” 用腾讯云账号登录。"
+    },
     "authModeOfficialSubscription": "官网订阅",
     "authModeCustomEndpoint": "自定义接口",
     "authModeCustomEndpointHint": "手动配置 API URL 和 API Key 连接自定义接口。",
@@ -782,6 +795,8 @@
       "saveClineFailed": "保存 Cline 配置失败",
       "hermesSaved": "Hermes 配置已保存",
       "saveHermesFailed": "保存 Hermes 配置失败",
+      "codeBuddySaved": "CodeBuddy 配置已保存",
+      "saveCodeBuddyFailed": "保存 CodeBuddy 配置失败",
       "modelProviderRequired": "请先选择一个模型供应商再保存。",
       "affectedRunningSessions": "{count} 个进行中的会话需重连以应用更改"
     },

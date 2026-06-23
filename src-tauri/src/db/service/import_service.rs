@@ -9,6 +9,7 @@ use crate::db::service::conversation_service;
 use crate::models::{AgentType, ConversationSummary, ImportResult};
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
+use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
 use crate::parsers::gemini::GeminiParser;
 use crate::parsers::hermes::HermesParser;
@@ -37,6 +38,7 @@ pub async fn import_local_conversations(
             (AgentType::OpenClaw, Box::new(OpenClawParser::new())),
             (AgentType::Cline, Box::new(ClineParser::new())),
             (AgentType::Hermes, Box::new(HermesParser::new())),
+            (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),
         ];
 
         let mut matched = Vec::new();

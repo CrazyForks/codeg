@@ -9,6 +9,7 @@ use crate::db::AppDatabase;
 use crate::models::*;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
+use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
 use crate::parsers::gemini::GeminiParser;
 use crate::parsers::hermes::HermesParser;
@@ -166,6 +167,7 @@ fn list_conversations_sync(
         (AgentType::OpenClaw, Box::new(OpenClawParser::new())),
         (AgentType::Cline, Box::new(ClineParser::new())),
         (AgentType::Hermes, Box::new(HermesParser::new())),
+        (AgentType::CodeBuddy, Box::new(CodeBuddyParser::new())),
     ];
 
     for (at, parser) in &parsers {
@@ -270,6 +272,7 @@ pub async fn get_conversation(
             AgentType::OpenClaw => Box::new(OpenClawParser::new()),
             AgentType::Cline => Box::new(ClineParser::new()),
             AgentType::Hermes => Box::new(HermesParser::new()),
+            AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
         };
 
         parser
@@ -509,6 +512,7 @@ pub async fn get_folder_conversation_core(
                 AgentType::OpenClaw => Box::new(OpenClawParser::new()),
                 AgentType::Cline => Box::new(ClineParser::new()),
                 AgentType::Hermes => Box::new(HermesParser::new()),
+                AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
             };
             match parser.get_conversation(&eid) {
                 Ok(d) => Ok((d.turns, d.session_stats, None, d.summary.title)),

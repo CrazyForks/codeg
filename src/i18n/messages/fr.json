@@ -575,6 +575,7 @@
       "confirmUninstall": "Confirmer la désinstallation",
       "saveClineConfig": "Enregistrer la configuration Cline",
       "saveHermesConfig": "Enregistrer la configuration Hermes",
+      "saveCodeBuddyConfig": "Enregistrer la configuration CodeBuddy",
       "customInstall": "Installation personnalisée"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "Modifiez directement ~/.hermes/config.yaml. Enregistrer ici écrase le fichier tel quel.",
       "saveRawConfig": "Enregistrer config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "Configuration de CodeBuddy",
+      "configDescription": "CodeBuddy s'authentifie avec une clé API. Les versions pour la Chine continentale nécessitent aussi de définir l'environnement sur « Chine (internal) » ; les versions iOA utilisent « iOA ». La version internationale la laisse non définie.",
+      "apiKeyLabel": "Clé API",
+      "apiKeyHint": "Enregistré en tant que CODEBUDDY_API_KEY pour cet agent. Vous pouvez aussi vous connecter avec la CLI CodeBuddy dans un terminal.",
+      "environmentLabel": "Environnement",
+      "environmentHint": "Définit CODEBUDDY_INTERNET_ENVIRONMENT. La Chine continentale doit utiliser « Chine (internal) » ; la version internationale la laisse non définie.",
+      "envOverseas": "International (par défaut)",
+      "envChina": "Chine (internal)",
+      "envIoa": "iOA",
+      "loginHint": "Pas de clé API ? Exécutez « codebuddy » dans un terminal pour vous connecter avec votre compte Tencent."
+    },
     "authModeOfficialSubscription": "Abonnement officiel",
     "authModeCustomEndpoint": "Endpoint personnalisé",
     "authModeCustomEndpointHint": "Configurer manuellement l'URL API et la clé API pour un endpoint personnalisé.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Échec de l'enregistrement de la configuration Cline",
       "hermesSaved": "Configuration Hermes enregistrée",
       "saveHermesFailed": "Échec de l'enregistrement de la configuration Hermes",
+      "codeBuddySaved": "Configuration CodeBuddy enregistrée",
+      "saveCodeBuddyFailed": "Échec de l'enregistrement de la configuration CodeBuddy",
       "modelProviderRequired": "Veuillez sélectionner un fournisseur de modèle avant d'enregistrer.",
       "affectedRunningSessions": "{count, plural, one {# session active doit se reconnecter pour appliquer la modification} other {# sessions actives doivent se reconnecter pour appliquer la modification}}"
     },

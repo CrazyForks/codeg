@@ -575,6 +575,7 @@
       "confirmUninstall": "제거 확인",
       "saveClineConfig": "Cline 설정 저장",
       "saveHermesConfig": "Hermes 설정 저장",
+      "saveCodeBuddyConfig": "CodeBuddy 구성 저장",
       "customInstall": "사용자 지정 설치"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "~/.hermes/config.yaml을 직접 편집합니다. 여기서 저장하면 파일이 그대로 덮어쓰여집니다.",
       "saveRawConfig": "config.yaml 저장"
     },
+    "codebuddy": {
+      "configManagement": "CodeBuddy 구성",
+      "configDescription": "CodeBuddy는 API 키로 인증합니다. 중국 버전은 환경을 ‘중국(internal)’으로 설정해야 하며, iOA 버전은 ‘iOA’를 사용하고, 해외 버전은 설정하지 않습니다.",
+      "apiKeyLabel": "API 키",
+      "apiKeyHint": "이 에이전트의 CODEBUDDY_API_KEY로 저장됩니다. 또는 터미널에서 CodeBuddy CLI로 로그인할 수도 있습니다.",
+      "environmentLabel": "환경",
+      "environmentHint": "CODEBUDDY_INTERNET_ENVIRONMENT를 설정합니다. 중국 본토는 ‘중국(internal)’을 사용해야 하며, 해외 버전은 설정하지 않습니다.",
+      "envOverseas": "해외(기본값)",
+      "envChina": "중국(internal)",
+      "envIoa": "iOA",
+      "loginHint": "API 키가 없나요? 터미널에서 ‘codebuddy’를 실행하여 Tencent 계정으로 로그인할 수도 있습니다."
+    },
     "authModeOfficialSubscription": "공식 구독",
     "authModeCustomEndpoint": "사용자 정의 엔드포인트",
     "authModeCustomEndpointHint": "API URL과 API Key를 수동으로 구성하여 사용자 정의 엔드포인트에 연결합니다.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Cline 설정 저장 실패",
       "hermesSaved": "Hermes 설정 저장됨",
       "saveHermesFailed": "Hermes 설정 저장 실패",
+      "codeBuddySaved": "CodeBuddy 구성이 저장되었습니다",
+      "saveCodeBuddyFailed": "CodeBuddy 구성 저장에 실패했습니다",
       "modelProviderRequired": "저장하기 전에 모델 공급자를 선택하세요.",
       "affectedRunningSessions": "{count}개의 실행 중인 세션은 다시 연결하면 변경 사항이 적용됩니다"
     },

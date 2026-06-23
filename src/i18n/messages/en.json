@@ -575,6 +575,7 @@
       "confirmUninstall": "Confirm Uninstall",
       "saveClineConfig": "Save Cline Config",
       "saveHermesConfig": "Save Hermes Config",
+      "saveCodeBuddyConfig": "Save CodeBuddy Config",
       "customInstall": "Custom install"
     },
     "status": {
@@ -694,6 +695,18 @@
       "rawConfigHint": "Edit ~/.hermes/config.yaml directly. Saving here overwrites the file verbatim.",
       "saveRawConfig": "Save config.yaml"
     },
+    "codebuddy": {
+      "configManagement": "CodeBuddy Configuration",
+      "configDescription": "CodeBuddy authenticates with an API key. Mainland China builds also require the environment set to “China (internal)”; iOA builds use “iOA”. The overseas build leaves it unset.",
+      "apiKeyLabel": "API Key",
+      "apiKeyHint": "Saved as CODEBUDDY_API_KEY for this agent. Alternatively, sign in with the CodeBuddy CLI in a terminal.",
+      "environmentLabel": "Environment",
+      "environmentHint": "Sets CODEBUDDY_INTERNET_ENVIRONMENT. Mainland China must use “China (internal)”; the overseas build leaves it unset.",
+      "envOverseas": "Overseas (default)",
+      "envChina": "China (internal)",
+      "envIoa": "iOA",
+      "loginHint": "No API key? Run “codebuddy” in a terminal to sign in with your Tencent account instead."
+    },
     "authModeOfficialSubscription": "Official Subscription",
     "authModeCustomEndpoint": "Custom Endpoint",
     "authModeCustomEndpointHint": "Manually configure API URL and API Key for a custom endpoint.",
@@ -782,6 +795,8 @@
       "saveClineFailed": "Failed to save Cline config",
       "hermesSaved": "Hermes config saved",
       "saveHermesFailed": "Failed to save Hermes config",
+      "codeBuddySaved": "CodeBuddy config saved",
+      "saveCodeBuddyFailed": "Failed to save CodeBuddy config",
       "modelProviderRequired": "Please select a model provider before saving.",
       "affectedRunningSessions": "{count, plural, one {# running session needs to reconnect to apply the change} other {# running sessions need to reconnect to apply the change}}"
     },
