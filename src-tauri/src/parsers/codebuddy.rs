@@ -8,14 +8,14 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::models::{
-    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageRole, MessageTurn,
-    TurnRole, TurnUsage, UnifiedMessage,
+    AgentExecutionStats, AgentToolCall, AgentType, ContentBlock, ConversationDetail,
+    ConversationSummary, MessageRole, MessageTurn, TurnRole, TurnUsage, UnifiedMessage,
 };
 use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
     latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, AgentParser,
-    ParseError,
+    resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, truncate_str,
+    AgentParser, ParseError,
 };
 
 /// Resolve CodeBuddy's config dir, honoring `CODEBUDDY_CONFIG_DIR`, else
@@ -170,6 +170,14 @@ impl CodeBuddyParser {
         let mut model: Option<String> = None;
         let mut cwd: Option<String> = None;
         let mut message_count: u32 = 0;
+        // `callId`s of `function_call`s classified as an `Agent` delegation. Only
+        // their paired results may load a sub-agent transcript — so an ordinary
+        // tool result that happens to carry a `subAgent` block (corruption,
+        // schema drift, a future tool) can never gain `agent_stats`. Uses the
+        // same agent classification as the tool-use rename, so it tracks "Agent"
+        // and the Claude-style "Task"+subagent_type form alike.
+        let mut agent_call_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (idx, line) in reader.lines().enumerate() {
             let Ok(line) = line else { continue };
@@ -258,16 +266,19 @@ impl CodeBuddyParser {
                     }
                 }
                 "function_call" => {
+                    let tool_call_id = call_id(&value);
+                    let tool_name = resolve_tool_call_name(&value);
+                    if tool_name == "Agent" {
+                        if let Some(id) = &tool_call_id {
+                            agent_call_ids.insert(id.clone());
+                        }
+                    }
                     messages.push(UnifiedMessage {
                         id: format!("cb-toolcall-{idx}"),
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::ToolUse {
-                            tool_use_id: call_id(&value),
-                            tool_name: value
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("unknown")
-                                .to_string(),
+                            tool_use_id: tool_call_id,
+                            tool_name,
                             input_preview: tool_input_preview(&value),
                             meta: None,
                         }],
@@ -279,14 +290,25 @@ impl CodeBuddyParser {
                     });
                 }
                 "function_call_result" => {
+                    let tool_call_id = call_id(&value);
+                    // Load the sub-agent transcript only for a result paired (by
+                    // callId) to a `function_call` we classified as an `Agent`
+                    // delegation — the historical mirror of the live path. Every
+                    // ordinary tool result stays `None`, even one that carries a
+                    // stray `subAgent` block, so non-Agent results are unchanged.
+                    let agent_stats = tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| agent_call_ids.contains(id))
+                        .then(|| agent_stats_from_subagent(&value, path))
+                        .flatten();
                     messages.push(UnifiedMessage {
                         id: format!("cb-toolresult-{idx}"),
                         role: MessageRole::Tool,
                         content: vec![ContentBlock::ToolResult {
-                            tool_use_id: call_id(&value),
+                            tool_use_id: tool_call_id,
                             output_preview: tool_output_preview(&value),
                             is_error: tool_is_error(&value),
-                            agent_stats: None,
+                            agent_stats,
                             images: Vec::new(),
                         }],
                         timestamp: ts,
@@ -500,6 +522,71 @@ fn usage_from_raw(value: &Value) -> Option<TurnUsage> {
     })
 }
 
+/// Parse a `function_call`'s `arguments` — a JSON string (or, defensively, an
+/// already-decoded object) — into a `Value` for field inspection. Returns `None`
+/// for missing/unparseable/non-object arguments.
+fn parse_tool_arguments(value: &Value) -> Option<Value> {
+    match value.get("arguments")? {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+        obj @ Value::Object(_) => Some(obj.clone()),
+        _ => None,
+    }
+}
+
+/// CodeBuddy invokes MCP tools indirectly through its `DeferExecuteTool`
+/// virtualization layer (after a `ToolSearch` discovery step), packing the real
+/// tool name and parameters into `{ "toolName": "mcp__…__delegate_to_agent",
+/// "params": { … } }`. When a tool call's parsed `arguments` carry that wrapper,
+/// return the inner `toolName` so the call resolves to its real identity — and
+/// renders the dedicated delegation/question card via the existing
+/// `normalizeToolName` suffix rules — instead of the opaque `DeferExecuteTool`
+/// shell. The `params` wrapper is deliberately left on `input_preview`: the
+/// frontend cards (`findDelegationArgs`, `findTaskId`) peel it themselves, and
+/// keeping it also stops the live `inferFromInput` from misclassifying
+/// `cancel_delegation`'s `{task_id}` as a generic task. Shared with the live ACP
+/// path in `acp/connection.rs`.
+pub(crate) fn deferred_tool_name(arguments: &Value) -> Option<&str> {
+    let obj = arguments.as_object()?;
+    obj.get("params")?;
+    obj.get("toolName")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// True when the parsed `arguments` carry a non-empty string `subagent_type` —
+/// the agent-agnostic sub-agent delegation marker (also used by
+/// `acp/connection.rs:is_subagent_invocation` and the frontend `inferFromInput`).
+fn declares_subagent(arguments: &Value) -> bool {
+    arguments
+        .get("subagent_type")
+        .and_then(|s| s.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Resolve a tool call's display name from its `arguments`:
+///   1. a `DeferExecuteTool` wrapper unwraps to its inner `toolName`;
+///   2. a native call carrying `subagent_type` is renamed to "Agent" (so the
+///      renderer routes it into `AgentToolCallPart`, mirroring the OpenCode
+///      `parsers/opencode.rs` and Codex `parsers/codex.rs` parsers);
+///   3. otherwise the literal `name` is kept.
+fn resolve_tool_call_name(value: &Value) -> String {
+    if let Some(arguments) = parse_tool_arguments(value) {
+        if let Some(inner) = deferred_tool_name(&arguments) {
+            return inner.to_string();
+        }
+        if declares_subagent(&arguments) {
+            return "Agent".to_string();
+        }
+    }
+    value
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// `function_call.arguments` is a JSON string (or, defensively, an object).
 fn tool_input_preview(value: &Value) -> Option<String> {
     let arguments = value.get("arguments")?;
@@ -512,9 +599,46 @@ fn tool_input_preview(value: &Value) -> Option<String> {
     }
 }
 
+/// Rebuild the MCP `CallToolResult` envelope from CodeBuddy's
+/// `providerData.toolResult.mcpMeta.structuredContent`. Deferred MCP tools
+/// (`DeferExecuteTool`) carry their real structured result here, while
+/// `output.text` is only the human-readable ack line; surfacing the envelope the
+/// frontend delegation/question cards parse (`parseToolOutput` /
+/// `parseStatusReport` / `parseAskQuestionOutcome`) lets them recover
+/// `child_conversation_id`, status, tasks, and selections. Returns `None` for
+/// plain tools (no `mcpMeta`) or MCP tools that return no structured content, so
+/// those fall through to the normal text path.
+fn deferred_result_envelope(value: &Value) -> Option<String> {
+    let tool_result = value.get("providerData")?.get("toolResult")?;
+    let mcp_meta = tool_result.get("mcpMeta")?;
+    let structured = mcp_meta.get("structuredContent")?;
+    if structured.is_null() {
+        return None;
+    }
+    let text = value
+        .get("output")
+        .and_then(|o| o.get("text").and_then(|t| t.as_str()).or_else(|| o.as_str()))
+        .or_else(|| tool_result.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("");
+    let is_error = mcp_meta
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    serde_json::to_string(&serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": is_error,
+    }))
+    .ok()
+}
+
 /// `function_call_result.output` is `{type:"text", text}`; fall back to the raw
-/// string or `providerData.toolResult.content`.
+/// string or `providerData.toolResult.content`. Deferred MCP tools first surface
+/// their structured `mcpMeta` envelope (see `deferred_result_envelope`).
 fn tool_output_preview(value: &Value) -> Option<String> {
+    if let Some(envelope) = deferred_result_envelope(value) {
+        return Some(envelope);
+    }
     if let Some(output) = value.get("output") {
         if let Some(text) = output.as_str() {
             if !text.is_empty() {
@@ -567,6 +691,129 @@ fn tool_is_error(value: &Value) -> bool {
         .and_then(|t| t.as_str())
         .and_then(|t| t.trim_start().get(..6).map(str::to_string))
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
+}
+
+/// The sub-agent transcript id CodeBuddy records on an `Agent` tool result
+/// (`providerData.toolResult.subAgent.sessionId`, e.g. `"agent-cdd7c1ea"`). The
+/// transcript lives at `<session_dir>/subagents/<id>.jsonl` — Claude Code's
+/// directory layout. Ordinary tool results carry no `subAgent` block, so this
+/// returns `None` for them.
+fn subagent_transcript_id(result: &Value) -> Option<&str> {
+    result
+        .get("providerData")?
+        .get("toolResult")?
+        .get("subAgent")?
+        .get("sessionId")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse a CodeBuddy sub-agent transcript and extract its tool calls.
+///
+/// The sub-agent JSONL uses the same OpenAI-items schema as the main session
+/// (`function_call` / `function_call_result` records); we pair them by `callId`
+/// and reuse the outer parser's name/preview/error helpers so nested calls
+/// render identically to top-level ones. Mirrors `claude.rs`'s
+/// `parse_subagent_tool_calls`, which does the same for Claude's schema.
+fn parse_codebuddy_subagent_tool_calls(path: &Path) -> Vec<AgentToolCall> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let reader = BufReader::new(file);
+
+    // (callId, name, input) in encounter order, paired against results by callId.
+    let mut calls: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+    let mut results: std::collections::HashMap<String, (Option<String>, bool)> =
+        std::collections::HashMap::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "function_call" => {
+                calls.push((
+                    call_id(&value),
+                    resolve_tool_call_name(&value),
+                    tool_input_preview(&value).map(|s| truncate_str(&s, 500)),
+                ));
+            }
+            "function_call_result" => {
+                if let Some(id) = call_id(&value) {
+                    let output = tool_output_preview(&value).map(|s| truncate_str(&s, 500));
+                    results.insert(id, (output, tool_is_error(&value)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    calls
+        .into_iter()
+        .map(|(id, tool_name, input_preview)| {
+            let (output_preview, is_error) =
+                id.and_then(|i| results.remove(&i)).unwrap_or((None, false));
+            AgentToolCall {
+                tool_name,
+                input_preview,
+                output_preview,
+                is_error,
+            }
+        })
+        .collect()
+}
+
+/// Build `agent_stats` for an `Agent` `function_call_result` by loading the
+/// sub-agent's own transcript and extracting its nested tool calls — the
+/// historical mirror of the live path, which synthesizes the same `agent_stats`
+/// from the streamed child tool calls (`conversation-runtime-context.tsx`).
+///
+/// Returns `None` for ordinary results (no `subAgent` linkage), a
+/// missing/empty transcript, or a sub-agent that ran no tools, so the common
+/// case stays a plain tool result. `main_session_path` is the real `.jsonl`
+/// path the parser is reading; the transcript sits beside it under
+/// `<session_dir>/subagents/`.
+fn agent_stats_from_subagent(
+    result: &Value,
+    main_session_path: &Path,
+) -> Option<AgentExecutionStats> {
+    let id = subagent_transcript_id(result)?;
+    // Path-traversal guard: `id` becomes a filename under the session dir.
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    let transcript = main_session_path
+        .with_extension("")
+        .join("subagents")
+        .join(format!("{id}.jsonl"));
+    if !transcript.exists() {
+        return None;
+    }
+    let tool_calls = parse_codebuddy_subagent_tool_calls(&transcript);
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let tool_count = tool_calls.len() as u32;
+    Some(AgentExecutionStats {
+        agent_type: None,
+        status: None,
+        total_duration_ms: None,
+        total_tokens: None,
+        total_tool_use_count: Some(tool_count),
+        read_count: None,
+        search_count: None,
+        bash_count: None,
+        edit_file_count: None,
+        lines_added: None,
+        lines_removed: None,
+        other_tool_count: None,
+        tool_calls,
+    })
 }
 
 fn text_message(
@@ -969,6 +1216,405 @@ mod tests {
             !read_output.contains("1→"),
             "line-number prefixes must be stripped, got: {read_output}"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn subagent_task_is_rewritten_to_agent() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-agent-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-agent";
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1782193811000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"delegate it"}]}),
+                // Sub-agent delegation: CodeBuddy's AgentTool, same arguments shape
+                // as Claude Code's Task ({description, prompt, subagent_type}).
+                json!({"type":"function_call","timestamp":1782193811200i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Task","callId":"a1",
+                       "arguments":"{\"description\": \"Explore structure\", \"prompt\": \"map the repo\", \"subagent_type\": \"general-purpose\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811400i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Task","callId":"a1","status":"completed",
+                       "output":{"type":"text","text":"Done: 12 files"}}),
+                // A plain tool in the same session must keep its name.
+                json!({"type":"function_call","timestamp":1782193811600i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","arguments":"{\"command\": \"ls\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811700i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","status":"completed","output":{"type":"text","text":"a.ts"}}),
+                // Empty subagent_type must NOT be treated as a delegation.
+                json!({"type":"function_call","timestamp":1782193811800i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Task","callId":"c1","arguments":"{\"subagent_type\": \"\"}"}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+
+        let mut uses = Vec::new();
+        let mut results = Vec::new();
+        for turn in &detail.turns {
+            for block in &turn.blocks {
+                match block {
+                    ContentBlock::ToolUse {
+                        tool_name,
+                        tool_use_id,
+                        input_preview,
+                        ..
+                    } => uses.push((
+                        tool_name.clone(),
+                        tool_use_id.clone(),
+                        input_preview.clone(),
+                    )),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        output_preview,
+                        ..
+                    } => results.push((tool_use_id.clone(), output_preview.clone())),
+                    _ => {}
+                }
+            }
+        }
+
+        // The Task delegation is renamed to "Agent" so the frontend routes it into
+        // AgentToolCallPart; its arguments (subagent_type/description/prompt) are
+        // preserved verbatim for the card to render.
+        let agent = uses
+            .iter()
+            .find(|(_, id, _)| id.as_deref() == Some("a1"))
+            .expect("delegation tool use");
+        assert_eq!(
+            agent.0, "Agent",
+            "a Task call carrying subagent_type must be renamed to Agent"
+        );
+        let agent_input = agent.2.as_deref().unwrap_or_default();
+        assert!(
+            agent_input.contains("subagent_type") && agent_input.contains("general-purpose"),
+            "input_preview must keep subagent_type, got: {agent_input}"
+        );
+        assert!(
+            agent_input.contains("Explore structure"),
+            "description must be preserved, got: {agent_input}"
+        );
+        assert!(
+            agent_input.contains("map the repo"),
+            "prompt must be preserved, got: {agent_input}"
+        );
+
+        // call_id pairing is unaffected by the rename — the Agent result resolves.
+        let agent_result = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("a1"))
+            .expect("delegation result");
+        assert!(agent_result
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Done: 12 files"));
+
+        // A plain tool keeps its original name.
+        let bash = uses
+            .iter()
+            .find(|(_, id, _)| id.as_deref() == Some("b1"))
+            .expect("bash tool use");
+        assert_eq!(
+            bash.0, "Bash",
+            "non-delegation tools must keep their original name"
+        );
+
+        // Empty subagent_type is not a delegation — the name stays "Task".
+        let empty = uses
+            .iter()
+            .find(|(_, id, _)| id.as_deref() == Some("c1"))
+            .expect("empty-subagent tool use");
+        assert_eq!(
+            empty.0, "Task",
+            "an empty subagent_type must not trigger the rename"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write a CodeBuddy sub-agent transcript at
+    /// `<root>/<encoded_cwd>/<session_id>/subagents/<agent_id>.jsonl`.
+    fn write_subagent(
+        root: &Path,
+        encoded_cwd: &str,
+        session_id: &str,
+        agent_id: &str,
+        records: &[Value],
+    ) {
+        let dir = root.join(encoded_cwd).join(session_id).join("subagents");
+        std::fs::create_dir_all(&dir).expect("create subagents dir");
+        let mut file =
+            std::fs::File::create(dir.join(format!("{agent_id}.jsonl"))).expect("create subagent");
+        for record in records {
+            writeln!(file, "{}", serde_json::to_string(record).expect("serialize"))
+                .expect("write line");
+        }
+    }
+
+    #[test]
+    fn subagent_tool_calls_loaded_into_agent_stats() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-substats-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-substats";
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1782193811000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"build it"}]}),
+                // Agent delegation whose result links to a sub-agent transcript.
+                json!({"type":"function_call","timestamp":1782193811200i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Agent","callId":"a1",
+                       "arguments":"{\"description\": \"build\", \"prompt\": \"run the build\", \"subagent_type\": \"general-purpose\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811400i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Agent","callId":"a1","status":"completed",
+                       "output":{"type":"text","text":"Build succeeded [Agent ID: agent-test01]"},
+                       "providerData":{"toolResult":{"content":"Build succeeded","subAgent":{"sessionId":"agent-test01","lastId":"x"}}}}),
+                // A second Agent delegation whose transcript file is absent.
+                json!({"type":"function_call","timestamp":1782193811500i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Agent","callId":"a2",
+                       "arguments":"{\"subagent_type\": \"general-purpose\", \"prompt\": \"x\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811600i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Agent","callId":"a2","status":"completed",
+                       "output":{"type":"text","text":"done"},
+                       "providerData":{"toolResult":{"content":"done","subAgent":{"sessionId":"agent-missing"}}}}),
+                // A plain tool with no sub-agent linkage.
+                json!({"type":"function_call","timestamp":1782193811700i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","arguments":"{\"command\": \"ls\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811800i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","status":"completed","output":{"type":"text","text":"a.ts"}}),
+                // Isolation guard: a non-Agent tool whose result carries a stray
+                // `subAgent` block (corruption / schema drift) pointing at a real
+                // transcript must still get no agent_stats — it is gated on the
+                // paired call being an `Agent`, not on the block's presence.
+                json!({"type":"function_call","timestamp":1782193811820i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b2","arguments":"{\"command\": \"echo hi\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811840i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b2","status":"completed","output":{"type":"text","text":"hi"},
+                       "providerData":{"toolResult":{"content":"hi","subAgent":{"sessionId":"agent-test01"}}}}),
+            ],
+        );
+
+        // The sub-agent ran two tools: a successful Bash and a failed Read. The
+        // transcript is CodeBuddy's own items format, same as the main session.
+        write_subagent(
+            &root,
+            "Users-demo-app",
+            sid,
+            "agent-test01",
+            &[
+                json!({"type":"function_call","timestamp":1782193811250i64,"sessionId":"agent-test01",
+                       "name":"Bash","callId":"s1","arguments":"{\"command\": \"pnpm build\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811300i64,"sessionId":"agent-test01",
+                       "name":"Bash","callId":"s1","status":"completed",
+                       "output":{"type":"text","text":"Exited with code 0"}}),
+                json!({"type":"function_call","timestamp":1782193811320i64,"sessionId":"agent-test01",
+                       "name":"Read","callId":"s2","arguments":"{\"file_path\": \"/missing\"}"}),
+                // CodeBuddy reports tool failure via providerData.toolResult.error.
+                json!({"type":"function_call_result","timestamp":1782193811350i64,"sessionId":"agent-test01",
+                       "name":"Read","callId":"s2","status":"completed",
+                       "output":{"type":"text","text":"boom"},
+                       "providerData":{"toolResult":{"content":"boom","error":"file not found"}}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+
+        let mut results: Vec<(Option<String>, Option<AgentExecutionStats>)> = Vec::new();
+        for turn in &detail.turns {
+            for block in &turn.blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } = block
+                {
+                    results.push((tool_use_id.clone(), agent_stats.clone()));
+                }
+            }
+        }
+
+        // The Agent result carries the sub-agent's nested tool calls.
+        let stats = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("a1"))
+            .expect("agent result")
+            .1
+            .as_ref()
+            .expect("agent_stats populated from subagent transcript");
+        assert_eq!(stats.tool_calls.len(), 2, "two nested tool calls");
+        assert_eq!(stats.total_tool_use_count, Some(2));
+
+        let bash = &stats.tool_calls[0];
+        assert_eq!(bash.tool_name, "Bash");
+        assert!(bash
+            .input_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pnpm build"));
+        assert!(bash
+            .output_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Exited with code 0"));
+        assert!(!bash.is_error, "successful Bash is not an error");
+
+        let read = &stats.tool_calls[1];
+        assert_eq!(read.tool_name, "Read");
+        assert!(
+            read.is_error,
+            "providerData.toolResult.error must mark the nested call failed"
+        );
+
+        // A delegation whose transcript file is missing degrades to no stats.
+        let missing = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("a2"))
+            .expect("second agent result");
+        assert!(
+            missing.1.is_none(),
+            "absent subagent transcript must leave agent_stats None"
+        );
+
+        // A plain tool result is untouched.
+        let plain = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("b1"))
+            .expect("plain tool result");
+        assert!(
+            plain.1.is_none(),
+            "non-Agent results must never carry agent_stats"
+        );
+
+        // A non-Agent result with a stray subAgent block pointing at a REAL
+        // transcript is still gated out by the call-side Agent classification.
+        let stray = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("b2"))
+            .expect("stray-subagent tool result");
+        assert!(
+            stray.1.is_none(),
+            "a non-Agent result must not gain agent_stats even with a stray subAgent block"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deferred_mcp_tool_is_unwrapped() {
+        let root = std::env::temp_dir().join(format!("codeg-cb-defer-{}", uuid::Uuid::new_v4()));
+        let sid = "sess-defer";
+        write_session(
+            &root,
+            "Users-demo-app",
+            sid,
+            &[
+                json!({"type":"message","role":"user","timestamp":1782193811000i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "content":[{"type":"input_text","text":"delegate it"}]}),
+                // CodeBuddy invokes MCP tools via DeferExecuteTool: the real tool
+                // name + params are packed under arguments.{toolName,params}.
+                json!({"type":"function_call","timestamp":1782193811200i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"DeferExecuteTool","callId":"d1",
+                       "arguments":"{\"params\":{\"agent_type\":\"codex\",\"task\":\"build\",\"working_dir\":\"/Users/demo/app\"},\"toolName\":\"mcp__codeg-mcp__delegate_to_agent\"}"}),
+                // The result carries the real MCP report under providerData.toolResult.mcpMeta.
+                json!({"type":"function_call_result","timestamp":1782193811400i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"DeferExecuteTool","callId":"d1","status":"completed",
+                       "output":{"type":"text","text":"Delegation successful. task_id=e5c9"},
+                       "providerData":{"toolResult":{"content":"Delegation successful. task_id=e5c9",
+                         "mcpMeta":{"structuredContent":{"agent_type":"codex","child_conversation_id":15,"status":"running","task_id":"e5c9","message":"ok"}}}}}),
+                json!({"type":"function_call","timestamp":1782193811600i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"DeferExecuteTool","callId":"d2",
+                       "arguments":"{\"params\":{\"task_ids\":[\"e5c9\"],\"wait_ms\":60000},\"toolName\":\"mcp__codeg-mcp__get_delegation_status\"}"}),
+                json!({"type":"function_call","timestamp":1782193811700i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"DeferExecuteTool","callId":"d3",
+                       "arguments":"{\"params\":{\"task_id\":\"e5c9\"},\"toolName\":\"mcp__codeg-mcp__cancel_delegation\"}"}),
+                // A plain (non-deferred) tool must keep its name and text output.
+                json!({"type":"function_call","timestamp":1782193811800i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","arguments":"{\"command\": \"ls\"}"}),
+                json!({"type":"function_call_result","timestamp":1782193811900i64,"cwd":"/Users/demo/app","sessionId":sid,
+                       "name":"Bash","callId":"b1","status":"completed","output":{"type":"text","text":"a.ts"}}),
+            ],
+        );
+
+        let parser = CodeBuddyParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+
+        let mut uses = Vec::new();
+        let mut results = Vec::new();
+        for turn in &detail.turns {
+            for block in &turn.blocks {
+                match block {
+                    ContentBlock::ToolUse {
+                        tool_name,
+                        tool_use_id,
+                        input_preview,
+                        ..
+                    } => uses.push((
+                        tool_name.clone(),
+                        tool_use_id.clone(),
+                        input_preview.clone(),
+                    )),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        output_preview,
+                        ..
+                    } => results.push((tool_use_id.clone(), output_preview.clone())),
+                    _ => {}
+                }
+            }
+        }
+
+        let name_of = |id: &str| {
+            uses.iter()
+                .find(|(_, u, _)| u.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("tool use {id}"))
+                .0
+                .clone()
+        };
+        // Each DeferExecuteTool resolves to its inner MCP tool name; normalizeToolName
+        // (frontend) then collapses the `mcp__…__` prefix to the canonical card name.
+        assert_eq!(name_of("d1"), "mcp__codeg-mcp__delegate_to_agent");
+        assert_eq!(name_of("d2"), "mcp__codeg-mcp__get_delegation_status");
+        assert_eq!(name_of("d3"), "mcp__codeg-mcp__cancel_delegation");
+        // Plain tool untouched.
+        assert_eq!(name_of("b1"), "Bash");
+
+        // input_preview keeps the wrapper — the frontend cards peel `params`.
+        let d1_input = uses
+            .iter()
+            .find(|(_, u, _)| u.as_deref() == Some("d1"))
+            .and_then(|(_, _, i)| i.clone())
+            .unwrap_or_default();
+        assert!(
+            d1_input.contains("params") && d1_input.contains("agent_type"),
+            "input must keep the params wrapper, got: {d1_input}"
+        );
+
+        // The result surfaces the MCP envelope so delegation cards recover
+        // structuredContent / child_conversation_id (not just the ack text).
+        let d1_output = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("d1"))
+            .and_then(|(_, o)| o.clone())
+            .expect("d1 result");
+        assert!(
+            d1_output.contains("structuredContent") && d1_output.contains("child_conversation_id"),
+            "delegation result must surface the structured MCP report, got: {d1_output}"
+        );
+
+        // A plain tool's output stays its text (no envelope).
+        let b1_output = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("b1"))
+            .and_then(|(_, o)| o.clone())
+            .expect("b1 result");
+        assert_eq!(b1_output, "a.ts");
 
         std::fs::remove_dir_all(&root).ok();
     }
