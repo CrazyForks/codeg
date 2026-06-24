@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -8,14 +8,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::models::{
-    AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageRole, MessageTurn,
-    TurnRole, TurnUsage, UnifiedMessage,
+    AgentExecutionStats, AgentToolCall, AgentType, ContentBlock, ConversationDetail,
+    ConversationSummary, MessageRole, MessageTurn, TurnRole, TurnUsage, UnifiedMessage,
 };
 use crate::parsers::{
     compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
-    latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, AgentParser,
-    ParseError,
+    is_safe_subagent_id, latest_turn_total_usage_tokens, merge_context_window_stats,
+    relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
+    title_from_user_text, truncate_str, AgentParser, ParseError,
 };
 
 /// Resolve Kimi Code's data home, honoring `KIMI_CODE_HOME`, else `~/.kimi-code`
@@ -133,7 +133,9 @@ impl KimiCodeParser {
         session_id: &str,
         cwd: Option<String>,
     ) -> Option<ConversationSummary> {
-        let parsed = parse_wire(&main_wire_path(session_dir));
+        // The list view never renders sub-agent stats, so pass `None` to skip the
+        // per-session sub-agent transcript I/O — only `build_detail` loads them.
+        let parsed = parse_wire(&main_wire_path(session_dir), None);
         // A session that never produced a user/assistant/tool event (only the
         // metadata + system-prompt config records) is treated as empty, matching
         // the "metadata-only is not listed" rule of the other parsers.
@@ -171,7 +173,12 @@ impl KimiCodeParser {
         conversation_id: &str,
         cwd: Option<String>,
     ) -> ConversationDetail {
-        let parsed = parse_wire(&main_wire_path(session_dir));
+        // `agents/` holds both the main wire and each sub-agent's wire, so an
+        // `Agent` delegation result can load its sub-agent transcript from here.
+        let parsed = parse_wire(
+            &main_wire_path(session_dir),
+            Some(&session_dir.join("agents")),
+        );
 
         let mut turns = group_into_turns(parsed.messages);
         relocate_orphaned_tool_results(&mut turns);
@@ -296,7 +303,13 @@ fn main_wire_path(session_dir: &Path) -> PathBuf {
 /// Parse a `wire.jsonl` event stream into a flat, chronologically-ordered list of
 /// `UnifiedMessage`s plus session metadata. Unknown / malformed lines are skipped
 /// (`continue`) so a forward-compatible or partially-written log never panics.
-fn parse_wire(path: &Path) -> WireParse {
+///
+/// When `agents_dir` is `Some` (the conversation-detail path), an `Agent`
+/// delegation's tool result loads the sub-agent's own `wire.jsonl` from
+/// `<agents_dir>/<agent_id>/` and attaches its nested tool calls as `agent_stats`
+/// so the sub-agent renders as an expandable Agent pill. `None` (the list path)
+/// skips that per-session I/O entirely.
+fn parse_wire(path: &Path, agents_dir: Option<&Path>) -> WireParse {
     let mut wp = WireParse::default();
     let Ok(file) = fs::File::open(path) else {
         return wp;
@@ -306,6 +319,10 @@ fn parse_wire(path: &Path) -> WireParse {
     // the turn's last assistant message at the next `turn.prompt` (or EOF).
     let mut pending_usage: Option<TurnUsage> = None;
     let mut last_assistant_idx: Option<usize> = None;
+    // `toolCallId`s of `tool.call`s classified as `Agent` delegations. Only their
+    // paired results may load a sub-agent transcript, so an ordinary tool result
+    // can never gain `agent_stats` (mirrors CodeBuddy's `agent_call_ids` gate).
+    let mut agent_call_ids: HashSet<String> = HashSet::new();
 
     for (idx, line) in BufReader::new(file).lines().enumerate() {
         let Ok(line) = line else { continue };
@@ -394,14 +411,22 @@ fn parse_wire(path: &Path) -> WireParse {
                     "tool.call" => {
                         let ts = note_content_ts(&mut wp, ts_raw);
                         wp.content_events += 1;
+                        let tool_call_id = event
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        // Record `Agent` delegations so only their paired results
+                        // load a sub-agent transcript (the gate is applied below).
+                        if is_agent_tool_call(event) {
+                            if let Some(id) = &tool_call_id {
+                                agent_call_ids.insert(id.clone());
+                            }
+                        }
                         wp.messages.push(block_message(
                             format!("kc-toolcall-{idx}"),
                             MessageRole::Assistant,
                             ContentBlock::ToolUse {
-                                tool_use_id: event
-                                    .get("toolCallId")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
+                                tool_use_id: tool_call_id,
                                 tool_name: event
                                     .get("name")
                                     .and_then(Value::as_str)
@@ -418,20 +443,37 @@ fn parse_wire(path: &Path) -> WireParse {
                         let ts = note_content_ts(&mut wp, ts_raw);
                         wp.content_events += 1;
                         let result = event.get("result");
+                        let tool_call_id = event
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        let output_preview = result.and_then(tool_result_preview);
+                        // Load the sub-agent transcript only for a result paired
+                        // (by `toolCallId`) to a `tool.call` classified as an
+                        // `Agent` delegation. Every ordinary result stays `None`,
+                        // even one whose output coincidentally opens with an
+                        // `agent_id:` line — the gate is the call classification,
+                        // not the marker's presence.
+                        let agent_stats = agents_dir
+                            .filter(|_| {
+                                tool_call_id
+                                    .as_deref()
+                                    .is_some_and(|id| agent_call_ids.contains(id))
+                            })
+                            .and_then(|dir| {
+                                agent_stats_from_subagent(output_preview.as_deref(), dir)
+                            });
                         wp.messages.push(block_message(
                             format!("kc-toolresult-{idx}"),
                             MessageRole::Tool,
                             ContentBlock::ToolResult {
-                                tool_use_id: event
-                                    .get("toolCallId")
-                                    .and_then(Value::as_str)
-                                    .map(String::from),
-                                output_preview: result.and_then(tool_result_preview),
+                                tool_use_id: tool_call_id,
+                                output_preview,
                                 is_error: result
                                     .and_then(|r| r.get("isError"))
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false),
-                                agent_stats: None,
+                                agent_stats,
                                 // Kimi tool results are text/JSON today; image
                                 // capture (cf. main's tool-result image support)
                                 // is a follow-up that needs a real image sample.
@@ -539,6 +581,161 @@ fn tool_result_preview(result: &Value) -> Option<String> {
     } else {
         serde_json::to_string(output).ok()
     }
+}
+
+/// True when a `tool.call` event is an `Agent` sub-agent delegation — its `name`
+/// is `"Agent"`, or (defensively) its `args` carry a non-empty `subagent_type`.
+/// Only such calls' paired results may load a sub-agent transcript.
+fn is_agent_tool_call(event: &Value) -> bool {
+    if event.get("name").and_then(Value::as_str) == Some("Agent") {
+        return true;
+    }
+    event
+        .get("args")
+        .and_then(|args| args.get("subagent_type"))
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The sub-agent transcript id Kimi writes at the head of an `Agent` tool
+/// result's output: the first line is `agent_id: agent-0` (followed by
+/// `actual_subagent_type:` / `status:` / a blank line / the summary). Only the
+/// first line is inspected, so an `agent_id:` substring appearing inside the
+/// summary body can never be mistaken for the marker. Returns `None` for an
+/// ordinary result whose output carries no such header.
+fn subagent_id_from_output(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .next()?
+        .trim()
+        .strip_prefix("agent_id:")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+/// Walk a sub-agent's `wire.jsonl` — the same event-sourcing format as the main
+/// wire — and extract its tool calls as `AgentToolCall`s, pairing each
+/// `tool.call` with its `tool.result` by `toolCallId`. The outer
+/// `tool_args_preview` / `tool_result_preview` helpers are reused so nested calls
+/// render identically to top-level ones. Mirrors `codebuddy.rs`'s
+/// `parse_codebuddy_subagent_tool_calls`.
+///
+/// Intentionally non-recursive: a nested `Agent` call inside the sub-agent shows
+/// as a flat leaf tool here (no further descent), which bounds the work and
+/// matches the frontend stripping `agent_stats` from nested renders.
+fn parse_kimi_subagent_tool_calls(path: &Path) -> Vec<AgentToolCall> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+
+    // (toolCallId, name, input) in encounter order, paired against results by id.
+    let mut calls: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+    let mut results: HashMap<String, (Option<String>, bool)> = HashMap::new();
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("context.append_loop_event") {
+            continue;
+        }
+        let Some(event) = value.get("event") else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "tool.call" => {
+                calls.push((
+                    event
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    tool_args_preview(event).map(|s| truncate_str(&s, 500)),
+                ));
+            }
+            "tool.result" => {
+                if let Some(id) = event.get("toolCallId").and_then(Value::as_str) {
+                    let result = event.get("result");
+                    let output =
+                        result.and_then(tool_result_preview).map(|s| truncate_str(&s, 500));
+                    let is_error = result
+                        .and_then(|r| r.get("isError"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    results.insert(id.to_string(), (output, is_error));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    calls
+        .into_iter()
+        .map(|(id, tool_name, input_preview)| {
+            let (output_preview, is_error) =
+                id.and_then(|i| results.remove(&i)).unwrap_or((None, false));
+            AgentToolCall {
+                tool_name,
+                input_preview,
+                output_preview,
+                is_error,
+            }
+        })
+        .collect()
+}
+
+/// Build `agent_stats` for an `Agent` tool result by reading the sub-agent id
+/// from its output header (`subagent_id_from_output`) and loading the sub-agent's
+/// own `wire.jsonl` from `<agents_dir>/<agent_id>/`. The historical mirror of the
+/// live path, which synthesizes the same `agent_stats` from the streamed child
+/// tool calls.
+///
+/// Returns `None` for an ordinary result (no `agent_id:` header), an unsafe id, a
+/// missing transcript, or a sub-agent that ran no tools — so the common case
+/// stays a plain tool result.
+fn agent_stats_from_subagent(
+    output: Option<&str>,
+    agents_dir: &Path,
+) -> Option<AgentExecutionStats> {
+    let id = subagent_id_from_output(output?)?;
+    // `id` becomes a path component under `agents_dir`; reject anything that
+    // could escape the directory before a file is opened.
+    if !is_safe_subagent_id(id) {
+        return None;
+    }
+    let transcript = agents_dir.join(id).join("wire.jsonl");
+    if !transcript.exists() {
+        return None;
+    }
+    let tool_calls = parse_kimi_subagent_tool_calls(&transcript);
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let tool_count = tool_calls.len() as u32;
+    Some(AgentExecutionStats {
+        agent_type: None,
+        status: None,
+        total_duration_ms: None,
+        total_tokens: None,
+        total_tool_use_count: Some(tool_count),
+        read_count: None,
+        search_count: None,
+        bash_count: None,
+        edit_file_count: None,
+        lines_added: None,
+        lines_removed: None,
+        other_tool_count: None,
+        tool_calls,
+    })
 }
 
 /// Map a `usage.record.usage` object onto `TurnUsage`; `None` when all counters
@@ -1024,5 +1221,169 @@ mod tests {
             parser.get_conversation("nope"),
             Err(ParseError::ConversationNotFound(_))
         ));
+    }
+
+    /// Write a sub-agent's wire at
+    /// `<sessions>/<bucket>/<sessionId>/agents/<agentId>/wire.jsonl`, beside the
+    /// `agents/main/` wire that `write_session` creates.
+    fn write_subagent_wire(
+        sessions_root: &Path,
+        bucket: &str,
+        session_id: &str,
+        agent_id: &str,
+        wire: &[Value],
+    ) {
+        let dir = sessions_root
+            .join(bucket)
+            .join(session_id)
+            .join("agents")
+            .join(agent_id);
+        std::fs::create_dir_all(&dir).expect("create subagent dir");
+        let mut file = std::fs::File::create(dir.join("wire.jsonl")).expect("create wire.jsonl");
+        for record in wire {
+            writeln!(file, "{}", serde_json::to_string(record).expect("serialize"))
+                .expect("write line");
+        }
+    }
+
+    #[test]
+    fn agent_delegation_loads_subagent_tool_calls_into_agent_stats() {
+        let root = unique_root("subagent");
+        let bucket = "wd_my-app_d1a3666e54ae";
+        let sid = "session_subagent";
+
+        write_session(
+            &root,
+            bucket,
+            sid,
+            &json!({"title":"delegate it"}),
+            &[
+                json!({"type":"turn.prompt","input":[{"type":"text","text":"delegate the build"}],"origin":{"kind":"user"},"time":1782276649000i64}),
+                // Agent delegation whose result header links to `agent-0`.
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"Agent_1","name":"Agent","args":{"description":"build it","prompt":"run pnpm build","subagent_type":"coder"}},"time":1782276650000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Agent_1","result":{"output":"agent_id: agent-0\nactual_subagent_type: coder\nstatus: completed\n\n[summary]\n`pnpm build` succeeded."}},"time":1782276660000i64}),
+                // A second Agent delegation whose transcript directory is absent.
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"Agent_2","name":"Agent","args":{"prompt":"x","subagent_type":"coder"}},"time":1782276661000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Agent_2","result":{"output":"agent_id: agent-missing\nstatus: completed\n\n[summary]\ndone"}},"time":1782276662000i64}),
+                // A plain tool with no sub-agent linkage.
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"Bash_0","name":"Bash","args":{"command":"ls"}},"time":1782276663000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Bash_0","result":{"output":"a.ts"}},"time":1782276664000i64}),
+                // Isolation guard: a non-Agent tool whose result output coincidentally
+                // opens with a real `agent_id: agent-0` header must STILL get no
+                // agent_stats — the gate is the call's classification, not the marker.
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"Bash_stray","name":"Bash","args":{"command":"echo agent_id"}},"time":1782276665000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"Bash_stray","result":{"output":"agent_id: agent-0\nstatus: completed"}},"time":1782276666000i64}),
+            ],
+        );
+
+        // The sub-agent ran two tools: a successful Bash and a failed Read.
+        write_subagent_wire(
+            &root,
+            bucket,
+            sid,
+            "agent-0",
+            &[
+                json!({"type":"metadata","protocol_version":"1.4","created_at":1782276651000i64}),
+                json!({"type":"config.update","profileName":"coder","modelAlias":"codeg-managed","time":1782276651000i64}),
+                json!({"type":"turn.prompt","input":[{"type":"text","text":"run pnpm build"}],"origin":{"kind":"user"},"time":1782276651500i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"s1","name":"Bash","args":{"command":"pnpm build","cwd":"/Users/demo/my-app"}},"time":1782276652000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"s1","result":{"output":"Exited with code 0"}},"time":1782276658000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"s2","name":"Read","args":{"file_path":"/missing"}},"time":1782276659000i64}),
+                json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"s2","result":{"output":"file not found","isError":true}},"time":1782276659500i64}),
+            ],
+        );
+
+        let parser = KimiCodeParser::with_base_dir(root.clone());
+        let detail = parser.get_conversation(sid).expect("detail");
+
+        // Collect every (tool_use_id, agent_stats) across the rendered turns.
+        let mut results: Vec<(Option<String>, Option<AgentExecutionStats>)> = Vec::new();
+        for turn in &detail.turns {
+            for block in &turn.blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    agent_stats,
+                    ..
+                } = block
+                {
+                    results.push((tool_use_id.clone(), agent_stats.clone()));
+                }
+            }
+        }
+
+        // The first Agent result carries the sub-agent's nested tool calls.
+        let stats = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("Agent_1"))
+            .expect("Agent_1 result")
+            .1
+            .as_ref()
+            .expect("agent_stats populated from the sub-agent wire");
+        assert_eq!(stats.tool_calls.len(), 2, "two nested tool calls");
+        assert_eq!(stats.total_tool_use_count, Some(2));
+
+        let bash = &stats.tool_calls[0];
+        assert_eq!(bash.tool_name, "Bash");
+        assert!(bash
+            .input_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pnpm build"));
+        assert!(bash
+            .output_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Exited with code 0"));
+        assert!(!bash.is_error, "the successful Bash is not an error");
+
+        let read = &stats.tool_calls[1];
+        assert_eq!(read.tool_name, "Read");
+        assert!(read.is_error, "result.isError=true marks the nested Read failed");
+
+        // A delegation whose transcript directory is missing degrades to no stats.
+        let missing = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("Agent_2"))
+            .expect("Agent_2 result");
+        assert!(
+            missing.1.is_none(),
+            "an absent sub-agent transcript leaves agent_stats None"
+        );
+
+        // A plain tool result is untouched.
+        let plain = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("Bash_0"))
+            .expect("plain tool result");
+        assert!(plain.1.is_none(), "non-Agent results never carry agent_stats");
+
+        // A non-Agent result with a real `agent_id:` header is still gated out by
+        // the call-side classification.
+        let stray = results
+            .iter()
+            .find(|(id, _)| id.as_deref() == Some("Bash_stray"))
+            .expect("stray tool result");
+        assert!(
+            stray.1.is_none(),
+            "a non-Agent result must not gain agent_stats even with a real agent_id header"
+        );
+
+        std::fs::remove_dir_all(root.parent().unwrap_or(&root)).ok();
+    }
+
+    #[test]
+    fn subagent_id_is_parsed_only_from_the_first_line() {
+        // The marker is the first line; an `agent_id:` later in the summary body
+        // must not be mistaken for it.
+        assert_eq!(
+            subagent_id_from_output("agent_id: agent-0\nstatus: completed"),
+            Some("agent-0")
+        );
+        assert_eq!(
+            subagent_id_from_output("[summary]\nthen agent_id: agent-9 in prose"),
+            None
+        );
+        assert_eq!(subagent_id_from_output("just a normal tool output"), None);
+        assert_eq!(subagent_id_from_output("agent_id:   "), None);
     }
 }
