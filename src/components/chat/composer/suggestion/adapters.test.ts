@@ -133,5 +133,5 @@ describe("commitToSuggestion", () => {
 })
 
 // skillToSuggestion / expertToSuggestion were retired with the `@` panel's skill
-// tab — skills/commands/experts are now inserted via the `/` `$` triggers and the
-// expert menu (see composer/invocation-reference.ts), not adapted for the panel.
+// tab — skills/commands/experts are now inserted via the `/` and `$` triggers
+// (see composer/invocation-reference.ts), not adapted for the panel.

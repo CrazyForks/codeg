@@ -629,12 +629,6 @@ export async function expertsList(): Promise<ExpertListItem[]> {
   return getTransport().call("experts_list")
 }
 
-export async function expertsListForAgent(
-  agentType: AgentType
-): Promise<ExpertListItem[]> {
-  return getTransport().call("experts_list_for_agent", { agentType })
-}
-
 export async function expertsGetInstallStatus(
   expertId: string
 ): Promise<ExpertInstallStatus[]> {

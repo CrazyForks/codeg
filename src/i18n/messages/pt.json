@@ -1944,8 +1944,6 @@
         "send": "Enviar",
         "forkAndSend": "Fork & Enviar",
         "slashCommands": "Comandos de barra",
-        "expertSkills": "Habilidades de especialistas",
-        "expertsEmptyForAgent": "Este agente não tem especialistas ativados. Ative-os em Configurações > Especialistas.",
         "slashSearchPlaceholder": "Buscar comandos...",
         "slashSearchEmpty": "Nenhum comando correspondente",
         "attachLocalUpload": "Carregar arquivo local",

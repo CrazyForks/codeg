@@ -1944,8 +1944,6 @@
         "send": "Senden",
         "forkAndSend": "Fork & Senden",
         "slashCommands": "Slash-Befehle",
-        "expertSkills": "Expertenfähigkeiten",
-        "expertsEmptyForAgent": "Dieser Agent hat keine aktivierten Experten. Aktivieren Sie sie unter Einstellungen > Experten.",
         "slashSearchPlaceholder": "Befehle suchen...",
         "slashSearchEmpty": "Keine passenden Befehle",
         "attachLocalUpload": "Lokale Datei hochladen",

@@ -118,5 +118,5 @@ export function commitToSuggestion(
 }
 
 // Skills, commands and experts are no longer surfaced in the `@` panel — they
-// are inserted via the `/` / `$` triggers and the expert menu, which build their
-// reference attrs directly (see composer/invocation-reference.ts).
+// are inserted via the `/` and `$` triggers, which build their reference attrs
+// directly (see composer/invocation-reference.ts).

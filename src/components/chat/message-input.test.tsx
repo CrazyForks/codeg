@@ -52,8 +52,6 @@ vi.mock("@/hooks/use-shortcut-settings", () => ({
     shortcuts: { send_message: "enter", newline_in_message: "shift+enter" },
   }),
 }))
-vi.mock("@/hooks/use-built-in-experts", () => ({ useBuiltInExperts: () => [] }))
-vi.mock("@/hooks/use-agent-experts", () => ({ useAgentExperts: () => [] }))
 vi.mock("@/hooks/use-agent-skills", () => ({ useAgentSkills: () => [] }))
 vi.mock("@/components/chat/composer/use-reference-search", () => ({
   useReferenceSearch: () => async () => [],

@@ -1946,8 +1946,6 @@
         "send": "发送",
         "forkAndSend": "分叉发送",
         "slashCommands": "斜杠命令",
-        "expertSkills": "专家技能",
-        "expertsEmptyForAgent": "该智能体没有启用任何专家。请在「设置 > 专家」中启用。",
         "slashSearchPlaceholder": "搜索命令...",
         "slashSearchEmpty": "没有匹配的命令",
         "attachUploadTooLarge": "{names} 超过 {limit}MB 上传上限，已跳过。",

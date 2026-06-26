@@ -426,8 +426,9 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
         notifyNotEnabled(label, "experts")
         return
       }
-      // Experts are open-ended coding skills: inject just the `/id` badge and
-      // let the user describe the task (no canned template like office docs).
+      // Experts are open-ended coding skills: inject just the leading
+      // invocation badge (`$id` on Codex, `/id` elsewhere) and let the user
+      // describe the task (no canned template like office docs).
       onSelect({ text: "", skill: { id: item.metadata.id, label } })
     },
     [onSelect, locale, isLocked, notifyNotEnabled]

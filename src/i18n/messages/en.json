@@ -1946,8 +1946,6 @@
         "send": "Send",
         "forkAndSend": "Fork & Send",
         "slashCommands": "Slash commands",
-        "expertSkills": "Expert skills",
-        "expertsEmptyForAgent": "This agent has no enabled experts. Enable them in Settings > Experts.",
         "slashSearchPlaceholder": "Search commands...",
         "slashSearchEmpty": "No matching commands",
         "attachUploadTooLarge": "{names} exceeds the {limit}MB upload limit and was skipped.",

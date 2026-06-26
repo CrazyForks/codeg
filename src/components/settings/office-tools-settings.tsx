@@ -45,7 +45,7 @@ import {
   officecliSyncSkills,
   officecliUninstall,
 } from "@/lib/api"
-import { invalidateAgentExpertsCache } from "@/hooks/use-agent-experts"
+import { invalidateAgentSkillsCache } from "@/hooks/use-agent-skills"
 import { pickLocalized } from "@/lib/expert-presentation"
 import type {
   AcpAgentInfo,
@@ -434,7 +434,7 @@ export function OfficeToolsSettings() {
             applyLinks={officecliSkillApplyLinks}
             loadContent={loadContent}
             onApplied={(touched) =>
-              touched.forEach((a) => invalidateAgentExpertsCache(a))
+              touched.forEach((a) => invalidateAgentSkillsCache(a))
             }
             searchPlaceholder={t("searchPlaceholder")}
             notReadyHint={installed ? t("syncFirst") : t("installFirst")}

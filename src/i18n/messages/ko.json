@@ -1944,8 +1944,6 @@
         "send": "보내기",
         "forkAndSend": "포크 & 전송",
         "slashCommands": "슬래시 명령",
-        "expertSkills": "전문가 스킬",
-        "expertsEmptyForAgent": "이 에이전트에 활성화된 전문가가 없습니다. 설정 > 전문가에서 활성화하세요.",
         "slashSearchPlaceholder": "명령 검색...",
         "slashSearchEmpty": "일치하는 명령이 없습니다",
         "attachLocalUpload": "로컬 파일 첨부",

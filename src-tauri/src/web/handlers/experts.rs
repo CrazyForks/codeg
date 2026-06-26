@@ -14,12 +14,6 @@ pub struct ExpertIdParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentTypeOnlyParams {
-    pub agent_type: AgentType,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ExpertAgentParams {
     pub expert_id: String,
     pub agent_type: AgentType,
@@ -33,15 +27,6 @@ pub struct ApplyLinksParams {
 
 pub async fn experts_list() -> Result<Json<Vec<ExpertListItem>>, AppCommandError> {
     let result = experts_commands::experts_list()
-        .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
-    Ok(Json(result))
-}
-
-pub async fn experts_list_for_agent(
-    Json(params): Json<AgentTypeOnlyParams>,
-) -> Result<Json<Vec<ExpertListItem>>, AppCommandError> {
-    let result = experts_commands::experts_list_for_agent(params.agent_type)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))

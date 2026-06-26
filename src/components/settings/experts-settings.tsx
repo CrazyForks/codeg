@@ -21,7 +21,7 @@ import {
 } from "@/lib/api"
 import { revealItemInDir } from "@/lib/platform"
 import { getActiveRemoteConnectionId, isDesktop } from "@/lib/transport"
-import { invalidateAgentExpertsCache } from "@/hooks/use-agent-experts"
+import { invalidateAgentSkillsCache } from "@/hooks/use-agent-skills"
 import type { AcpAgentInfo, ExpertLinkState, ExpertListItem } from "@/lib/types"
 import { toErrorMessage } from "@/lib/app-error"
 import { getExpertIcon, pickLocalized } from "@/lib/expert-presentation"
@@ -220,7 +220,7 @@ export function ExpertsSettings() {
             applyLinks={expertsApplyLinks}
             loadContent={expertsReadContent}
             onApplied={(touched) =>
-              touched.forEach((a) => invalidateAgentExpertsCache(a))
+              touched.forEach((a) => invalidateAgentSkillsCache(a))
             }
             searchPlaceholder={t("searchPlaceholder")}
           />

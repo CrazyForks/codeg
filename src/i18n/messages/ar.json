@@ -1944,8 +1944,6 @@
         "send": "إرسال",
         "forkAndSend": "تفريع وإرسال",
         "slashCommands": "أوامر الشرطة المائلة",
-        "expertSkills": "مهارات الخبراء",
-        "expertsEmptyForAgent": "لا يحتوي هذا العميل على خبراء مفعّلين. فعّلهم من الإعدادات > الخبراء.",
         "slashSearchPlaceholder": "البحث عن الأوامر...",
         "slashSearchEmpty": "لا توجد أوامر مطابقة",
         "attachLocalUpload": "تحميل ملف محلي",

@@ -1,16 +1,8 @@
 import { describe, expect, it } from "vitest"
 
-import type {
-  AgentSkillItem,
-  AvailableCommandInfo,
-  ExpertListItem,
-} from "@/lib/types"
+import type { AgentSkillItem, AvailableCommandInfo } from "@/lib/types"
 
-import {
-  commandToReference,
-  expertToReference,
-  skillToReference,
-} from "./invocation-reference"
+import { commandToReference, skillToReference } from "./invocation-reference"
 import { referenceToMarkdown } from "./reference-text"
 
 const cmd = (name: string): AvailableCommandInfo => ({
@@ -28,21 +20,6 @@ const skill = (id: string, name: string): AgentSkillItem =>
     description: "desc",
     read_only: false,
   }) as AgentSkillItem
-
-const expert = (id: string): ExpertListItem => ({
-  metadata: {
-    id,
-    category: "review",
-    icon: null,
-    sort_order: 0,
-    display_name: { en: id },
-    description: { en: `${id} desc` },
-    bundled_hash: "h",
-  },
-  installed_centrally: true,
-  user_modified: false,
-  central_path: `/experts/${id}`,
-})
 
 describe("commandToReference", () => {
   it("builds a skill-kind reference that serializes to /name", () => {
@@ -80,25 +57,5 @@ describe("skillToReference", () => {
 
   it("falls back to the id when the skill has no name", () => {
     expect(skillToReference(skill("only-id", ""), "/").label).toBe("only-id")
-  })
-})
-
-describe("expertToReference", () => {
-  it("builds an expert badge (scope=expert) with the given localized label", () => {
-    const ref = expertToReference(expert("reviewer"), "$", "审查员")
-    expect(ref).toEqual({
-      refType: "skill",
-      id: "reviewer",
-      label: "审查员",
-      uri: null,
-      meta: { invocationPrefix: "$", scope: "expert" },
-    })
-    expect(referenceToMarkdown(ref)).toBe("$reviewer")
-  })
-
-  it("falls back to the id when the label is empty", () => {
-    expect(expertToReference(expert("reviewer"), "/", "").label).toBe(
-      "reviewer"
-    )
   })
 })

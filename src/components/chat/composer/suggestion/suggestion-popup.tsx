@@ -28,8 +28,8 @@ const FETCH_DEBOUNCE_MS = 150
 // Tab order in the panel: agent first (per product decision), then the rest in
 // their usual order. This is a *display* order; the search provider keeps its
 // own (file-first) group order, which other code/tests depend on. `skill` is
-// intentionally absent — skills/commands are inserted via the `/` and `$`
-// triggers (and experts via the expert menu), not the `@` panel.
+// intentionally absent — skills, commands and experts are inserted via the `/`
+// and `$` triggers, not the `@` panel.
 const TAB_ORDER: readonly ReferenceKind[] = [
   "agent",
   "file",
