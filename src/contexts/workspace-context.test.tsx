@@ -30,6 +30,50 @@ vi.mock("@/lib/api", () => ({
   saveFileContent: vi.fn(),
 }))
 
+// Controllable workspace-state store: WorkspaceProvider subscribes to its
+// envelopes to auto-open office previews. `emitEnvelope` lets a test push a
+// changed_paths event as if the file watcher fired. `subscribeEnvelopes`
+// identity is stable so the provider's effect doesn't churn across renders.
+const workspaceStoreMock = vi.hoisted(() => {
+  type EnvelopeListener = (env: {
+    seq: number
+    kind: string
+    changed_paths: string[]
+  }) => void
+  const listeners = new Set<EnvelopeListener>()
+  return {
+    subscribeEnvelopes: (listener: EnvelopeListener) => {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+    emitEnvelope: (changed_paths: string[]) => {
+      for (const listener of [...listeners]) {
+        listener({ seq: 1, kind: "fs_change", changed_paths })
+      }
+    },
+    reset: () => listeners.clear(),
+  }
+})
+
+vi.mock("@/hooks/use-workspace-state-store", () => ({
+  useWorkspaceStateStore: () => ({
+    rootPath: "/repo",
+    seq: 0,
+    version: 1,
+    health: "healthy" as const,
+    tree: [],
+    git: [],
+    error: null,
+    degraded: false,
+    isGitRepo: true,
+    requestResync: async () => {},
+    restart: async () => {},
+    subscribeEnvelopes: workspaceStoreMock.subscribeEnvelopes,
+  }),
+}))
+
 const mockedApi = api as unknown as {
   readFileForEdit: ReturnType<typeof vi.fn>
   gitIsTracked: ReturnType<typeof vi.fn>
@@ -1739,5 +1783,68 @@ describe("applyExternalReload git base does not stale-write after close+reopen",
     const tabA = snap.tabs.find((t) => t.id === "file:a.ts")
     expect(tabA?.gitBaseContent).not.toBe("stale-base")
     expect(tabA?.gitBaseContent).toBe(undefined)
+  })
+})
+
+describe("WorkspaceProvider office auto-preview", () => {
+  beforeEach(() => {
+    workspaceStoreMock.reset()
+    // Preference defaults ON; drop any "false" a prior test left behind.
+    localStorage.removeItem("workspace:office-auto-preview")
+  })
+
+  it("auto-opens an office file's preview when the watcher reports it, with no aux panel involved", async () => {
+    renderWorkspace()
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
+
+    // The provider — not the (closed-by-default) file-tree aux panel — owns
+    // this subscription, so a watcher envelope surfaces the preview directly.
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["report.pptx"])
+    })
+
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
+    expect(screen.getByTestId("active-file-tab")).toHaveTextContent(
+      "file:report.pptx"
+    )
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("files")
+    expect(screen.getByTestId("mode")).toHaveTextContent("fusion")
+  })
+
+  it("ignores non-office changed paths", async () => {
+    renderWorkspace()
+
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["notes.txt", "src/app.ts"])
+    })
+
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
+  })
+
+  it("opens each office file once, even when later envelopes re-report it", async () => {
+    renderWorkspace()
+
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["deck.pptx"])
+    })
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["deck.pptx"])
+    })
+
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
+  })
+
+  it("does not auto-open when the preference is disabled", async () => {
+    localStorage.setItem("workspace:office-auto-preview", "false")
+    renderWorkspace()
+
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["report.pptx"])
+    })
+
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
   })
 })
