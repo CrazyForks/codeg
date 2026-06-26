@@ -683,6 +683,10 @@ pub fn build_router(
             post(handlers::acp::opencode_list_plugins),
         )
         .route(
+            "/opencode_provider_catalog",
+            post(handlers::acp::opencode_provider_catalog),
+        )
+        .route(
             "/opencode_install_plugins",
             post(handlers::acp::opencode_install_plugins),
         )

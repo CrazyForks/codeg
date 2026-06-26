@@ -2136,6 +2136,34 @@ export interface PluginCheckSummary {
   has_project_config_hint: boolean
 }
 
+// ─── OpenCode Provider Catalog (models.dev) ───
+
+/** A model entry under a catalog provider, normalized from models.dev. */
+export interface OpenCodeCatalogModel {
+  id: string
+  name: string
+  reasoning: boolean
+  tool_call: boolean
+  context: number | null
+  cost_in: number | null
+  cost_out: number | null
+}
+
+/**
+ * One provider from the models.dev catalog (the same registry OpenCode reads).
+ * `auth_kind` is `"oauth"` for providers OpenCode signs into via a browser flow
+ * (ChatGPT, GitHub Copilot, GitLab Duo), `"api"` otherwise.
+ */
+export interface OpenCodeCatalogProvider {
+  id: string
+  name: string
+  npm: string | null
+  env: string[]
+  doc: string | null
+  auth_kind: "api" | "oauth"
+  models: OpenCodeCatalogModel[]
+}
+
 export type PluginInstallEventKind = "started" | "log" | "completed" | "failed"
 
 export interface PluginInstallEvent {

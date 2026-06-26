@@ -836,6 +836,25 @@ pub async fn opencode_list_plugins() -> Result<Json<PluginCheckSummary>, AppComm
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpencodeProviderCatalogParams {
+    #[serde(default)]
+    pub force_refresh: Option<bool>,
+}
+
+pub async fn opencode_provider_catalog(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<OpencodeProviderCatalogParams>,
+) -> Result<Json<Vec<crate::acp::opencode_catalog::CatalogProvider>>, AppCommandError> {
+    let catalog = acp_commands::opencode_provider_catalog_core(
+        &state.data_dir,
+        params.force_refresh.unwrap_or(false),
+    )
+    .await;
+    Ok(Json(catalog))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpencodeInstallPluginsParams {
     pub names: Option<Vec<String>>,
     pub task_id: String,

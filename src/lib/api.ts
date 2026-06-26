@@ -104,6 +104,7 @@ import type {
   ModelProviderInfo,
   UpdateModelProviderResult,
   PluginCheckSummary,
+  OpenCodeCatalogProvider,
   QuickMessage,
   OfficecliInfo,
   OfficecliSkill,
@@ -549,6 +550,14 @@ export async function acpPreflight(
 
 export async function opencodeListPlugins(): Promise<PluginCheckSummary> {
   return getTransport().call("opencode_list_plugins", {})
+}
+
+export async function opencodeProviderCatalog(
+  forceRefresh?: boolean
+): Promise<OpenCodeCatalogProvider[]> {
+  return getTransport().call("opencode_provider_catalog", {
+    forceRefresh: forceRefresh ?? null,
+  })
 }
 
 export async function opencodeInstallPlugins(
