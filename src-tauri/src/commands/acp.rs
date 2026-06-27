@@ -1347,83 +1347,112 @@ fn load_codex_config_toml_raw() -> Option<String> {
     fs::read_to_string(codex_config_toml_path()).ok()
 }
 
-fn load_codex_local_config_json() -> Option<String> {
+/// Project codex `config.toml` text into the launch-relevant config map shared
+/// by the settings read-back and the staleness fingerprint. Pure (no I/O) so it
+/// is unit-testable; [`load_codex_local_config_json`] is the on-disk wrapper
+/// that also folds in the api key from `auth.json`.
+///
+/// `apiBaseUrl` / `model` / `env` mirror back into the codex runtime env via
+/// [`build_runtime_env_from_setting`] (they map to `OPENAI_*`); `modelProvider`
+/// deliberately does NOT (it is not an `AgentRuntimeConfig` field). It is still
+/// included so a provider switch is visible to the fingerprint even when the
+/// resolved `base_url` is unchanged — two providers can share one endpoint yet
+/// differ in `wire_api` / auth. Before codex-acp 1.0.1 this was caught only
+/// incidentally by the injected `MODEL_PROVIDER` launch env; that injection is
+/// gone now that resume reads `model_provider` from config.toml (#224), so the
+/// fingerprint must carry the name itself.
+fn codex_config_projection_from_toml(raw_toml: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut merged = serde_json::Map::new();
+    let Ok(value) = raw_toml.parse::<toml::Value>() else {
+        return merged;
+    };
 
-    if let Ok(raw_toml) = fs::read_to_string(codex_config_toml_path()) {
-        if let Ok(value) = raw_toml.parse::<toml::Value>() {
-            if let Some(model) = value
-                .get("model")
-                .and_then(|item| item.as_str())
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-            {
-                merged.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(model.to_string()),
-                );
-            }
+    if let Some(model) = value
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        merged.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
 
-            let model_provider = value
-                .get("model_provider")
-                .and_then(|item| item.as_str())
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string);
+    let model_provider = value
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string);
 
-            let mut api_base_url: Option<String> = None;
-            if let Some(provider) = model_provider {
-                api_base_url = value
-                    .get("model_providers")
-                    .and_then(|table| table.get(provider.as_str()))
-                    .and_then(|table| table.get("base_url"))
-                    .and_then(|item| item.as_str())
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_string);
-            }
-            if api_base_url.is_none() {
-                api_base_url = value
-                    .get("model_providers")
-                    .and_then(|table| table.as_table())
-                    .and_then(|providers| {
-                        providers.values().find_map(|item| {
-                            item.get("base_url")
-                                .and_then(|base| base.as_str())
-                                .map(str::trim)
-                                .filter(|base| !base.is_empty())
-                                .map(str::to_string)
-                        })
-                    });
-            }
-            if let Some(base_url) = api_base_url {
-                merged.insert(
-                    "apiBaseUrl".to_string(),
-                    serde_json::Value::String(base_url),
-                );
-            }
+    if let Some(provider) = &model_provider {
+        merged.insert(
+            "modelProvider".to_string(),
+            serde_json::Value::String(provider.clone()),
+        );
+    }
 
-            if let Some(env) = value.get("env").and_then(|item| item.as_table()) {
-                let mut env_map = serde_json::Map::new();
-                for (key, item) in env {
-                    let Some(raw) = item.as_str() else {
-                        continue;
-                    };
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    env_map.insert(
-                        key.to_string(),
-                        serde_json::Value::String(trimmed.to_string()),
-                    );
-                }
-                if !env_map.is_empty() {
-                    merged.insert("env".to_string(), serde_json::Value::Object(env_map));
-                }
+    let mut api_base_url: Option<String> = None;
+    if let Some(provider) = &model_provider {
+        api_base_url = value
+            .get("model_providers")
+            .and_then(|table| table.get(provider.as_str()))
+            .and_then(|table| table.get("base_url"))
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string);
+    }
+    if api_base_url.is_none() {
+        api_base_url = value
+            .get("model_providers")
+            .and_then(|table| table.as_table())
+            .and_then(|providers| {
+                providers.values().find_map(|item| {
+                    item.get("base_url")
+                        .and_then(|base| base.as_str())
+                        .map(str::trim)
+                        .filter(|base| !base.is_empty())
+                        .map(str::to_string)
+                })
+            });
+    }
+    if let Some(base_url) = api_base_url {
+        merged.insert(
+            "apiBaseUrl".to_string(),
+            serde_json::Value::String(base_url),
+        );
+    }
+
+    if let Some(env) = value.get("env").and_then(|item| item.as_table()) {
+        let mut env_map = serde_json::Map::new();
+        for (key, item) in env {
+            let Some(raw) = item.as_str() else {
+                continue;
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            env_map.insert(
+                key.to_string(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
+        if !env_map.is_empty() {
+            merged.insert("env".to_string(), serde_json::Value::Object(env_map));
         }
     }
+
+    merged
+}
+
+fn load_codex_local_config_json() -> Option<String> {
+    let mut merged = match fs::read_to_string(codex_config_toml_path()) {
+        Ok(raw_toml) => codex_config_projection_from_toml(&raw_toml),
+        Err(_) => serde_json::Map::new(),
+    };
 
     if let Ok(raw_auth) = fs::read_to_string(codex_auth_json_path()) {
         if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&raw_auth) {
@@ -1445,29 +1474,6 @@ fn load_codex_local_config_json() -> Option<String> {
         return None;
     }
     serde_json::to_string_pretty(&serde_json::Value::Object(merged)).ok()
-}
-
-/// Extract the `model_provider` name from codex `config.toml` text.
-///
-/// Returns the trimmed provider name, or `None` when the key is absent, empty,
-/// or the TOML is malformed. Pure (no I/O) so it is unit-testable without env
-/// vars or the filesystem; [`codex_model_provider`] is the on-disk wrapper.
-fn parse_codex_model_provider(raw_toml: &str) -> Option<String> {
-    raw_toml
-        .parse::<toml::Value>()
-        .ok()?
-        .get("model_provider")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-}
-
-/// Read codex's configured `model_provider` from `~/.codex/config.toml` (honors
-/// `CODEX_HOME` via [`codex_config_toml_path`]). `None` when the file is
-/// missing/unreadable or declares no provider.
-fn codex_model_provider() -> Option<String> {
-    parse_codex_model_provider(&fs::read_to_string(codex_config_toml_path()).ok()?)
 }
 
 fn persist_codex_local_config(config_patch_json: Option<&str>) -> Result<(), AcpError> {
@@ -4719,20 +4725,12 @@ pub(crate) async fn build_session_runtime_env(
         build_runtime_env_from_setting(agent_type, setting.as_ref(), local_config_json.as_deref());
     apply_model_provider_env(agent_type, setting.as_ref(), &mut runtime_env, &db.conn).await;
 
-    // codex-acp 1.0.0 hard-codes `modelProvider: "openai"` when resuming a
-    // session (its `getResumeModelProvider`) unless `MODEL_PROVIDER` is set —
-    // which silently routes resumed conversations to the official OpenAI
-    // endpoint and ignores the custom provider in `~/.codex/config.toml`. New
-    // sessions are spared because they pass `null` (→ codex reads the config's
-    // own `model_provider`). Pin `MODEL_PROVIDER` to that same name so resumed
-    // sessions select the same provider as new ones. Skipped when the config
-    // declares no provider (official OpenAI / ChatGPT users → keep the upstream
-    // "openai" fallback) or the user already set it explicitly via `env_json`.
-    if agent_type == AgentType::Codex && !runtime_env.contains_key("MODEL_PROVIDER") {
-        if let Some(provider) = codex_model_provider() {
-            runtime_env.insert("MODEL_PROVIDER".to_string(), provider);
-        }
-    }
+    // codex resume no longer needs a `MODEL_PROVIDER` pin: codex-acp 1.0.1
+    // (#224) resolves the resumed provider from `~/.codex/config.toml` via
+    // `config/read`, matching new sessions (which pass `null` so codex reads the
+    // config's own `model_provider`). The 1.0.0 workaround that injected
+    // `MODEL_PROVIDER` to stop resumed sessions falling back to "openai" is now
+    // redundant and was removed.
 
     if let Some(cred_env) = crate::commands::terminal::prepare_credential_env(data_dir) {
         for (key, value) in cred_env {
@@ -7223,30 +7221,68 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_model_provider_extracts_named_custom_provider() {
-        // A codeg-managed config pins a named custom provider. Without this name
-        // pinned into MODEL_PROVIDER, codex-acp resumes against "openai".
-        let toml = r#"
+    fn codex_config_projection_tracks_model_provider_for_fingerprint() {
+        // Two configs sharing one base_url but naming different providers must
+        // produce different projections, so `fingerprint_config` (which hashes
+        // this projection) flags a provider switch even though the resolved
+        // endpoint is unchanged. codex-acp 1.0.1 reads `model_provider` from
+        // config.toml directly, so it is no longer pinned into the launch env
+        // where the fingerprint previously caught it incidentally.
+        let codeg = r#"
 model = "gpt-5-codex"
 model_provider = "codeg"
 
 [model_providers.codeg]
-name = "codeg"
 base_url = "https://gateway.example/v1"
 wire_api = "responses"
+
+[model_providers.other]
+base_url = "https://gateway.example/v1"
+wire_api = "chat"
 "#;
-        assert_eq!(parse_codex_model_provider(toml), Some("codeg".to_string()));
+        let other = codeg.replace(
+            "model_provider = \"codeg\"",
+            "model_provider = \"other\"",
+        );
 
-        // No model_provider (official OpenAI / ChatGPT users) → None, so
-        // build_session_runtime_env leaves MODEL_PROVIDER unset and codex-acp's
-        // resume fallback to "openai" stays correct.
-        assert_eq!(parse_codex_model_provider("model = \"gpt-5-codex\"\n"), None);
+        let p_codeg = codex_config_projection_from_toml(codeg);
+        let p_other = codex_config_projection_from_toml(&other);
 
-        // Whitespace-only value is treated as absent.
-        assert_eq!(parse_codex_model_provider("model_provider = \"   \"\n"), None);
+        assert_eq!(
+            p_codeg.get("modelProvider").and_then(|v| v.as_str()),
+            Some("codeg")
+        );
+        assert_eq!(
+            p_other.get("modelProvider").and_then(|v| v.as_str()),
+            Some("other")
+        );
+        // Same endpoint resolved for both providers...
+        assert_eq!(p_codeg.get("apiBaseUrl"), p_other.get("apiBaseUrl"));
+        // ...yet the projections differ, so the launch-config fingerprint does too.
+        assert_ne!(p_codeg, p_other);
 
-        // Malformed TOML must not panic — just yields None.
-        assert_eq!(parse_codex_model_provider("model_provider = "), None);
+        // Deterministic for identical input.
+        assert_eq!(codex_config_projection_from_toml(codeg), p_codeg);
+
+        // `modelProvider` must NOT be an AgentRuntimeConfig key, or
+        // build_runtime_env_from_setting would mirror it back into a runtime env
+        // var (reintroducing the very MODEL_PROVIDER pin we removed).
+        assert!(
+            serde_json::from_value::<AgentRuntimeConfig>(serde_json::Value::Object(
+                p_codeg.clone()
+            ))
+            .is_ok()
+        );
+
+        // No model_provider declared (official OpenAI / ChatGPT) → no
+        // modelProvider key, matching the pre-1.0.1 "leave MODEL_PROVIDER unset"
+        // behavior; the bare `model` still projects.
+        let bare = codex_config_projection_from_toml("model = \"gpt-5-codex\"\n");
+        assert!(!bare.contains_key("modelProvider"));
+        assert_eq!(bare.get("model").and_then(|v| v.as_str()), Some("gpt-5-codex"));
+
+        // Malformed TOML must not panic — yields an empty projection.
+        assert!(codex_config_projection_from_toml("model_provider = ").is_empty());
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
