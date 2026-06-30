@@ -1191,7 +1191,8 @@
       "sectionChats": "Chat",
       "noChats": "Sem chats",
       "newChatAction": "Novo chat",
-      "automations": "Automações"
+      "automations": "Automações",
+      "loadingSubsessions": "Carregando subconversas…"
     },
     "conversation": {
       "reloadFailed": "Falha ao recarregar conversa: {message}",
@@ -1280,7 +1281,9 @@
       "pin": "Fixar",
       "unpin": "Desafixar",
       "markCompleted": "Marcar como concluída",
-      "reopen": "Reabrir"
+      "reopen": "Reabrir",
+      "expandSubsessions": "Expandir subconversas",
+      "collapseSubsessions": "Recolher subconversas"
     },
     "search": {
       "dialogTitle": "Buscar",

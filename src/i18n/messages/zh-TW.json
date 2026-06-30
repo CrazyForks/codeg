@@ -1191,7 +1191,8 @@
       "sectionChats": "聊天",
       "noChats": "沒有聊天",
       "newChatAction": "新增聊天",
-      "automations": "自動化"
+      "automations": "自動化",
+      "loadingSubsessions": "正在載入子會話…"
     },
     "conversation": {
       "reloadFailed": "會話重新載入失敗：{message}",
@@ -1280,7 +1281,9 @@
       "pin": "置頂",
       "unpin": "取消置頂",
       "markCompleted": "標記為已完成",
-      "reopen": "重新開啟"
+      "reopen": "重新開啟",
+      "expandSubsessions": "展開子會話",
+      "collapseSubsessions": "摺疊子會話"
     },
     "search": {
       "dialogTitle": "搜尋",

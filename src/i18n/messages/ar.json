@@ -1191,7 +1191,8 @@
       "sectionChats": "محادثة",
       "noChats": "لا توجد محادثات",
       "newChatAction": "محادثة جديدة",
-      "automations": "الأتمتة"
+      "automations": "الأتمتة",
+      "loadingSubsessions": "جارٍ تحميل المحادثات الفرعية…"
     },
     "conversation": {
       "reloadFailed": "فشل إعادة تحميل المحادثة: {message}",
@@ -1280,7 +1281,9 @@
       "pin": "تثبيت",
       "unpin": "إلغاء التثبيت",
       "markCompleted": "وضع علامة كمكتمل",
-      "reopen": "إعادة فتح"
+      "reopen": "إعادة فتح",
+      "expandSubsessions": "توسيع المحادثات الفرعية",
+      "collapseSubsessions": "طي المحادثات الفرعية"
     },
     "search": {
       "dialogTitle": "بحث",

@@ -1191,7 +1191,8 @@
       "sectionChats": "聊天",
       "noChats": "没有聊天",
       "newChatAction": "新建聊天",
-      "automations": "自动化"
+      "automations": "自动化",
+      "loadingSubsessions": "正在加载子会话…"
     },
     "conversation": {
       "reloadFailed": "会话重新加载失败：{message}",
@@ -1280,7 +1281,9 @@
       "pin": "置顶",
       "unpin": "取消置顶",
       "markCompleted": "标记为已完成",
-      "reopen": "重新打开"
+      "reopen": "重新打开",
+      "expandSubsessions": "展开子会话",
+      "collapseSubsessions": "折叠子会话"
     },
     "search": {
       "dialogTitle": "搜索",

@@ -1191,7 +1191,8 @@
       "sectionChats": "Discussion",
       "noChats": "Aucune discussion",
       "newChatAction": "Nouvelle discussion",
-      "automations": "Automatisations"
+      "automations": "Automatisations",
+      "loadingSubsessions": "Chargement des sous-conversations…"
     },
     "conversation": {
       "reloadFailed": "Échec du rechargement de la conversation : {message}",
@@ -1280,7 +1281,9 @@
       "pin": "Épingler",
       "unpin": "Désépingler",
       "markCompleted": "Marquer comme terminé",
-      "reopen": "Rouvrir"
+      "reopen": "Rouvrir",
+      "expandSubsessions": "Développer les sous-conversations",
+      "collapseSubsessions": "Réduire les sous-conversations"
     },
     "search": {
       "dialogTitle": "Rechercher",

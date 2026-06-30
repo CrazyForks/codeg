@@ -1191,7 +1191,8 @@
       "sectionChats": "Chat",
       "noChats": "Keine Chats",
       "newChatAction": "Neuer Chat",
-      "automations": "Automatisierungen"
+      "automations": "Automatisierungen",
+      "loadingSubsessions": "Unterkonversationen werden geladen…"
     },
     "conversation": {
       "reloadFailed": "Konversation konnte nicht neu geladen werden: {message}",
@@ -1280,7 +1281,9 @@
       "pin": "Anheften",
       "unpin": "Loslösen",
       "markCompleted": "Als abgeschlossen markieren",
-      "reopen": "Erneut öffnen"
+      "reopen": "Erneut öffnen",
+      "expandSubsessions": "Unterkonversationen einblenden",
+      "collapseSubsessions": "Unterkonversationen ausblenden"
     },
     "search": {
       "dialogTitle": "Suchen",

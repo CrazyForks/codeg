@@ -1191,7 +1191,8 @@
       "sectionChats": "Chat",
       "noChats": "No chats",
       "newChatAction": "New chat",
-      "automations": "Automations"
+      "automations": "Automations",
+      "loadingSubsessions": "Loading sub-conversations…"
     },
     "conversation": {
       "reloadFailed": "Failed to reload conversation: {message}",
@@ -1280,7 +1281,9 @@
       "pin": "Pin",
       "unpin": "Unpin",
       "markCompleted": "Mark as completed",
-      "reopen": "Reopen"
+      "reopen": "Reopen",
+      "expandSubsessions": "Expand sub-conversations",
+      "collapseSubsessions": "Collapse sub-conversations"
     },
     "search": {
       "dialogTitle": "Search",

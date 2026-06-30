@@ -37,6 +37,21 @@ export function compareByCreatedAtDesc(
 }
 
 /**
+ * Oldest-created first, id as a stable tie-break — matching the backend
+ * `list_children` ORDER BY created_at ASC so a merged/inserted child lands where
+ * a refetch would put it.
+ */
+export function compareByCreatedAtAsc(
+  left: DbConversationSummary,
+  right: DbConversationSummary
+): number {
+  const createdDiff =
+    parseTimestamp(left.created_at) - parseTimestamp(right.created_at)
+  if (createdDiff !== 0) return createdDiff
+  return left.id - right.id
+}
+
+/**
  * Most-recently-pinned first. Only ever applied to rows with a non-null
  * `pinned_at` (the pinned bucket), so the empty-string fallback is just a guard.
  */
@@ -253,6 +268,12 @@ export interface ConversationRow {
    * through the virtualized render. See {@link groupByFolderWithReuse}.
    */
   conversation: DbConversationSummary
+  /**
+   * Nesting depth in the delegation tree: 0 for a root / pinned / chat
+   * conversation, 1 for its direct delegation children, 2 for grandchildren,
+   * etc. Drives the card's per-level indent (a pure function of this number).
+   */
+  depth: number
 }
 
 export interface EmptyHintRow {
@@ -292,12 +313,108 @@ export interface SectionHeaderRow {
   count: number
 }
 
+/**
+ * A transient placeholder at the child indent, shown while a conversation's
+ * delegation children are being lazily fetched (between expand and the
+ * `listChildConversations` response). Replaced by the real child rows once
+ * loaded, or by nothing if the parent turns out to have no (live) children.
+ */
+export interface SubsessionLoadingRow {
+  kind: "subsession-loading"
+  parentId: number
+  depth: number
+}
+
 export type SidebarRow =
   | SectionHeaderRow
   | FolderHeaderRow
   | ConversationRow
   | EmptyHintRow
   | ChatsEmptyRow
+  | SubsessionLoadingRow
+
+const MAX_RENDER_DEPTH = 32
+
+// Shared empty defaults so callers (and existing tests) that don't track
+// sub-session expansion can omit the two params without allocating per call —
+// the row output is then identical to the pre-subtree flat model.
+const EMPTY_EXPANDED: ReadonlySet<number> = new Set()
+const EMPTY_CHILDREN: ReadonlyMap<number, readonly DbConversationSummary[]> =
+  new Map()
+
+/**
+ * Merge a freshly-fetched children snapshot with child summaries already applied
+ * from live events (buffered into the lazy-load placeholder while the fetch was
+ * in flight). Keyed by id with the live event winning, so a child created or
+ * updated after the fetch's DB query is never lost — closing the lazy-load
+ * lost-update race. Sorted created_at-ascending to match `list_children`.
+ */
+export function mergeChildrenById(
+  snapshot: readonly DbConversationSummary[],
+  buffered: readonly DbConversationSummary[]
+): DbConversationSummary[] {
+  const byId = new Map<number, DbConversationSummary>()
+  for (const c of snapshot) byId.set(c.id, c)
+  for (const b of buffered) byId.set(b.id, b)
+  return [...byId.values()].sort(compareByCreatedAtAsc)
+}
+
+/**
+ * Push a conversation row and — when it is expanded and its delegation children
+ * are cached — recursively push its subtree (depth+1 per level). Bounded by
+ * `conversationExpanded` (a finite, user-controlled set) and by what is actually
+ * in `childrenByParent` (only fetched parents descend), so it always terminates;
+ * `MAX_RENDER_DEPTH` is defense-in-depth against pathological data. The
+ * `parent_id` chain is a tree by construction (set once at insert, never
+ * updated), so cycles cannot occur.
+ *
+ * Child summaries are pushed by reference (never copied), exactly like root
+ * rows, so a status event replacing one child keeps every sibling's identity and
+ * the card `memo` still bails out through the virtualized render.
+ */
+function pushConversationRow(
+  rows: SidebarRow[],
+  conversation: DbConversationSummary,
+  depth: number,
+  conversationExpanded: ReadonlySet<number>,
+  childrenByParent: ReadonlyMap<number, readonly DbConversationSummary[]>,
+  childrenLoading: ReadonlySet<number>
+): void {
+  rows.push({ kind: "conversation", conversation, depth })
+  if (
+    depth >= MAX_RENDER_DEPTH ||
+    conversation.child_count <= 0 ||
+    !conversationExpanded.has(conversation.id)
+  ) {
+    return
+  }
+  const kids = childrenByParent.get(conversation.id)
+  // Spinner while: not fetched yet (undefined), OR an in-flight placeholder
+  // (empty array still loading — events may not have buffered any child yet).
+  if (
+    kids === undefined ||
+    (kids.length === 0 && childrenLoading.has(conversation.id))
+  ) {
+    rows.push({
+      kind: "subsession-loading",
+      parentId: conversation.id,
+      depth: depth + 1,
+    })
+    return
+  }
+  // Loaded (possibly merged with mid-flight events). An empty array that is NOT
+  // loading means a stale child_count → the `for` renders nothing, self-healing.
+  for (const kid of kids) {
+    pushConversationRow(
+      rows,
+      kid,
+      depth + 1,
+      conversationExpanded,
+      childrenByParent,
+      childrenLoading
+    )
+  }
+}
 
 /**
  * Flatten the (optional) pinned section and the folders section into a single
@@ -336,6 +453,19 @@ export function buildRows(args: {
   foldersExpanded: boolean
   chatConversations: readonly DbConversationSummary[]
   chatsExpanded: boolean
+  /** Ids whose delegation subtree is open. A conversation row with
+   *  `child_count > 0` and id in this set recurses into its cached children.
+   *  Optional — omitted (e.g. in tests) means nothing is expanded. */
+  conversationExpanded?: ReadonlySet<number>
+  /** Lazily-fetched direct children keyed by parent id. Absent key = not yet
+   *  fetched (renders a loading row when expanded); empty array = no live
+   *  children (renders nothing — self-heals stale `child_count`). Optional. */
+  childrenByParent?: ReadonlyMap<number, readonly DbConversationSummary[]>
+  /** Parent ids whose children are currently being fetched. With an empty
+   *  placeholder array in `childrenByParent`, membership here renders the loading
+   *  spinner; an empty array WITHOUT membership is a settled-empty subtree
+   *  (renders nothing). Optional. */
+  childrenLoading?: ReadonlySet<number>
 }): SidebarRow[] {
   const {
     pinned,
@@ -347,6 +477,9 @@ export function buildRows(args: {
     foldersExpanded,
     chatConversations,
     chatsExpanded,
+    conversationExpanded = EMPTY_EXPANDED,
+    childrenByParent = EMPTY_CHILDREN,
+    childrenLoading = EMPTY_EXPANDED,
   } = args
   const rows: SidebarRow[] = []
 
@@ -359,7 +492,14 @@ export function buildRows(args: {
     })
     if (pinnedExpanded) {
       for (const conv of pinned) {
-        rows.push({ kind: "conversation", conversation: conv })
+        pushConversationRow(
+          rows,
+          conv,
+          0,
+          conversationExpanded,
+          childrenByParent,
+          childrenLoading
+        )
       }
     }
   }
@@ -386,7 +526,14 @@ export function buildRows(args: {
           continue
         }
         for (const conv of convs) {
-          rows.push({ kind: "conversation", conversation: conv })
+          pushConversationRow(
+            rows,
+            conv,
+            0,
+            conversationExpanded,
+            childrenByParent,
+            childrenLoading
+          )
         }
       }
     }
@@ -405,7 +552,14 @@ export function buildRows(args: {
       rows.push({ kind: "chats-empty" })
     } else {
       for (const conv of chatConversations) {
-        rows.push({ kind: "conversation", conversation: conv })
+        pushConversationRow(
+          rows,
+          conv,
+          0,
+          conversationExpanded,
+          childrenByParent,
+          childrenLoading
+        )
       }
     }
   }
