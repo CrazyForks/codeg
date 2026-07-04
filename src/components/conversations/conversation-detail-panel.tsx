@@ -548,10 +548,10 @@ const ConversationTabView = memo(function ConversationTabView({
     setAcpLoadError(effectiveConversationId, connLoadError ?? null)
   }, [connLoadError, effectiveConversationId, setAcpLoadError])
 
-  // completeTurn MUST be declared BEFORE setLiveMessage so that React runs
-  // its cleanup/setup before setLiveMessage's cleanup. When connStatus
-  // transitions away from "prompting", completeTurn snapshots and promotes
-  // the liveMessage first, then setLiveMessage's cleanup safely clears it.
+  // Promote the completed turn on the prompting→idle edge. (There is no longer
+  // an ordering constraint against a setLiveMessage cleanup: the liveMessage
+  // sink writes the runtime store from the connection dispatch, not a React
+  // effect — see registerLiveMessageSink.)
   const prevConnStatusRef = useRef(connStatus)
   useEffect(() => {
     const wasPrompting = prevConnStatusRef.current === "prompting"
@@ -559,11 +559,10 @@ const ConversationTabView = memo(function ConversationTabView({
     if (!wasPrompting || connStatus === "prompting") return
 
     // Turn completed — promote liveMessage + optimisticTurns to localTurns.
-    // Pass conn.liveMessage explicitly: when turn_complete arrives in the
-    // same React batch as the final STREAM_BATCH (typical case), the mirror
-    // effect that syncs conn.liveMessage into the runtime session has not
-    // run yet for this render, so session.liveMessage would be missing the
-    // final text chunk. The connections-context value is authoritative.
+    // Pass conn.liveMessage explicitly (belt-and-suspenders): the sink already
+    // wrote the final chunk into session.liveMessage synchronously from the
+    // dispatch, so COMPLETE_TURN's fallback would also be current — but the
+    // connections-context value is authoritative, so pass it directly.
     completeTurn(effectiveConversationId, conn.liveMessage)
 
     // Cancel previous metadata sync (handles rapid consecutive turns)
@@ -655,34 +654,23 @@ const ConversationTabView = memo(function ConversationTabView({
     workingDirForConnection,
   ])
 
+  // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
+  // The connection dispatch invokes this sink synchronously whenever liveMessage
+  // changes (streaming deltas, tool updates, the prompt-start reset), so the
+  // streaming content flows straight to the runtime store — which the message
+  // list renders — WITHOUT this keep-alive panel re-rendering per token (the old
+  // mirror effect required a per-token render just to run). The sink writes
+  // non-null values with isLive = (status === "prompting"), which tells the
+  // runtime reducer to bypass its stale-reconnect-replay guard (matters for the
+  // rekey path: close+reopen mid-turn, where detail.turns may already hold user
+  // turns that would otherwise drop the live assistant stream). Turn-end clearing
+  // is owned by COMPLETE_TURN (nulls liveMessage); unmount clearing by
+  // removeConversation. `tabId` is the connection contextKey.
   useEffect(() => {
-    // Only sync non-null liveMessage updates to state. When conn.liveMessage
-    // goes null (agent finished streaming), don't clear state.liveMessage —
-    // COMPLETE_TURN needs to snapshot it when connStatus transitions.
-    // Clearing is handled by COMPLETE_TURN (sets liveMessage = null) and
-    // by this effect's cleanup (when not prompting).
-    if (conn.liveMessage != null) {
-      // isLive=true when actively prompting tells the runtime reducer to
-      // bypass its stale-reconnect-replay guard. This matters for the
-      // rekey path (close+reopen mid-turn): the runtime session for the
-      // persisted conversation id is fresh and may have user turns in
-      // detail.turns post-load, which would otherwise drop the live
-      // assistant stream on the floor.
-      setLiveMessage(
-        effectiveConversationId,
-        conn.liveMessage,
-        connStatus === "prompting"
-      )
-    }
-    return () => {
-      // Don't clear liveMessage if agent is still responding — the session
-      // is kept via pendingCleanup, and clearing here would cause the
-      // SET_LIVE_MESSAGE guard to block the reconnect liveMessage on reopen.
-      if (connStatusRef.current !== "prompting") {
-        setLiveMessage(effectiveConversationId, null)
-      }
-    }
-  }, [conn.liveMessage, connStatus, effectiveConversationId, setLiveMessage])
+    return acpActions.registerLiveMessageSink(tabId, (liveMessage, isLive) =>
+      setLiveMessage(effectiveConversationId, liveMessage, isLive)
+    )
+  }, [acpActions, tabId, effectiveConversationId, setLiveMessage])
 
   // Cross-client VIEWER (Bug 2): mirror the connection's in-flight user prompt
   // (from a snapshot's `pending_user_message`, captured when we attach

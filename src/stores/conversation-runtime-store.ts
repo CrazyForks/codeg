@@ -163,14 +163,13 @@ type Action =
       type: "COMPLETE_TURN"
       conversationId: number
       /**
-       * Optional authoritative liveMessage from the caller. Used to avoid a
-       * race where the connections-context batches the final STREAM_BATCH
-       * and STATUS_CHANGED into one render: by the time COMPLETE_TURN runs,
-       * the panel's mirror effect that copies conn.liveMessage into
-       * session.liveMessage has not yet executed for the current render,
-       * so session.liveMessage is one render stale and missing the final
-       * text chunk. When provided, this value is preferred over
-       * session.liveMessage for the snapshot.
+       * Optional authoritative liveMessage from the caller. `session.liveMessage`
+       * is kept current by the connection dispatch's liveMessage sink (writes
+       * synchronously as each batch is applied — see `registerLiveMessageSink`),
+       * so the fallback would normally already hold the final chunk. When
+       * provided (the panel's connStatus-edge effect), this value is preferred
+       * as the authoritative source; the background turn_complete listener
+       * omits it and relies on the sink-synced `session.liveMessage`.
        */
       liveMessage?: LiveMessage | null
     }
@@ -1017,11 +1016,13 @@ function reducer(
         return state
       }
 
-      // Prefer the caller-provided liveMessage when present. The panel's
-      // mirror effect that syncs conn.liveMessage → session.liveMessage runs
-      // AFTER this effect within the same render, so session.liveMessage
-      // misses the final stream chunk that arrived in the same React batch
-      // as the status transition.
+      // Prefer the caller-provided liveMessage when present. `current.liveMessage`
+      // is kept in sync by the connection dispatch's liveMessage sink (see
+      // `registerLiveMessageSink` in the connections context), which writes
+      // synchronously as each batch is applied — so by turn-end it already holds
+      // the final chunk. The panel's connStatus-edge effect still passes
+      // `conn.liveMessage` explicitly (belt-and-suspenders); the background
+      // turn_complete listener passes nothing and relies on the sink-synced value.
       const sourceLiveMessage =
         action.liveMessage !== undefined
           ? action.liveMessage
