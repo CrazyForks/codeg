@@ -130,6 +130,7 @@ import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-
 import { useAgentSkills } from "@/hooks/use-agent-skills"
 import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
 import { useEnabledSkillIds } from "@/hooks/use-enabled-skill-ids"
+import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import { getExpertIcon, pickLocalized } from "@/lib/expert-presentation"
 import { OFFICE_ACTIONS, type OfficeAction } from "@/lib/office-actions"
 import {
@@ -567,6 +568,9 @@ export function MessageInput({
   // pick closes it explicitly — matching the prior cog menu, which also closed
   // on every selection.
   const [collapsedSelectorsOpen, setCollapsedSelectorsOpen] = useState(false)
+  // Keep the collapsed settings popover open while dragging the (virtualized)
+  // model list's native scrollbar — see `useScrollbarSafeDismiss`.
+  const collapsedSelectorsGuard = useScrollbarSafeDismiss()
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -3268,9 +3272,13 @@ export function MessageInput({
                           </Button>
                         </PopoverTrigger>
                         <PopoverContent
+                          ref={collapsedSelectorsGuard.contentRef}
                           side="top"
                           align="start"
                           aria-label={t("agentSettings")}
+                          onPointerDownOutside={
+                            collapsedSelectorsGuard.onPointerDownOutside
+                          }
                           className="w-[22rem] max-w-[calc(100vw-1rem)] p-1"
                         >
                           {showConfigLoading && (
