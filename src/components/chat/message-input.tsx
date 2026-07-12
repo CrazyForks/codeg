@@ -155,6 +155,7 @@ import {
   applyExpertReference,
   isComposerChromeClick,
   isComposerEmpty,
+  restampSkillPrefixes,
   restoreBlocksIntoEditor,
 } from "@/components/chat/composer/composer-commands"
 import {
@@ -871,6 +872,25 @@ export function MessageInput({
     })
     return () => cancelAnimationFrame(raf)
   }, [injectContent, composerReady, skillPrefix, onInjectConsumed])
+
+  // A skill / expert badge freezes its invocation prefix (`$` for Codex, `/`
+  // elsewhere) at insert time. On the welcome page users routinely click a
+  // quick-skill card while the default agent is selected and only then switch to
+  // Codex via the picker below — the badge would keep its `/` and Codex would
+  // parse the leading `/skill` as a slash command and reject the turn. Re-stamp
+  // the existing skill badges whenever the effective prefix changes so the
+  // leading invocation always matches the selected agent (ACP slash commands
+  // carry no scope and stay `/`). rAF-deferred like the sibling editor-mutation
+  // effects to stay off React's commit phase — the badge NodeView re-renders via
+  // a synchronous flushSync().
+  useEffect(() => {
+    if (!composerReady) return
+    const raf = requestAnimationFrame(() => {
+      const editor = editorRef.current?.getEditor()
+      if (editor) restampSkillPrefixes(editor, skillPrefix)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [skillPrefix, composerReady])
 
   const setDragActiveIfChanged = useCallback((next: boolean) => {
     if (dragActiveRef.current === next) return
@@ -2298,6 +2318,14 @@ export function MessageInput({
 
   const buildDraft = useCallback((): PromptDraft | null => {
     const editor = editorRef.current?.getEditor()
+    // Authoritative prefix normalization at the send boundary. A skill / expert
+    // badge freezes its `$`/`/` trigger at insert time and the agent can change
+    // afterward; the agent-change effect re-stamps live, but doing it here too —
+    // synchronously, before both the sent blocks and the display prose read the
+    // doc — guarantees the wire text matches the current agent regardless of any
+    // timing/ordering (Codex needs `$skill`, not the slash-command `/skill`).
+    // Cheap: one small-doc walk, and no dispatch when nothing is stale.
+    if (editor) restampSkillPrefixes(editor, skillPrefix)
     // Inline badges + prose → text/resource_link blocks (file mentions become
     // first-class ResourceLinks; agent/session/commit/skill stay inline text;
     // embedded badges are dropped here and re-added below from the payload map).
@@ -2347,7 +2375,7 @@ export function MessageInput({
       displayProse ||
       `Attached ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
     return { blocks, displayText }
-  }, [attachments])
+  }, [attachments, skillPrefix])
 
   // Clear the editor + attachments after a send / enqueue / save.
   const resetComposer = useCallback(() => {
