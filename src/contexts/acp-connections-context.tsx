@@ -1246,14 +1246,17 @@ function connectionsReducer(
         current.availableCommands ?? action.patch.availableCommands
       const mergedPromptCapabilities =
         action.patch.promptCapabilities ?? current.promptCapabilities
-      const recoveredError = current.error ?? action.patch.lastError
 
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
       // Mutable fields (status, sessionId, liveMessage, pendingPermission,
-      // usage) are fresher in memory than in the snapshot and must NOT be
-      // overwritten — but the latched/fill-null fields above are still
-      // applied so the once-per-lifetime bits can recover.
+      // usage, error) are fresher in memory than in the snapshot and must NOT
+      // be overwritten — but the latched/fill-null fields above are still
+      // applied so the once-per-lifetime bits can recover. `error` in
+      // particular is cleared on a new prompt (STATUS_CHANGED → prompting), so
+      // folding a stale snapshot's `lastError` back in here would resurrect an
+      // error the current turn already cleared; it is recovered on the fresh
+      // path below instead.
       if (action.patch.eventSeq <= current.lastAppliedSeq) {
         if (
           mergedSelectorsReady === current.selectorsReady &&
@@ -1261,8 +1264,7 @@ function connectionsReducer(
           mergedModes === current.modes &&
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
-          mergedPromptCapabilities === current.promptCapabilities &&
-          recoveredError === current.error
+          mergedPromptCapabilities === current.promptCapabilities
         ) {
           return state
         }
@@ -1275,7 +1277,6 @@ function connectionsReducer(
           promptCapabilities: mergedPromptCapabilities,
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
-          error: recoveredError,
         })
         return next
       }
