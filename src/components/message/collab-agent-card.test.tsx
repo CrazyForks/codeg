@@ -114,6 +114,23 @@ describe("CollabAgentCard", () => {
     expect(screen.getByText("22220000")).toBeInTheDocument()
   })
 
+  it("renders a resultless wait as a bare pill, not an empty box", () => {
+    // Newer codex `wait_agent` returns no per-agent message, so the capsule has
+    // nothing to show. It must render as a bare, non-expandable pill — NOT an
+    // empty bordered body frame (the sub-agent "white box" bug).
+    renderCard({
+      input: collabInput({
+        op: "wait",
+        status: "completed",
+        agents: { "22220000-bbbb": { status: "completed", message: null } },
+      }),
+      state: "output-available",
+    })
+    expect(screen.getByText("Fetching sub-agent result")).toBeInTheDocument()
+    // No collapsible trigger → bodyless capsule is a bare pill, not a button.
+    expect(screen.queryByRole("button")).not.toBeInTheDocument()
+  })
+
   it("op-aware titles survive snake_case op spellings", () => {
     renderCard({
       input: collabInput({
