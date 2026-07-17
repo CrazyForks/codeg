@@ -206,10 +206,14 @@ export function Sidebar() {
         className={cn(
           "flex h-10 shrink-0 items-center gap-2 pr-2",
           // Desktop: the fixed left window-chrome overlay (reserved below) owns
-          // the top-left, so drop the header's own left padding and the divider
-          // (the sidebar reads as one continuous surface). Mobile (Sheet): keep
-          // the original title padding + divider — mobile is unchanged.
-          isMobile ? "border-b border-border pl-4" : "pl-0"
+          // the top-left, so drop the header's own left padding. A subtle bottom
+          // divider (border-border/50) matches the conversation detail header's
+          // bottom border so the two align as one bar across the app's top edge.
+          // Mobile (Sheet): keep the original title padding + a full-strength
+          // divider — mobile is unchanged.
+          isMobile
+            ? "border-b border-border pl-4"
+            : "border-b border-border/50 pl-0"
         )}
       >
         {isMobile ? (
