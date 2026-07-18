@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "فشلت الإضافة إلى VCS",
         "loadBranchesFailed": "فشل تحميل الفروع",
         "renameFailed": "فشل إعادة التسمية",
+        "moveFailed": "فشل النقل",
         "deleteFailed": "فشل الحذف",
         "rolledBack": "تم التراجع عن {name}",
         "rollbackFailed": "فشل التراجع",

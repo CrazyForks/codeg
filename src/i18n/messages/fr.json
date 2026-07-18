@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "Échec de l'ajout au VCS",
         "loadBranchesFailed": "Échec du chargement des branches",
         "renameFailed": "Échec du renommage",
+        "moveFailed": "Échec du déplacement",
         "deleteFailed": "Échec de la suppression",
         "rolledBack": "{name} annulé",
         "rollbackFailed": "Échec de l'annulation",

@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "VCS에 추가하지 못했습니다",
         "loadBranchesFailed": "브랜치를 불러오지 못했습니다",
         "renameFailed": "이름 변경에 실패했습니다",
+        "moveFailed": "이동에 실패했습니다",
         "deleteFailed": "삭제에 실패했습니다",
         "rolledBack": "{name}을(를) 롤백했습니다",
         "rollbackFailed": "롤백에 실패했습니다",

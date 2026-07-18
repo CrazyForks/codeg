@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "Failed to add to VCS",
         "loadBranchesFailed": "Failed to load branches",
         "renameFailed": "Rename failed",
+        "moveFailed": "Move failed",
         "deleteFailed": "Delete failed",
         "rolledBack": "Rolled back {name}",
         "rollbackFailed": "Rollback failed",

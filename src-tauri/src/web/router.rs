@@ -359,6 +359,10 @@ pub fn build_router(
             post(handlers::files::rename_file_tree_entry),
         )
         .route(
+            "/move_file_tree_entry",
+            post(handlers::files::move_file_tree_entry),
+        )
+        .route(
             "/delete_file_tree_entry",
             post(handlers::files::delete_file_tree_entry),
         )

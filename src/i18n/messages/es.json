@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "No se pudo añadir a VCS",
         "loadBranchesFailed": "No se pudieron cargar las ramas",
         "renameFailed": "Error al renombrar",
+        "moveFailed": "Error al mover",
         "deleteFailed": "Error al eliminar",
         "rolledBack": "Se revirtió {name}",
         "rollbackFailed": "Error al revertir",

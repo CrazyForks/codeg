@@ -2956,6 +2956,24 @@ export async function renameFileTreeEntry(
   })
 }
 
+/**
+ * Move a file/directory into a different directory of the same workspace,
+ * keeping its name. `sourcePath` and `destDir` are workspace-relative
+ * (forward slashes); `destDir` is `""` for the workspace root. Resolves to the
+ * moved entry's new workspace-relative path.
+ */
+export async function moveFileTreeEntry(
+  rootPath: string,
+  sourcePath: string,
+  destDir: string
+): Promise<string> {
+  return getTransport().call("move_file_tree_entry", {
+    rootPath,
+    sourcePath,
+    destDir,
+  })
+}
+
 export async function deleteFileTreeEntry(
   rootPath: string,
   path: string

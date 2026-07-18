@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "Hinzufügen zu VCS fehlgeschlagen",
         "loadBranchesFailed": "Branches konnten nicht geladen werden",
         "renameFailed": "Umbenennen fehlgeschlagen",
+        "moveFailed": "Verschieben fehlgeschlagen",
         "deleteFailed": "Löschen fehlgeschlagen",
         "rolledBack": "{name} zurückgesetzt",
         "rollbackFailed": "Zurücksetzen fehlgeschlagen",

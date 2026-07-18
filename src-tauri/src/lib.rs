@@ -967,6 +967,7 @@ mod tauri_app {
                 folders::save_file_content,
                 folders::save_file_copy,
                 folders::rename_file_tree_entry,
+                folders::move_file_tree_entry,
                 folders::delete_file_tree_entry,
                 folders::create_file_tree_entry,
                 folders::git_log,

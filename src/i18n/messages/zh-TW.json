@@ -1869,6 +1869,7 @@
         "addToVcsFailed": "加入到 VCS 失敗",
         "loadBranchesFailed": "載入分支失敗",
         "renameFailed": "重新命名失敗",
+        "moveFailed": "移動失敗",
         "deleteFailed": "刪除失敗",
         "rolledBack": "已回滾 {name}",
         "rollbackFailed": "回滾失敗",
