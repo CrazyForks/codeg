@@ -588,6 +588,35 @@ function extractRevisedPrompt(content: string | null): string | null {
   return trimmed
 }
 
+/**
+ * Fold a Cursor task's wire title ("Task: <description>") into its rawInput
+ * as `description`. Applies only when the input carries Cursor's
+ * `_toolName:"task"` identity stamp and no description of its own; every
+ * other shape returns null (caller falls through to the raw input).
+ */
+function mergeCursorTaskTitle(
+  rawInput: string,
+  title: string | null | undefined
+): string | null {
+  const match = /^task:\s*(\S.*)$/i.exec(title?.trim() ?? "")
+  if (!match) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawInput)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null
+  }
+  const obj = parsed as Record<string, unknown>
+  if (obj._toolName !== "task") return null
+  if (typeof obj.description === "string" && obj.description.length > 0) {
+    return null
+  }
+  return JSON.stringify({ ...obj, description: match[1].trim() })
+}
+
 /** First filesystem path from an ACP tool call's `locations` (`[{ path }]`), or null. */
 function firstLocationPath(locations: unknown): string | null {
   if (!Array.isArray(locations)) return null
@@ -610,6 +639,17 @@ function resolveLiveToolInput(
   // through to the raw input when there's no op or it isn't a JSON object.
   if (toolName === COLLAB_AGENT_TOOL_NAME && info.raw_input) {
     const merged = mergeCollabOp(info.raw_input, info.title)
+    if (merged) return merged
+  }
+
+  // Cursor announces its task tool before the args stream in, so the live
+  // rawInput is often just the `{_toolName:"task"}` identity stamp — and the
+  // CLI never resends rawInput on later updates. The wire title
+  // ("Task: <description>") is the only human-readable label; fold it into
+  // the input as `description` so the Agent card doesn't sit on its
+  // "starting…" placeholder forever. Never overwrites a real description.
+  if (toolName === "agent" && info.raw_input) {
+    const merged = mergeCursorTaskTitle(info.raw_input, info.title)
     if (merged) return merged
   }
 

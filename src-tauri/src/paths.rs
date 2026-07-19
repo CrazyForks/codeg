@@ -11,6 +11,7 @@ const CODEG_DIR_NAME: &str = ".codeg";
 const PETS_DIR_NAME: &str = "pets";
 const UPLOADS_DIR_NAME: &str = "uploads";
 const LOGS_DIR_NAME: &str = "logs";
+const TURN_TIMINGS_DIR_NAME: &str = "turn-timings";
 
 /// `$CODEG_HOME` if set (and non-empty), else `~/.codeg/`.
 ///
@@ -102,6 +103,28 @@ pub fn codeg_logs_root() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(CODEG_DIR_NAME).join(LOGS_DIR_NAME))
         .unwrap_or_else(|| PathBuf::from(CODEG_DIR_NAME).join(LOGS_DIR_NAME))
+}
+
+/// Root directory for codeg's own per-turn timing observations (see
+/// `crate::turn_timings`) — wall-clock turn spans the ACP connection layer
+/// records for agents whose native session store carries no per-turn
+/// timestamps (Cursor). Written by the live connection, read back by the
+/// history parser.
+///
+/// Resolution mirrors [`codeg_uploads_root`]:
+/// 1. `$CODEG_HOME/turn-timings`
+/// 2. `$CODEG_DATA_DIR/turn-timings` (server-mode data directory)
+/// 3. `~/.codeg/turn-timings` (desktop default)
+pub fn codeg_turn_timings_root() -> PathBuf {
+    if let Some(custom) = std::env::var_os("CODEG_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom).join(TURN_TIMINGS_DIR_NAME);
+    }
+    if let Some(data) = std::env::var_os("CODEG_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(data).join(TURN_TIMINGS_DIR_NAME);
+    }
+    dirs::home_dir()
+        .map(|h| h.join(CODEG_DIR_NAME).join(TURN_TIMINGS_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(CODEG_DIR_NAME).join(TURN_TIMINGS_DIR_NAME))
 }
 
 /// Single source of truth for "where does the database live, and where

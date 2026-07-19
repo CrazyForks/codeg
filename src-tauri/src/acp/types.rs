@@ -255,6 +255,15 @@ pub enum AcpEvent {
         child_connection_id: String,
         child_conversation_id: i32,
         agent_type: crate::models::agent::AgentType,
+        /// Bounded preview of the delegated task text (broker's
+        /// `TASK_PREVIEW_CAP`). Lets the live card show WHAT was delegated even
+        /// when the parent tool call's `raw_input` never carries the arguments
+        /// (Cursor announces MCP calls identity-less and never re-sends them).
+        task_preview: String,
+        /// Broker-minted task id — the same id the running ack embeds as
+        /// `task_id=<id>` — so the live card can label the delegation before
+        /// the ack text lands on the tool output.
+        task_id: String,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.
@@ -616,6 +625,14 @@ pub struct AcpAgentInfo {
     /// effort). Only populated for `AgentType::Grok`. `None` fields mean the key
     /// is absent from the config. Derived from `grok_config_toml`.
     pub grok_settings: Option<GrokSettings>,
+    /// Raw `~/.cursor/cli-config.json` text, attached for the Cursor settings
+    /// panel's advanced view. Only populated for `AgentType::Cursor`.
+    pub cursor_cli_config_json: Option<String>,
+    /// Parsed scalar settings from cli-config.json backing the Cursor panel's
+    /// structured controls (sandbox / permission rules; the Run Everything
+    /// permission mode is a launch flag, not a config key). Only populated
+    /// for `AgentType::Cursor`. Derived from `cursor_cli_config_json`.
+    pub cursor_settings: Option<CursorSettings>,
     pub model_provider_id: Option<i32>,
 }
 
@@ -678,6 +695,61 @@ pub struct GrokStructuredConfig {
     pub custom_api_backend: Option<String>,
     pub custom_context_window: Option<i64>,
     pub auto_compact_threshold_percent: Option<i64>,
+}
+
+/// The subset of `~/.cursor/cli-config.json` surfaced as structured controls
+/// in the Cursor settings panel. The file is shared with the Cursor CLI's own
+/// `/config` UI, so codeg only projects the keys it manages; everything else
+/// is preserved verbatim on write. `None` means the key is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CursorSettings {
+    /// `sandbox.mode` — "enabled" | "disabled".
+    pub sandbox_mode: Option<String>,
+    /// `permissions.allow` rules, e.g. `Shell(ls)`.
+    pub permissions_allow: Vec<String>,
+    /// `permissions.deny` rules.
+    pub permissions_deny: Vec<String>,
+}
+
+/// The structured-control values the Cursor settings panel sends on save.
+/// `None` fields leave the corresponding key untouched; `Some` fields replace
+/// it (lists are replaced wholesale). Merged onto the current on-disk
+/// cli-config.json so unmanaged keys are preserved. camelCase on the wire to
+/// match the enclosing request body.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorStructuredConfig {
+    pub sandbox_mode: Option<String>,
+    pub permissions_allow: Option<Vec<String>>,
+    pub permissions_deny: Option<Vec<String>>,
+}
+
+/// Result of probing `cursor-agent status --format json` for the Cursor
+/// settings panel's auth card. Parsed defensively: unknown shapes surface as
+/// `raw_status` so the panel can still show something useful.
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorAuthStatus {
+    /// A launchable cursor-agent binary was found (cache or system install).
+    pub installed: bool,
+    pub is_authenticated: bool,
+    /// The CLI's own `status` string (e.g. "unauthenticated").
+    pub raw_status: Option<String>,
+    /// Account email when logged in (field name per the CLI's JSON output).
+    pub email: Option<String>,
+    /// Membership/plan label when the CLI reports one.
+    pub membership: Option<String>,
+    /// Probe failure detail (spawn error / timeout / non-JSON output).
+    pub error: Option<String>,
+}
+
+/// Result of `cursor-agent models` for the Cursor settings panel's model
+/// picker. `models` is best-effort parsed CLI output; `error` carries the
+/// failure reason when the probe could not run (e.g. not logged in).
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorModelsResult {
+    pub models: Vec<String>,
+    pub default_model: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Lightweight status info for a single agent, used by connect() pre-check.

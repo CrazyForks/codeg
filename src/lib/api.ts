@@ -32,6 +32,9 @@ import type {
   AcpAgentInfo,
   AcpAgentStatus,
   GrokStructuredConfig,
+  CursorStructuredConfig,
+  CursorAuthStatus,
+  CursorModelsResult,
   CodexModelInfo,
   AgentSkillScope,
   AgentSkillLayout,
@@ -437,6 +440,11 @@ export async function acpUpdateAgentConfig(
     /** Grok structured controls (mode / reasoning effort); merged onto the
      * on-disk config.toml server-side. */
     grok_structured?: GrokStructuredConfig | null
+    /** Raw ~/.cursor/cli-config.json text (advanced editor; whole file). */
+    cursor_cli_config_json?: string | null
+    /** Cursor structured controls (sandbox / permission rules); merged onto
+     * the on-disk cli-config.json server-side. */
+    cursor_structured?: CursorStructuredConfig | null
   }
 ): Promise<number> {
   return getTransport().call("acp_update_agent_config", {
@@ -448,7 +456,19 @@ export async function acpUpdateAgentConfig(
     codexModelCatalog: params.codex_model_catalog ?? null,
     grokConfigToml: params.grok_config_toml ?? null,
     grokStructured: params.grok_structured ?? null,
+    cursorCliConfigJson: params.cursor_cli_config_json ?? null,
+    cursorStructured: params.cursor_structured ?? null,
   })
+}
+
+/** Probe `cursor-agent status --format json` for the Cursor auth card. */
+export async function acpCursorAuthStatus(): Promise<CursorAuthStatus> {
+  return getTransport().call("acp_cursor_auth_status", {})
+}
+
+/** List models via `cursor-agent models` for the Cursor model picker. */
+export async function acpCursorListModels(): Promise<CursorModelsResult> {
+  return getTransport().call("acp_cursor_list_models", {})
 }
 
 /**

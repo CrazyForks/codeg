@@ -26,6 +26,7 @@ pub mod preferences;
 pub mod process;
 pub mod supervise;
 mod terminal;
+pub mod turn_timings;
 pub mod update;
 pub mod web;
 pub mod workspace_state;
@@ -1070,6 +1071,8 @@ mod tauri_app {
                 version_control::get_account_token,
                 version_control::delete_account_token,
                 acp_commands::acp_preflight,
+                acp_commands::acp_cursor_auth_status,
+                acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
                 acp_commands::acp_set_mode,

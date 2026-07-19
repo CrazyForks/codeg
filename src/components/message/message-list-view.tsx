@@ -111,9 +111,8 @@ interface ResolvedMessageGroup {
   models?: string[]
   /**
    * Wall-clock completion time supplied by the Rust parser. For merged
-   * sub-turns this reflects the last sub-turn's completion (inherited
-   * automatically via `{ ...last.group }`), not first-start + accumulated
-   * duration.
+   * sub-turns this is the latest non-null completion across the run — the
+   * post-turn metadata patch may sit on any sub-turn, not just the last.
    */
   completed_at?: string | null
 }
@@ -266,8 +265,10 @@ function isEmptyTurnItem(item: ThreadRenderItem): boolean {
  * collapsible. Empty (no-content) turn items are treated as transparent and
  * do not break the run — that handles cases where parsers leave empty
  * placeholder turns between tool exchanges.
+ *
+ * Exported for tests.
  */
-function mergeConsecutiveAssistantTurns(
+export function mergeConsecutiveAssistantTurns(
   items: ThreadRenderItem[]
 ): ThreadRenderItem[] {
   const result: ThreadRenderItem[] = []
@@ -309,9 +310,18 @@ function mergeConsecutiveAssistantTurns(
       // agent loops, etc.) would visibly under-report tokens.
       let mergedUsage: import("@/lib/types").TurnUsage | null = null
       let mergedDuration: number | null = null
+      // Post-turn metadata may land on ANY sub-turn (Cursor's reparse patches
+      // the FIRST local sub-turn when the parser emits fewer turns than the
+      // live stream split into), so the merged completion time is the latest
+      // non-null across the run — not whatever the last sub-turn happens to
+      // carry.
+      let mergedCompletedAt: string | null = null
       const seenModels = new Set<string>()
       const mergedModels: string[] = []
       for (const it of buffer) {
+        if (it.group.completed_at) {
+          mergedCompletedAt = it.group.completed_at
+        }
         const u = it.group.usage
         if (u) {
           if (!mergedUsage) {
@@ -352,6 +362,7 @@ function mergeConsecutiveAssistantTurns(
           duration_ms: mergedDuration,
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
+          completed_at: mergedCompletedAt,
         },
       })
     }

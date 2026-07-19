@@ -639,6 +639,14 @@ pub fn build_router(
             post(handlers::acp::acp_update_hermes_config),
         )
         .route(
+            "/acp_cursor_auth_status",
+            post(handlers::acp::acp_cursor_auth_status),
+        )
+        .route(
+            "/acp_cursor_list_models",
+            post(handlers::acp::acp_cursor_list_models),
+        )
+        .route(
             "/acp_update_kimi_code_config",
             post(handlers::acp::acp_update_kimi_code_config),
         )
