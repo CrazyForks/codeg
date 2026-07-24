@@ -2794,6 +2794,10 @@
         "cardCompleted": "后台任务已完成",
         "cardFinishedWithStatus": "后台任务已结束（{status}）",
         "cardResultPending": "结果尚未返回"
+      },
+      "proposedPlan": {
+        "title": "计划提案",
+        "planning": "规划中…"
       }
     },
     "diffPreview": {

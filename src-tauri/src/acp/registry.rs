@@ -209,7 +209,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.4 depends on `@openai/codex` ^0.144.4 and drives `codex
+            // 1.1.7 depends on `@openai/codex` ^0.145.0 and drives `codex
             // app-server`; since 1.0.1 it also resolves the resumed
             // `model_provider` from `~/.codex/config.toml` (#224), so codeg no
             // longer injects `MODEL_PROVIDER` to keep resumed sessions on the
@@ -222,10 +222,28 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // retryable turn errors (#289, `_meta.codex.error` → a transient
             // retry banner via `codex_retry_indicator`), and the
             // context-compaction lifecycle (#288, `_meta.contextCompaction` tool
-            // call → a dedicated frontend card).
+            // call → a dedicated frontend card). 1.1.x also adds Plan mode: the
+            // `collaboration_mode` config option (rendered by the generic
+            // config-option path) and native `request_user_input`, delivered as
+            // an ACP `elicitation/create` request — codeg advertises
+            // `elicitation.form` for Codex and bridges the WHOLE form surface
+            // (Plan-mode questions, MCP-server forms, MCP tool-call approvals)
+            // in `handle_elicitation_request` / `question::classify_elicitation`.
+            // 1.1.5 (#322) also widened codex-acp's MCP config filtering to
+            // project `.codex` layers, which is why codeg forces
+            // `DISABLE_MCP_CONFIG_FILTERING` (see `apply_codex_env_policy`) so
+            // the injected `codeg-mcp` server always survives. 1.1.6 adds
+            // steering (#309): `_session/steering` injects a user prompt into
+            // the LIVE turn (initialize advertises `_meta.steering.supported`)
+            // — not wired into codeg yet. 1.1.7 (#326) emits Plan-mode plan
+            // contents as a plain `agent_message_chunk`
+            // (`_meta.codex.phase = "final_answer"`, no `<proposed_plan>` tags),
+            // which the adapter's tag-splitter simply no-ops on — tagged output
+            // from older codex still renders as the proposed-plan card. 1.1.7
+            // declares no `engines.node`, so the 20.0.0 floor is retained.
             distribution: AgentDistribution::Npx {
-                version: "1.1.4",
-                package: "@agentclientprotocol/codex-acp@1.1.4",
+                version: "1.1.7",
+                package: "@agentclientprotocol/codex-acp@1.1.7",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
@@ -646,8 +664,8 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.1.4",
-            "@agentclientprotocol/codex-acp@1.1.4",
+            "1.1.7",
+            "@agentclientprotocol/codex-acp@1.1.7",
             Some("20.0.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));

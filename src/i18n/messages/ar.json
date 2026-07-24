@@ -2794,6 +2794,10 @@
         "cardCompleted": "اكتملت مهمة الخلفية",
         "cardFinishedWithStatus": "انتهت مهمة الخلفية ({status})",
         "cardResultPending": "لم تصل النتيجة بعد"
+      },
+      "proposedPlan": {
+        "title": "الخطة المقترحة",
+        "planning": "جارٍ التخطيط…"
       }
     },
     "diffPreview": {

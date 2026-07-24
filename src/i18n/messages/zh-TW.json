@@ -2794,6 +2794,10 @@
         "cardCompleted": "背景任務已完成",
         "cardFinishedWithStatus": "背景任務已結束（{status}）",
         "cardResultPending": "結果尚未返回"
+      },
+      "proposedPlan": {
+        "title": "計劃提案",
+        "planning": "規劃中…"
       }
     },
     "diffPreview": {

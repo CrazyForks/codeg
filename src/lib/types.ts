@@ -972,13 +972,17 @@ export interface QuestionOption {
 }
 
 /** A single multiple-choice question (mirror of Rust `QuestionSpec`). `id` is
- *  the backend-minted correlation key the answer is submitted against. */
+ *  the backend-minted correlation key the answer is submitted against. Empty
+ *  `options` means free-text: the card renders only its "Other" input (codex
+ *  elicitation / MCP-server forms ask open questions this way). `is_secret`
+ *  masks that input (absent on the wire for non-secret sources). */
 export interface QuestionSpec {
   id: string
   question: string
   header: string
   multi_select: boolean
   options: QuestionOption[]
+  is_secret?: boolean
 }
 
 /** Awaiting-answer question set on the session (mirror of `PendingQuestionState`). */

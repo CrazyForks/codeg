@@ -2794,6 +2794,10 @@
         "cardCompleted": "Background task completed",
         "cardFinishedWithStatus": "Background task finished ({status})",
         "cardResultPending": "Result not returned yet"
+      },
+      "proposedPlan": {
+        "title": "Proposed plan",
+        "planning": "Planning…"
       }
     },
     "diffPreview": {

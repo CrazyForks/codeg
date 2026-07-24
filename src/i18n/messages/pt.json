@@ -2794,6 +2794,10 @@
         "cardCompleted": "Tarefa em segundo plano concluída",
         "cardFinishedWithStatus": "Tarefa em segundo plano encerrada ({status})",
         "cardResultPending": "Resultado ainda não retornou"
+      },
+      "proposedPlan": {
+        "title": "Plano proposto",
+        "planning": "A planear…"
       }
     },
     "diffPreview": {

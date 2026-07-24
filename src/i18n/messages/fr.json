@@ -2794,6 +2794,10 @@
         "cardCompleted": "Tâche en arrière-plan terminée",
         "cardFinishedWithStatus": "Tâche en arrière-plan terminée ({status})",
         "cardResultPending": "Résultat pas encore reçu"
+      },
+      "proposedPlan": {
+        "title": "Plan proposé",
+        "planning": "Planification…"
       }
     },
     "diffPreview": {

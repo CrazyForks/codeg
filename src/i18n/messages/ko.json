@@ -2794,6 +2794,10 @@
         "cardCompleted": "백그라운드 작업 완료",
         "cardFinishedWithStatus": "백그라운드 작업 종료 ({status})",
         "cardResultPending": "결과가 아직 반환되지 않았습니다"
+      },
+      "proposedPlan": {
+        "title": "제안된 계획",
+        "planning": "계획 중…"
       }
     },
     "diffPreview": {

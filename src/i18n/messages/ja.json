@@ -2794,6 +2794,10 @@
         "cardCompleted": "バックグラウンドタスクが完了しました",
         "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
         "cardResultPending": "結果はまだ返っていません"
+      },
+      "proposedPlan": {
+        "title": "提案された計画",
+        "planning": "計画中…"
       }
     },
     "diffPreview": {

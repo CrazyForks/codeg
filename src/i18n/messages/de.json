@@ -2794,6 +2794,10 @@
         "cardCompleted": "Hintergrundaufgabe abgeschlossen",
         "cardFinishedWithStatus": "Hintergrundaufgabe beendet ({status})",
         "cardResultPending": "Ergebnis steht noch aus"
+      },
+      "proposedPlan": {
+        "title": "Vorgeschlagener Plan",
+        "planning": "Wird geplant…"
       }
     },
     "diffPreview": {

@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
+    CreateTerminalRequest, CreateTerminalResponse,
+    ElicitationCapabilities, ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
@@ -126,6 +127,23 @@ fn apply_grok_env_policy(merged: &mut Vec<(String, String)>, runtime_env: &BTree
         merged.retain(|(k, _)| k != key);
         merged.push((key.to_string(), String::new()));
     }
+}
+
+/// Codex-only launch policy: force codex-acp's MCP name-conflict de-duplication
+/// OFF. codeg injects its companion server (`codeg-mcp`) over ACP
+/// `session/new.mcpServers`; codex-acp otherwise drops any ACP-passed server
+/// whose name collides with a `config.toml` entry — global *or* project layer
+/// (the check was widened to project `.codex/config.toml` in codex-acp #322) —
+/// silently stripping codeg-mcp and with it ask_user_question / delegation /
+/// feedback / session_info. The late `retain` + `push` makes the override win
+/// over any user `runtime_env` twin, so the injection is guaranteed to survive.
+fn apply_codex_env_policy(agent_type: AgentType, merged: &mut Vec<(String, String)>) {
+    if agent_type != AgentType::Codex {
+        return;
+    }
+    let key = "DISABLE_MCP_CONFIG_FILTERING";
+    merged.retain(|(k, _)| k != key);
+    merged.push((key.to_string(), "true".to_string()));
 }
 
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
@@ -394,6 +412,7 @@ async fn build_agent(
                 crate::commands::acp::seed_pi_workspace_trust(cwd, runtime_env);
             }
             let mut merged_env = merge_agent_env(env, runtime_env);
+            apply_codex_env_policy(agent_type, &mut merged_env);
             // codex-acp 1.0.0 honors APP_SERVER_LOGS as a directory for its
             // adapter-side logs. Surface it only under CODEG_ACP_DEBUG so
             // default runs are unchanged; a directory-creation failure silently
@@ -752,6 +771,23 @@ async fn build_agent(
     })
 }
 
+/// Stack size for the dedicated OS thread that drives each ACP connection's
+/// `run_connection` future (see the spawn site below). `run_connection` is one
+/// colossal async state machine — the full per-connection message loop plus
+/// every registered client-request handler — and in DEBUG builds the compiler
+/// does not pack async locals, so a single poll of the connection closure needs
+/// far more than a default ~2 MiB Tokio worker-thread stack. Left on the worker
+/// pool it overflowed the stack and aborted the whole process under `tauri dev`
+/// (release builds pack the frame small enough to fit, which is why only debug
+/// crashed). 8 MiB matches the macOS main-thread stack — 4x the default that
+/// overflowed, generous headroom for the debug frame as ACP features accrete.
+/// The stack is reserved address space, lazily committed, so it costs no
+/// physical memory beyond the pages actually touched (~the real 2-3 MiB the
+/// frame uses), regardless of this cap — so the larger reservation is free. If a
+/// future ACP feature ever grows the loop past even this, split `run_connection`
+/// into boxed sub-futures rather than raising it further.
+const ACP_CONNECTION_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Spawn an ACP agent process and run the connection loop in a background task.
 ///
 /// On success, the newly created `AgentConnection` is inserted into
@@ -866,14 +902,30 @@ pub async fn spawn_agent_connection(
         },
     );
 
-    tokio::spawn(async move {
-        // RAII guard: runs on normal exit AND on panic unwinding, so a
-        // panic inside `run_connection` can't leak a stale map entry.
-        let _cleanup = ConnectionCleanupGuard {
-            connections: cleanup_connections,
-            connection_id: cleanup_connection_id,
-        };
-
+    // Drive `run_connection` on a dedicated, large-stack thread (see
+    // ACP_CONNECTION_STACK_SIZE) rather than a Tokio worker task: its debug
+    // poll frame is too big for a default ~2 MiB worker stack and was aborting
+    // the process under `tauri dev`. `Handle::block_on` runs it on the SAME
+    // shared runtime, so `tokio::spawn`/timers/IO inside `run_connection` still
+    // use the pool — only the giant top-level frame moves to the roomy stack.
+    // The connection is fire-and-forget (torn down from within via `cmd_rx` /
+    // process exit; no JoinHandle is awaited), so a thread is behaviorally
+    // equivalent to the previous task.
+    let connection_rt = tokio::runtime::Handle::current();
+    // RAII guard built OUTSIDE the thread body and moved in: on a normal exit
+    // or panic unwind its Drop removes the manager map entry, AND if the thread
+    // fails to spawn the dropped closure runs the same Drop — so the entry is
+    // never leaked.
+    let cleanup_guard = ConnectionCleanupGuard {
+        connections: cleanup_connections,
+        connection_id: cleanup_connection_id,
+    };
+    let connection_thread = std::thread::Builder::new()
+        .name(format!("acp-conn-{conn_id}"))
+        .stack_size(ACP_CONNECTION_STACK_SIZE)
+        .spawn(move || {
+            let _cleanup = cleanup_guard;
+            connection_rt.block_on(async move {
         let delegation_for_cleanup = delegation_injection.clone();
         let result = run_connection(
             agent,
@@ -950,16 +1002,80 @@ pub async fn spawn_agent_connection(
             },
         )
         .await;
-        // `_cleanup` is dropped here — removes the connection entry from
-        // the manager map. Same drop semantics apply on panic unwinding.
-    });
+                // Connection loop ended; `block_on` returns and `_cleanup`
+                // (bound at the top of the thread body) drops next, removing
+                // the manager map entry — same as on a panic unwind.
+            });
+        });
+    if let Err(e) = connection_thread {
+        // Thread creation only fails on OS resource exhaustion. Dropping the
+        // un-spawned closure already ran `cleanup_guard`'s Drop (removing the
+        // map entry), so just surface the failure and let the caller abort.
+        tracing::error!("[ACP] failed to spawn connection driver thread: {e}");
+        return Err(AcpError::SpawnFailed(format!(
+            "connection driver thread: {e}"
+        )));
+    }
 
     Ok(session_started_rx)
 }
 
+/// A pending permission-card responder. `Acp` is a real ACP
+/// `session/request_permission`; `CodexElicitation` is a codex approval-style
+/// `elicitation/create` (MCP tool-call approval / message-only confirm) routed
+/// through the SAME permission card so approvals look exactly like they did
+/// before codeg advertised `elicitation.form` — its chosen option answers the
+/// blocked elicitation request instead (see `handle_elicitation_request`).
+enum PendingPermission {
+    Acp(Responder<RequestPermissionResponse>),
+    CodexElicitation {
+        responder: Responder<serde_json::Value>,
+        approval: crate::acp::question::ElicitationApproval,
+    },
+}
+
+impl PendingPermission {
+    /// Resolve with the user's chosen option id.
+    fn respond_selected(self, option_id: String) {
+        match self {
+            PendingPermission::Acp(responder) => {
+                let outcome =
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id));
+                let _ = responder.respond(RequestPermissionResponse::new(outcome));
+            }
+            PendingPermission::CodexElicitation {
+                responder,
+                approval,
+            } => {
+                let response = crate::acp::question::build_elicitation_approval_response(
+                    &approval, &option_id,
+                );
+                let _ = responder.respond(serde_json::to_value(response).unwrap_or_default());
+            }
+        }
+    }
+
+    /// Resolve as cancelled — the turn ended / connection tore down before the
+    /// user chose.
+    fn respond_cancelled(self) {
+        match self {
+            PendingPermission::Acp(responder) => {
+                let _ = responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            }
+            PendingPermission::CodexElicitation { responder, .. } => {
+                let _ = responder.respond(
+                    serde_json::to_value(crate::acp::question::elicitation_cancel_response())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+}
+
 /// Shared state for pending permission responders.
-type PendingPermissions =
-    Arc<tokio::sync::Mutex<HashMap<String, Responder<RequestPermissionResponse>>>>;
+type PendingPermissions = Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>;
 
 fn map_session_modes(mode_state: &SessionModeState) -> SessionModeStateInfo {
     SessionModeStateInfo {
@@ -2531,18 +2647,64 @@ async fn run_connection(
             },
             on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                // Codex `elicitation/create`: question-style requests (Plan
+                // mode `request_user_input`, generic MCP forms) bridge into
+                // the same ask card as the codeg-mcp ask tool (reusing the ask
+                // access + kill switch); approval-style requests (MCP
+                // tool-call approvals, message-only confirms) route through
+                // the permission card via `pending_perms`.
+                let access = grok_ask_access.clone();
+                let conn_id = grok_ask_conn_id.clone();
+                let perms = perms.clone();
+                let state_inner = Arc::clone(&state);
+                let emitter_inner = emitter_clone.clone();
+                async move |req: CodexElicitationRequest,
+                            responder: Responder<serde_json::Value>,
+                            _cx: ConnectionTo<Agent>| {
+                    handle_elicitation_request(
+                        &access,
+                        &perms,
+                        &state_inner,
+                        &emitter_inner,
+                        &conn_id,
+                        req,
+                        responder,
+                    )
+                    .await;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
         .connect_with(agent, async move |cx| -> Result<(), sacp::Error> {
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
             // Advertise filesystem + terminal capabilities for ACP tool execution.
-            let init_request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
-                ClientCapabilities::new()
-                    .terminal(true)
-                    .fs(FileSystemCapabilities::new()
-                        .read_text_file(true)
-                        .write_text_file(true)),
-            );
+            let mut client_capabilities = ClientCapabilities::new()
+                .terminal(true)
+                .fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true));
+            // Codex only: advertise form elicitation so codex's native Plan-mode
+            // `request_user_input` tool is delivered as an `elicitation/create`
+            // request (handled below) instead of being silently answered `{}`.
+            // NOTE this reroutes codex's WHOLE form-elicitation surface — MCP
+            // tool-call approvals and MCP-server forms included — so the
+            // handler must cover every shape (`classify_elicitation`). URL
+            // elicitation is deliberately NOT advertised: codex-acp then falls
+            // back to `session/request_permission`, which codeg already
+            // handles. Scoped to Codex to keep the blast radius off other
+            // agents (e.g. Claude's native AskUserQuestion, which would
+            // otherwise un-gate and duplicate the codeg-mcp ask tool).
+            if agent_type == AgentType::Codex {
+                client_capabilities = client_capabilities
+                    .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+            }
+            let init_request = InitializeRequest::new(ProtocolVersion::LATEST)
+                .client_capabilities(client_capabilities);
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -3206,6 +3368,19 @@ async fn run_connection(
 #[serde(transparent)]
 struct GrokAskUserQuestionRequest(serde_json::Value);
 
+/// Every codex `elicitation/create` request — `request_user_input` (Plan
+/// mode), generic MCP-server forms, MCP tool-call approvals, message-only
+/// confirms — arrives here once codeg advertises `elicitation.form`. sacp
+/// 11.0.0 ships no `JsonRpcRequest`/`JsonRpcResponse` impl for the schema's
+/// elicitation types (and no feature to enable them), so — like the grok bridge
+/// — take the raw params object and reply with a raw JSON value (the serialized
+/// `CreateElicitationResponse`). sacp has no built-in elicitation handling, so
+/// this custom method handler fills the gap with no dispatch conflict.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "elicitation/create", response = serde_json::Value)]
+#[serde(transparent)]
+struct CodexElicitationRequest(serde_json::Value);
+
 /// Bridge grok's native `_x.ai/ask_user_question` ext request into codeg's
 /// interactive question card. Grok blocks on the reply, so codeg registers the
 /// questions through the shared [`crate::acp::question::SessionQuestionAccess`] —
@@ -3311,6 +3486,217 @@ async fn handle_grok_ask_user_question(
     });
 }
 
+/// Bridge codex's `elicitation/create` requests into codeg's interactive
+/// surfaces. Codex only sends these when codeg declares `elicitation.form`
+/// (see `connect_with`), then BLOCKS on the reply, so every shape must resolve
+/// to something the user can act on (see
+/// [`crate::acp::question::classify_elicitation`] for the full taxonomy):
+///
+///   * Question-style (Plan-mode `request_user_input`, generic MCP forms) →
+///     the shared [`crate::acp::question::SessionQuestionAccess`] path — the
+///     SAME one the codeg-mcp ask tool and the grok bridge use (it sets
+///     `pending_question`, broadcasts `QuestionRequest`, and `AskQuestionCard`
+///     renders) — answered once the user submits.
+///   * Approval-style (MCP tool-call approvals, message-only confirms) → the
+///     permission card via `pending_perms`, exactly like the
+///     `session/request_permission` fallback codex-acp used before the
+///     capability was advertised. Auto-declining these would reject the tool
+///     call (including codeg-mcp's own tools in consent-requiring modes).
+///
+/// Question-path early returns DECLINE, which makes codex proceed with its own
+/// judgment — no worse than the pre-bridge `{answers:{}}`, so nothing here can
+/// regress it. Codex delivers `request_user_input` ONLY as this elicitation and
+/// never puts a completed tool_call on the stream, so — like the grok bridge —
+/// the question path synthesizes the answered result card itself once the user
+/// submits (keyed by the elicitation's tool_call_id).
+#[allow(clippy::too_many_arguments)]
+async fn handle_elicitation_request(
+    access: &Option<(
+        Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        crate::acp::question::QuestionRuntimeConfig,
+    )>,
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    connection_id: &str,
+    req: CodexElicitationRequest,
+    responder: Responder<serde_json::Value>,
+) {
+    // The wire reply is the serialized `CreateElicitationResponse` (see the
+    // newtype above). `Decline` makes codex proceed with its own judgment.
+    fn decline() -> serde_json::Value {
+        serde_json::to_value(crate::acp::question::elicitation_decline_response())
+            .unwrap_or_default()
+    }
+    let raw = req.0;
+    // Everything codex-acp can send once `elicitation.form` is advertised
+    // resolves to a plan here — an unhandled shape would silently reject the
+    // agent's blocked request (an MCP tool-call approval, most damagingly).
+    let plan = match crate::acp::question::classify_elicitation(&raw) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::warn!("[codex elicitation] declining unrenderable request: {e}");
+            let _ = responder.respond(decline());
+            return;
+        }
+    };
+    match plan {
+        // Approval-style (MCP tool-call approval / message-only confirm):
+        // render through the permission card — the exact surface these used
+        // before codeg advertised `elicitation.form` (codex-acp then sent
+        // `session/request_permission`). Deliberately NOT gated by the
+        // ask_user_question toggle: this is consent, not an agent question,
+        // and auto-declining would reject the tool call outright.
+        crate::acp::question::ElicitationPlan::Approval(approval) => {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            // Mirror codex-acp's own `request_permission` fallback tool_call
+            // shape (`buildPermissionRequest`) so the frontend permission card
+            // renders it identically. When codex correlated the approval to an
+            // already-rendered mcpToolCall item, reuse that id so the card
+            // attaches to it.
+            let tool_call = serde_json::json!({
+                "toolCallId": approval
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| format!("elicitation-{request_id}")),
+                "title": approval.message,
+                "kind": "execute",
+                "status": "pending",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": approval.message},
+                }],
+            });
+            let options: Vec<PermissionOptionInfo> = approval
+                .options
+                .iter()
+                .map(|o| PermissionOptionInfo {
+                    option_id: o.option_id.clone(),
+                    name: o.label.clone(),
+                    kind: o.kind.to_string(),
+                })
+                .collect();
+            perms.lock().await.insert(
+                request_id.clone(),
+                PendingPermission::CodexElicitation {
+                    responder,
+                    approval,
+                },
+            );
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::PermissionRequest {
+                    request_id,
+                    tool_call,
+                    options,
+                },
+            )
+            .await;
+        }
+        // Question-style (codex `request_user_input`, generic MCP forms):
+        // bridge into the same ask card as the codeg-mcp ask tool.
+        crate::acp::question::ElicitationPlan::Questions(questions) => {
+            let Some((question_access, ask_cfg)) = access else {
+                let _ = responder.respond(decline());
+                return;
+            };
+            // Same kill switch as the codeg-mcp ask tool and the grok bridge:
+            // when the user has turned ask_user_question off, decline so codex
+            // proceeds.
+            if !ask_cfg.is_enabled().await {
+                let _ = responder.respond(decline());
+                return;
+            }
+            // register_question consumes the specs; `questions` keeps its copy
+            // to correlate the answer back to each field when building the
+            // response.
+            let Some(registered) = question_access
+                .register_question(connection_id, questions.specs.clone())
+                .await
+            else {
+                // Connection gone, or an ask is already pending on this connection.
+                let _ = responder.respond(decline());
+                return;
+            };
+            // Codex advertises an auto-resolution timeout on some
+            // `request_user_input` asks (`_meta.codex.autoResolutionMs`):
+            // codex-acp races the elicitation against it and answers
+            // `{answers: {}}` itself on expiry, ABANDONING this request. Reap
+            // the by-then-pointless card shortly after so it can't linger as a
+            // zombie; `cancel_question` is a no-op if the user already
+            // answered.
+            if let Some(ms) = crate::acp::question::elicitation_auto_resolution_ms(&raw) {
+                let reaper_access = Arc::clone(question_access);
+                let reaper_conn = connection_id.to_string();
+                let reaper_qid = registered.question_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        ms.saturating_add(2_000),
+                    ))
+                    .await;
+                    reaper_access.cancel_question(&reaper_conn, &reaper_qid).await;
+                });
+            }
+            // The user answers out-of-band (the `answer_question` endpoint
+            // resolves the one-shot below), so await it on a task — keeping
+            // the ACP dispatch loop free — then reply to codex's blocked
+            // elicitation request. Cloned here so the synthesized card below can
+            // write through the session state from the spawned task.
+            let card_state = Arc::clone(state);
+            let card_emitter = emitter.clone();
+            tokio::spawn(async move {
+                let response = match registered.answer_rx.await {
+                    Ok(outcome) => {
+                        // Surface the answered "提问回答" capsule in-stream — the
+                        // parity codex's `request_user_input` never emits itself: it
+                        // resolves the answer over THIS elicitation round-trip and
+                        // puts no completed tool_call on the ACP stream (so the live
+                        // message has nothing to render otherwise). Emit BEFORE
+                        // unblocking codex so the card lands ahead of its follow-up
+                        // text; codex is blocked on this reply, so nothing races the
+                        // emit. Keyed by the elicitation's tool_call_id so this is
+                        // the single card for the ask and the reloaded history card
+                        // (`codex.rs`, same id) replaces rather than duplicates it.
+                        if let Some(tool_call_id) = questions.tool_call_id.clone() {
+                            emit_with_state(
+                                &card_state,
+                                &card_emitter,
+                                AcpEvent::ToolCall {
+                                    tool_call_id,
+                                    title: "request_user_input".to_string(),
+                                    kind: "other".to_string(),
+                                    status: "completed".to_string(),
+                                    content: None,
+                                    raw_input: Some(
+                                        crate::acp::question::grok_result_card_input(
+                                            &questions.specs,
+                                        )
+                                        .to_string(),
+                                    ),
+                                    raw_output: Some(
+                                        crate::acp::question::grok_result_card_output(&outcome)
+                                            .to_string(),
+                                    ),
+                                    locations: None,
+                                    meta: None,
+                                    images: None,
+                                },
+                            )
+                            .await;
+                        }
+                        crate::acp::question::build_elicitation_response(&questions, &outcome)
+                    }
+                    // Sender dropped: canceled or the connection tore down.
+                    // Decline so codex proceeds with its own judgment.
+                    Err(_) => crate::acp::question::elicitation_decline_response(),
+                };
+                let _ = responder.respond(serde_json::to_value(response).unwrap_or_default());
+            });
+        }
+    }
+}
+
 async fn handle_permission_request(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -3369,7 +3755,10 @@ async fn handle_permission_request(
         }
     }
 
-    perms.lock().await.insert(request_id.clone(), responder);
+    perms
+        .lock()
+        .await
+        .insert(request_id.clone(), PendingPermission::Acp(responder));
 
     emit_with_state(
         state,
@@ -4860,11 +5249,8 @@ async fn run_conversation_loop<'a>(
                                     request_id,
                                     option_id,
                                 }) => {
-                                    if let Some(responder) = perms.lock().await.remove(&request_id) {
-                                        let outcome = RequestPermissionOutcome::Selected(
-                                            SelectedPermissionOutcome::new(option_id),
-                                        );
-                                        let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                                    if let Some(pending) = perms.lock().await.remove(&request_id) {
+                                        pending.respond_selected(option_id);
                                         emit_with_state(
                                             state,
                                             emitter,
@@ -4962,10 +5348,8 @@ async fn run_conversation_loop<'a>(
                                     tracked_terminal_tool_calls.clear();
                                     // Also cancel any pending permission requests
                                     let mut locked = perms.lock().await;
-                                    for (_, responder) in locked.drain() {
-                                        let _ = responder.respond(RequestPermissionResponse::new(
-                                            RequestPermissionOutcome::Cancelled,
-                                        ));
+                                    for (_, pending) in locked.drain() {
+                                        pending.respond_cancelled();
                                     }
                                     drop(locked);
                                     // Immediately emit TurnComplete so the frontend
@@ -5034,10 +5418,8 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     tracked_terminal_tool_calls.clear();
                                     let mut locked = perms.lock().await;
-                                    for (_, responder) in locked.drain() {
-                                        let _ = responder.respond(RequestPermissionResponse::new(
-                                            RequestPermissionOutcome::Cancelled,
-                                        ));
+                                    for (_, pending) in locked.drain() {
+                                        pending.respond_cancelled();
                                     }
                                     disconnect_requested = true;
                                     break;
@@ -5068,11 +5450,8 @@ async fn run_conversation_loop<'a>(
                 request_id,
                 option_id,
             }) => {
-                if let Some(responder) = perms.lock().await.remove(&request_id) {
-                    let outcome = RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(option_id),
-                    );
-                    let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                if let Some(pending) = perms.lock().await.remove(&request_id) {
+                    pending.respond_selected(option_id);
                     emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id })
                         .await;
                 }
@@ -5152,10 +5531,8 @@ async fn run_conversation_loop<'a>(
                     .release_all_for_session(sid.0.as_ref())
                     .await;
                 let mut locked = perms.lock().await;
-                for (_, responder) in locked.drain() {
-                    let _ = responder.respond(RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Cancelled,
-                    ));
+                for (_, pending) in locked.drain() {
+                    pending.respond_cancelled();
                 }
                 drop(locked);
                 // Cascade-cancel any pending delegations owned by this parent.
@@ -6968,6 +7345,42 @@ mod tests {
             let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
             apply_grok_env_policy(&mut env, &rt);
             assert!(!env.iter().any(|(k, _)| k == "XAI_API_KEY"));
+        }
+    }
+
+    #[test]
+    fn codex_env_policy_forces_mcp_filter_off_and_overrides_user_twin() {
+        // Codex gets the flag injected so codex-acp never drops the injected
+        // `codeg-mcp` server on a config.toml name collision.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut env);
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "DISABLE_MCP_CONFIG_FILTERING" && v == "true"));
+
+        // A user-supplied twin is replaced (not duplicated) so the override wins.
+        let mut with_twin = vec![(
+            "DISABLE_MCP_CONFIG_FILTERING".to_string(),
+            "false".to_string(),
+        )];
+        apply_codex_env_policy(AgentType::Codex, &mut with_twin);
+        let hits: Vec<_> = with_twin
+            .iter()
+            .filter(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING")
+            .collect();
+        assert_eq!(hits.len(), 1, "no duplicate key");
+        assert_eq!(hits[0].1, "true", "codeg override wins over user twin");
+    }
+
+    #[test]
+    fn codex_env_policy_is_noop_for_other_agents() {
+        for agent in [AgentType::Grok, AgentType::ClaudeCode, AgentType::Gemini] {
+            let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+            apply_codex_env_policy(agent, &mut env);
+            assert!(
+                !env.iter().any(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING"),
+                "{agent:?} must not receive the codex-only flag"
+            );
         }
     }
 
